@@ -8,6 +8,8 @@ from typing import Any
 import numpy as np
 import pygame
 
+from duckiematrix_telemetry import TELEMETRY_COLUMNS
+
 
 DEFAULT_DATA_DIR = Path("~/duckietown/imitation_learning/expert_data").expanduser()
 TIMESTAMP_COLUMN = "timestamp in seconds since run start"
@@ -22,8 +24,8 @@ BAR_LEFT = (92, 184, 92)
 BAR_RIGHT = (235, 137, 88)
 
 WINDOW_WIDTH = 960
-WINDOW_HEIGHT = 680
-PANEL_HEIGHT = 148
+WINDOW_HEIGHT = 760
+PANEL_HEIGHT = 238
 HOLD_INTERVAL_MS = 75
 DISPLAY_MODES = ("fit", "native")
 
@@ -72,15 +74,22 @@ def load_samples(run_dir: Path) -> list[dict[str, Any]]:
         reader = csv.DictReader(file)
 
         for row in reader:
-            samples.append(
-                {
-                    "step_idx": int(row["step_idx"]),
-                    "timestamp": float(row[TIMESTAMP_COLUMN]),
-                    "image": row["image"],
-                    "left_action": float(row["left_action"]),
-                    "right_action": float(row["right_action"]),
-                }
-            )
+            sample = {
+                "step_idx": int(row["step_idx"]),
+                "timestamp": float(row[TIMESTAMP_COLUMN]),
+                "image": row["image"],
+                "left_action": float(row["left_action"]),
+                "right_action": float(row["right_action"]),
+            }
+            for column in TELEMETRY_COLUMNS:
+                value = row.get(column)
+                if value is None or value == "":
+                    sample[column] = None
+                elif column in {"lane_position_valid", "terminated", "truncated"}:
+                    sample[column] = bool(int(float(value)))
+                else:
+                    sample[column] = float(value)
+            samples.append(sample)
 
     if not samples:
         raise ValueError(f"{actions_file} contains no samples")
@@ -91,6 +100,16 @@ def load_samples(run_dir: Path) -> list[dict[str, Any]]:
 def render_text(surface: pygame.Surface, font: pygame.font.Font, text: str, xy: tuple[int, int],
                 color: tuple[int, int, int] = TEXT) -> None:
     surface.blit(font.render(text, True, color), xy)
+
+
+def format_optional_float(value: Any, precision: int = 3, signed: bool = False) -> str:
+    if value is None:
+        return "n/a"
+    value = float(value)
+    if np.isnan(value):
+        return "nan"
+    sign = "+" if signed else ""
+    return f"{value:{sign}.{precision}f}"
 
 
 def scaled_rect(image_size: tuple[int, int], max_rect: pygame.Rect) -> pygame.Rect:
@@ -237,6 +256,31 @@ def draw_frame(
     draw_direction_arrow(screen, (830, y + 7), left, right)
 
     y += 38
+    reward = format_optional_float(sample.get("reward"), precision=3, signed=True)
+    speed = format_optional_float(sample.get("speed"), precision=3)
+    lane_dot_dir = format_optional_float(sample.get("lane_dot_dir"), precision=3, signed=True)
+    lane_dist = format_optional_float(sample.get("lane_dist"), precision=3, signed=True)
+    lane_angle = format_optional_float(sample.get("lane_angle_deg"), precision=1, signed=True)
+    lane_valid = sample.get("lane_position_valid")
+    terminated = sample.get("terminated")
+    truncated = sample.get("truncated")
+
+    render_text(screen, fonts["large"], f"reward {reward}", (24, y), ACCENT)
+    render_text(screen, fonts["large"], f"speed {speed}", (250, y))
+    render_text(screen, fonts["large"], f"dot_dir {lane_dot_dir}", (450, y))
+    render_text(screen, fonts["large"], f"dist {lane_dist}", (690, y))
+
+    y += 40
+    render_text(
+        screen,
+        fonts["normal"],
+        f"angle {lane_angle} deg   lane_valid={lane_valid if lane_valid is not None else 'n/a'}   "
+        f"terminated={terminated if terminated is not None else 'n/a'}   truncated={truncated if truncated is not None else 'n/a'}",
+        (24, y),
+        MUTED_TEXT,
+    )
+
+    y += 38
     render_text(
         screen,
         fonts["small"],
@@ -281,8 +325,8 @@ def run_viewer(run_dir: Path, display_mode: str) -> None:
     clock = pygame.time.Clock()
     image_cache = ImageCache()
     fonts = {
-        "large": pygame.font.Font(None, 36),
-        "normal": pygame.font.Font(None, 26),
+        "large": pygame.font.Font(None, 38),
+        "normal": pygame.font.Font(None, 28),
         "small": pygame.font.Font(None, 22),
     }
 

@@ -38,6 +38,13 @@ class PPOConfig:
     model: str
     imitation_checkpoint: str | None
     total_steps: int
+    max_episode_steps: int
+    reset_random_warmup_steps: int
+    reset_random_warmup_retries: int
+    reset_random_action_scale: float
+    eval_interval_rollouts: int
+    eval_steps: int
+    eval_deterministic: bool
     rollout_steps: int
     epochs: int
     batch_size: int
@@ -75,6 +82,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", choices=("mobilenet_v3_small", "resnet18"), default="mobilenet_v3_small")
     parser.add_argument("--imitation-checkpoint", type=Path, default=None)
     parser.add_argument("--total-steps", type=int, default=100_000)
+    parser.add_argument(
+        "--max-episode-steps",
+        type=int,
+        default=1000,
+        help="Reset and log an episode after this many steps; set to 0 to rely only on environment termination.",
+    )
+    parser.add_argument(
+        "--reset-random-warmup-steps",
+        type=int,
+        default=0,
+        help="After each reset, take this many random untrained actions before starting the next PPO episode.",
+    )
+    parser.add_argument(
+        "--reset-random-warmup-retries",
+        type=int,
+        default=3,
+        help="Retry random reset warmup if the environment terminates during the warmup.",
+    )
+    parser.add_argument(
+        "--reset-random-action-scale",
+        type=float,
+        default=0.6,
+        help="Scale for random warmup actions in the continuous left/right action space.",
+    )
+    parser.add_argument(
+        "--eval-interval-rollouts",
+        type=int,
+        default=10,
+        help="Run evaluation after this many completed PPO rollouts/updates; set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--eval-steps",
+        type=int,
+        default=500,
+        help="Number of environment steps to run for each evaluation.",
+    )
+    parser.add_argument(
+        "--eval-stochastic",
+        action="store_false",
+        dest="eval_deterministic",
+        help="Sample from the policy during evaluation instead of using the deterministic mean action.",
+    )
     parser.add_argument("--rollout-steps", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -120,6 +169,133 @@ def compute_gae(rewards, dones, values, last_value, gamma, gae_lambda):
     return advantages, returns
 
 
+def sample_random_action(env, rng: np.random.Generator, action_scale: float) -> np.ndarray:
+    low = np.asarray(env.action_space.low, dtype=np.float32)
+    high = np.asarray(env.action_space.high, dtype=np.float32)
+    action_scale = float(np.clip(action_scale, 0.0, 1.0))
+    action = rng.uniform(low=low, high=high).astype(np.float32)
+    return np.clip(action * action_scale, low, high).astype(np.float32)
+
+
+def reset_environment(
+    env,
+    args: argparse.Namespace,
+    rng: np.random.Generator,
+    seed: int | None = None,
+    use_random_warmup: bool = True,
+):
+    observation, info = env.reset(seed=seed)
+    warmup_steps = max(0, args.reset_random_warmup_steps) if use_random_warmup else 0
+    if warmup_steps == 0:
+        return observation, info
+
+    retries = max(1, args.reset_random_warmup_retries)
+    for _ in range(retries):
+        warmup_observation = observation
+        warmup_info = info
+        warmup_done = False
+        for _ in range(warmup_steps):
+            action = sample_random_action(env, rng, args.reset_random_action_scale)
+            warmup_observation, _, terminated, truncated, warmup_info = env.step(action)
+            warmup_done = bool(terminated or truncated)
+            if warmup_done:
+                break
+        if not warmup_done:
+            return warmup_observation, warmup_info
+        observation, info = env.reset()
+
+    return observation, info
+
+
+def done_reason(terminated: bool, truncated: bool, time_limit_done: bool) -> str:
+    if terminated:
+        return "terminated"
+    if truncated:
+        return "truncated"
+    if time_limit_done:
+        return "time_limit"
+    return "unknown"
+
+
+def write_training_episode(
+    metrics_file: Path,
+    metrics_fields: list[str],
+    step: int,
+    episode: int,
+    episode_return: float,
+    episode_length: int,
+    reason: str,
+) -> None:
+    with metrics_file.open("a", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=metrics_fields)
+        writer.writerow({
+            "step": step,
+            "episode": episode,
+            "episode_return": episode_return,
+            "episode_length": episode_length,
+            "done_reason": reason,
+        })
+
+
+def evaluate_policy(
+    env,
+    policy: TanhGaussianPolicy,
+    args: argparse.Namespace,
+    transform: transforms.Compose,
+    device: torch.device,
+    reset_rng: np.random.Generator,
+) -> dict[str, float | int]:
+    observation, info = reset_environment(env, args, reset_rng, use_random_warmup=False)
+    total_return = 0.0
+    episode_return = 0.0
+    episode_length = 0
+    completed_episodes = 0
+    terminated_count = 0
+    truncated_count = 0
+    time_limit_count = 0
+
+    was_training = policy.training
+    policy.eval()
+    try:
+        for _ in range(args.eval_steps):
+            obs_tensor = preprocess(observation, args.crop_y_start, args.image_size, transform).unsqueeze(0).to(device)
+            with torch.no_grad():
+                action_tensor = policy.act(obs_tensor, deterministic=args.eval_deterministic)
+            action = action_tensor.squeeze(0).cpu().numpy().astype(np.float32)
+            observation, reward, terminated, truncated, info = env.step(action)
+
+            reward = float(reward)
+            total_return += reward
+            episode_return += reward
+            episode_length += 1
+
+            time_limit_done = args.max_episode_steps > 0 and episode_length >= args.max_episode_steps
+            done = bool(terminated or truncated or time_limit_done)
+            if done:
+                completed_episodes += 1
+                terminated_count += int(bool(terminated))
+                truncated_count += int(bool(truncated))
+                time_limit_count += int(time_limit_done and not terminated and not truncated)
+                observation, info = reset_environment(env, args, reset_rng, use_random_warmup=False)
+                episode_return = 0.0
+                episode_length = 0
+    finally:
+        if was_training:
+            policy.train()
+
+    return {
+        "eval_return": total_return,
+        "eval_mean_reward": total_return / max(1, args.eval_steps),
+        "eval_steps": args.eval_steps,
+        "eval_completed_episodes": completed_episodes,
+        "eval_open_episode_return": episode_return,
+        "eval_open_episode_length": episode_length,
+        "eval_terminated": terminated_count,
+        "eval_truncated": truncated_count,
+        "eval_time_limit": time_limit_count,
+    }
+
+
 def save_checkpoint(path, policy, value, policy_optimizer, value_optimizer, config, step):
     torch.save({
         "step": step,
@@ -137,6 +313,7 @@ def save_checkpoint(path, policy, value, policy_optimizer, value_optimizer, conf
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
+    reset_rng = np.random.default_rng(args.seed + 1)
     device = resolve_device(args.device)
     run_dir = args.output_dir.expanduser() / datetime.now().strftime("%Y%m%d_%H%M%S_ppo")
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -158,17 +335,47 @@ def main() -> None:
     value_optimizer = torch.optim.AdamW(value.parameters(), lr=args.value_lr)
 
     metrics_file = run_dir / "history.csv"
+    metrics_fields = [
+        "step",
+        "episode",
+        "episode_return",
+        "episode_length",
+        "done_reason",
+        "policy_loss",
+        "value_loss",
+        "entropy",
+    ]
     with metrics_file.open("w", newline="") as file:
-        csv.DictWriter(file, fieldnames=["step", "episode", "episode_return", "episode_length", "policy_loss", "value_loss", "entropy"]).writeheader()
+        csv.DictWriter(file, fieldnames=metrics_fields).writeheader()
+    eval_metrics_file = run_dir / "eval_history.csv"
+    eval_metrics_fields = [
+        "train_step",
+        "train_rollout",
+        "eval_index",
+        "eval_return",
+        "eval_mean_reward",
+        "eval_steps",
+        "eval_completed_episodes",
+        "eval_open_episode_return",
+        "eval_open_episode_length",
+        "eval_terminated",
+        "eval_truncated",
+        "eval_time_limit",
+    ]
+    with eval_metrics_file.open("w", newline="") as file:
+        csv.DictWriter(file, fieldnames=eval_metrics_fields).writeheader()
 
     env = None
     try:
         env = DuckiematrixDB21JEnv(entity_name=args.entity_name, headless=True, camera_width=args.camera_width, camera_height=args.camera_height)
-        observation, info = env.reset(seed=args.seed)
+        observation, info = reset_environment(env, args, reset_rng, seed=args.seed)
         episode_return = 0.0
         episode_length = 0
         episode = 0
         global_step = 0
+        rollout = 0
+        eval_index = 0
+        best_eval_return = -float("inf")
 
         while global_step < args.total_steps:
             obs_buf, action_buf, logp_buf, reward_buf, done_buf, value_buf = [], [], [], [], [], []
@@ -179,25 +386,38 @@ def main() -> None:
                     value_tensor = value(obs_tensor.unsqueeze(0))
                 action = action_tensor.squeeze(0).cpu().numpy().astype(np.float32)
                 next_observation, reward, terminated, truncated, info = env.step(action)
-                done = bool(terminated or truncated)
 
                 obs_buf.append(obs_tensor.cpu())
                 action_buf.append(action_tensor.squeeze(0).cpu())
                 logp_buf.append(logp_tensor.squeeze(0).cpu())
-                reward_buf.append(float(reward))
-                done_buf.append(float(done))
                 value_buf.append(value_tensor.squeeze(0).cpu())
                 episode_return += float(reward)
                 episode_length += 1
                 global_step += 1
+                env_done = bool(terminated or truncated)
+                time_limit_done = args.max_episode_steps > 0 and episode_length >= args.max_episode_steps
+                done = env_done or time_limit_done
+                reward_buf.append(float(reward))
+                done_buf.append(float(done))
                 observation = next_observation
 
                 if done:
-                    with metrics_file.open("a", newline="") as file:
-                        writer = csv.DictWriter(file, fieldnames=["step", "episode", "episode_return", "episode_length", "policy_loss", "value_loss", "entropy"])
-                        writer.writerow({"step": global_step, "episode": episode, "episode_return": episode_return, "episode_length": episode_length})
-                    print(f"step={global_step} episode={episode} return={episode_return:.3f} length={episode_length}", flush=True)
-                    observation, info = env.reset()
+                    reason = done_reason(terminated, truncated, time_limit_done)
+                    write_training_episode(
+                        metrics_file,
+                        metrics_fields,
+                        global_step,
+                        episode,
+                        episode_return,
+                        episode_length,
+                        reason,
+                    )
+                    print(
+                        f"step={global_step} episode={episode} return={episode_return:.3f} "
+                        f"length={episode_length} done_reason={reason}",
+                        flush=True,
+                    )
+                    observation, info = reset_environment(env, args, reset_rng)
                     episode += 1
                     episode_return = 0.0
                     episode_length = 0
@@ -244,7 +464,76 @@ def main() -> None:
                     last_policy_loss, last_value_loss, last_entropy = policy_loss.item(), value_loss.item(), entropy.item()
 
             save_checkpoint(run_dir / "last.pt", policy, value, policy_optimizer, value_optimizer, config, global_step)
-            print(f"update step={global_step} policy_loss={last_policy_loss:.4f} value_loss={last_value_loss:.4f} entropy={last_entropy:.4f}", flush=True)
+            rollout += 1
+            print(
+                f"update step={global_step} rollout={rollout} rollout_return={sum(reward_buf):.3f} "
+                f"current_episode_return={episode_return:.3f} current_episode_length={episode_length} "
+                f"policy_loss={last_policy_loss:.4f} value_loss={last_value_loss:.4f} entropy={last_entropy:.4f}",
+                flush=True,
+            )
+
+            should_eval = (
+                args.eval_interval_rollouts > 0
+                and args.eval_steps > 0
+                and rollout % args.eval_interval_rollouts == 0
+            )
+            if should_eval:
+                if episode_length > 0:
+                    write_training_episode(
+                        metrics_file,
+                        metrics_fields,
+                        global_step,
+                        episode,
+                        episode_return,
+                        episode_length,
+                        "eval_interrupt",
+                    )
+                    print(
+                        f"step={global_step} episode={episode} return={episode_return:.3f} "
+                        f"length={episode_length} done_reason=eval_interrupt",
+                        flush=True,
+                    )
+                    episode += 1
+                    episode_return = 0.0
+                    episode_length = 0
+
+                eval_result = evaluate_policy(env, policy, args, transform, device, reset_rng)
+                eval_index += 1
+                eval_row = {
+                    "train_step": global_step,
+                    "train_rollout": rollout,
+                    "eval_index": eval_index,
+                    **eval_result,
+                }
+                with eval_metrics_file.open("a", newline="") as file:
+                    writer = csv.DictWriter(file, fieldnames=eval_metrics_fields)
+                    writer.writerow(eval_row)
+                print(
+                    f"eval step={global_step} rollout={rollout} eval_index={eval_index} "
+                    f"return={eval_result['eval_return']:.3f} steps={eval_result['eval_steps']} "
+                    f"mean_reward={eval_result['eval_mean_reward']:.4f} "
+                    f"completed_episodes={eval_result['eval_completed_episodes']} "
+                    f"open_episode_return={eval_result['eval_open_episode_return']:.3f} "
+                    f"open_episode_length={eval_result['eval_open_episode_length']}",
+                    flush=True,
+                )
+                if float(eval_result["eval_return"]) > best_eval_return:
+                    best_eval_return = float(eval_result["eval_return"])
+                    save_checkpoint(
+                        run_dir / "best_eval.pt",
+                        policy,
+                        value,
+                        policy_optimizer,
+                        value_optimizer,
+                        config,
+                        global_step,
+                    )
+                    print(
+                        f"new_best_eval step={global_step} return={best_eval_return:.3f} "
+                        f"checkpoint={run_dir / 'best_eval.pt'}",
+                        flush=True,
+                    )
+                observation, info = reset_environment(env, args, reset_rng)
     finally:
         if env is not None:
             env.close()

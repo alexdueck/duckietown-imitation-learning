@@ -272,6 +272,7 @@ def write_training_episode(
             "episode": episode,
             "episode_return": episode_return,
             "episode_length": episode_length,
+            "episode_return_per_step": episode_return / max(1, episode_length),
             "done_reason": reason,
         })
 
@@ -432,6 +433,7 @@ def main() -> None:
         "episode",
         "episode_return",
         "episode_length",
+        "episode_return_per_step",
         "done_reason",
         "policy_loss",
         "value_loss",
@@ -544,7 +546,8 @@ def main() -> None:
                     )
                     print(
                         f"step={global_step} episode={episode} return={episode_return:.3f} "
-                        f"length={episode_length} done_reason={reason}",
+                        f"length={episode_length} reward_per_step={episode_return / max(1, episode_length):.4f} "
+                        f"done_reason={reason}",
                         flush=True,
                     )
                     observation, info = reset_environment(env, args, reset_rng)
@@ -604,6 +607,7 @@ def main() -> None:
             rollout += 1
             print(
                 f"update step={global_step} rollout={rollout} rollout_return={sum(reward_buf):.3f} "
+                f"rollout_reward_per_step={sum(reward_buf) / max(1, len(reward_buf)):.4f} "
                 f"current_episode_return={episode_return:.3f} current_episode_length={episode_length} "
                 f"policy_loss={last_policy_loss:.4f} value_loss={last_value_loss:.4f} entropy={last_entropy:.4f}",
                 flush=True,
@@ -627,7 +631,8 @@ def main() -> None:
                     )
                     print(
                         f"step={global_step} episode={episode} return={episode_return:.3f} "
-                        f"length={episode_length} done_reason=eval_interrupt",
+                        f"length={episode_length} reward_per_step={episode_return / max(1, episode_length):.4f} "
+                        f"done_reason=eval_interrupt",
                         flush=True,
                     )
                     episode += 1

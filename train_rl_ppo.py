@@ -47,6 +47,8 @@ class PPOConfig:
     eval_steps: int
     eval_deterministic: bool
     initial_log_std: float | None
+    min_log_std: float
+    max_log_std: float
     rollout_steps: int
     epochs: int
     batch_size: int
@@ -137,6 +139,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Initial actor log standard deviation. Defaults to -2.0 for imitation warm-starts and -0.5 otherwise.",
+    )
+    parser.add_argument(
+        "--min-log-std",
+        type=float,
+        default=-5.0,
+        help="Lower bound applied to the learned actor log standard deviation after each policy update.",
+    )
+    parser.add_argument(
+        "--max-log-std",
+        type=float,
+        default=-1.0,
+        help="Upper bound applied to the learned actor log standard deviation after each policy update.",
     )
     parser.add_argument("--rollout-steps", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=4)
@@ -360,6 +374,7 @@ def main() -> None:
         initial_log_std = args.initial_log_std
         if initial_log_std is None:
             initial_log_std = -2.0 if args.imitation_checkpoint is not None else -0.5
+        initial_log_std = float(np.clip(initial_log_std, args.min_log_std, args.max_log_std))
         with torch.no_grad():
             policy.log_std.fill_(initial_log_std)
         print(f"Initial policy log_std={initial_log_std:.3f} std={np.exp(initial_log_std):.3f}", flush=True)
@@ -377,6 +392,8 @@ def main() -> None:
                 f"Checkpoint model is {checkpoint_model!r}, but --model is {args.model!r}. "
                 "Use the same model architecture when resuming."
             )
+        with torch.no_grad():
+            policy.log_std.clamp_(args.min_log_std, args.max_log_std)
         print(f"Resumed RL checkpoint {args.resume_checkpoint.expanduser()} at step={resumed_step}", flush=True)
 
     metrics_file = run_dir / "history.csv"
@@ -501,6 +518,8 @@ def main() -> None:
                     (policy_loss - args.entropy_coef * entropy).backward()
                     nn.utils.clip_grad_norm_(policy.parameters(), args.max_grad_norm)
                     policy_optimizer.step()
+                    with torch.no_grad():
+                        policy.log_std.clamp_(args.min_log_std, args.max_log_std)
 
                     value_optimizer.zero_grad(set_to_none=True)
                     (args.value_coef * value_loss).backward()

@@ -46,6 +46,7 @@ class PPOConfig:
     eval_interval_rollouts: int
     eval_steps: int
     eval_deterministic: bool
+    initial_log_std: float | None
     rollout_steps: int
     epochs: int
     batch_size: int
@@ -130,6 +131,12 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         dest="eval_deterministic",
         help="Sample from the policy during evaluation instead of using the deterministic mean action.",
+    )
+    parser.add_argument(
+        "--initial-log-std",
+        type=float,
+        default=None,
+        help="Initial actor log standard deviation. Defaults to -2.0 for imitation warm-starts and -0.5 otherwise.",
     )
     parser.add_argument("--rollout-steps", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=4)
@@ -349,6 +356,13 @@ def main() -> None:
     if args.imitation_checkpoint is not None:
         load_imitation_actor(policy, args.imitation_checkpoint)
         policy.to(device)
+    if args.resume_checkpoint is None:
+        initial_log_std = args.initial_log_std
+        if initial_log_std is None:
+            initial_log_std = -2.0 if args.imitation_checkpoint is not None else -0.5
+        with torch.no_grad():
+            policy.log_std.fill_(initial_log_std)
+        print(f"Initial policy log_std={initial_log_std:.3f} std={np.exp(initial_log_std):.3f}", flush=True)
     value = ValueNetwork(args.model, pretrained=args.resume_checkpoint is None).to(device)
     policy_optimizer = torch.optim.AdamW(policy.parameters(), lr=args.policy_lr)
     value_optimizer = torch.optim.AdamW(value.parameters(), lr=args.value_lr)

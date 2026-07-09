@@ -27,7 +27,7 @@ from gym_duckiematrix.DB21J import DuckiematrixDB21JEnv
 
 from live_eval_imitation_policy import observation_to_rgb, shutdown_dtps
 from rl_models import TanhGaussianPolicy, load_imitation_actor
-from train_imitation_learning import IMAGENET_MEAN, IMAGENET_STD, resolve_device, set_seed
+from train_imitation_learning import IMAGENET_MEAN, IMAGENET_STD, build_model, resolve_device, set_seed
 
 
 @dataclass
@@ -182,7 +182,12 @@ def make_transform() -> transforms.Compose:
     return transforms.Compose([transforms.ToTensor(), transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)])
 
 
-def preprocess(observation: np.ndarray, crop_y_start: int, image_size: int, transform: transforms.Compose) -> torch.Tensor:
+def preprocess(
+    observation: np.ndarray,
+    crop_y_start: int,
+    image_size: int,
+    transform: transforms.Compose,
+) -> torch.Tensor:
     image = Image.fromarray(observation_to_rgb(observation)).convert("RGB")
     width, height = image.size
     crop_y_start = max(0, min(crop_y_start, height - 1))
@@ -292,7 +297,12 @@ def evaluate_policy(
     policy.eval()
     try:
         for _ in range(args.eval_steps):
-            obs_tensor = preprocess(observation, args.crop_y_start, args.image_size, transform).unsqueeze(0).to(device)
+            obs_tensor = preprocess(
+                observation,
+                args.crop_y_start,
+                args.image_size,
+                transform,
+            ).unsqueeze(0).to(device)
             with torch.no_grad():
                 action_tensor = policy.act(obs_tensor, deterministic=args.eval_deterministic)
             action = action_tensor.squeeze(0).cpu().numpy().astype(np.float32)
@@ -351,6 +361,20 @@ def load_rl_checkpoint(path, policy, value, policy_optimizer, value_optimizer, d
     policy_optimizer.load_state_dict(checkpoint["policy_optimizer_state_dict"])
     value_optimizer.load_state_dict(checkpoint["value_optimizer_state_dict"])
     return checkpoint
+
+
+def load_reference_imitation_model(checkpoint_path: Path, device: torch.device):
+    checkpoint = torch.load(checkpoint_path.expanduser(), map_location=device)
+    config = checkpoint.get("config", {})
+    model = build_model(
+        model_name=config.get("model", "mobilenet_v3_small"),
+        pretrained=False,
+        train_backbone=bool(config.get("train_backbone", False)),
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(device)
+    model.eval()
+    return model
 
 
 def main() -> None:
@@ -439,11 +463,20 @@ def main() -> None:
         observation, info = reset_environment(env, args, reset_rng, seed=args.seed)
         if args.debug_initial_action:
             with torch.no_grad():
-                obs_tensor = preprocess(observation, args.crop_y_start, args.image_size, transform).unsqueeze(0).to(device)
+                obs_tensor = preprocess(
+                    observation,
+                    args.crop_y_start,
+                    args.image_size,
+                    transform,
+                ).unsqueeze(0).to(device)
                 mean, log_std = policy(obs_tensor)
                 deterministic_action = torch.tanh(mean).squeeze(0).cpu().numpy()
                 raw_mean = mean.squeeze(0).cpu().numpy()
                 std = log_std.exp().squeeze(0).cpu().numpy()
+                reference_action = None
+                if args.imitation_checkpoint is not None:
+                    reference_model = load_reference_imitation_model(args.imitation_checkpoint, device)
+                    reference_action = reference_model(obs_tensor).squeeze(0).cpu().numpy()
             print(
                 "debug_initial_action "
                 f"raw_mean_left={raw_mean[0]:+.4f} raw_mean_right={raw_mean[1]:+.4f} "
@@ -451,6 +484,16 @@ def main() -> None:
                 f"std_left={std[0]:.4f} std_right={std[1]:.4f}",
                 flush=True,
             )
+            if reference_action is not None:
+                print(
+                    "debug_initial_action_compare "
+                    f"il_left={reference_action[0]:+.4f} il_right={reference_action[1]:+.4f} "
+                    f"rl_raw_minus_il_left={raw_mean[0] - reference_action[0]:+.6f} "
+                    f"rl_raw_minus_il_right={raw_mean[1] - reference_action[1]:+.6f} "
+                    f"rl_action_minus_il_left={deterministic_action[0] - reference_action[0]:+.6f} "
+                    f"rl_action_minus_il_right={deterministic_action[1] - reference_action[1]:+.6f}",
+                    flush=True,
+                )
         episode_return = 0.0
         episode_length = 0
         episode = 0
@@ -462,7 +505,12 @@ def main() -> None:
         while global_step < args.total_steps:
             obs_buf, action_buf, logp_buf, reward_buf, done_buf, value_buf = [], [], [], [], [], []
             for _ in range(args.rollout_steps):
-                obs_tensor = preprocess(observation, args.crop_y_start, args.image_size, transform).to(device)
+                obs_tensor = preprocess(
+                    observation,
+                    args.crop_y_start,
+                    args.image_size,
+                    transform,
+                ).to(device)
                 with torch.no_grad():
                     action_tensor, logp_tensor, _ = policy.sample(obs_tensor.unsqueeze(0))
                     value_tensor = value(obs_tensor.unsqueeze(0))
@@ -513,7 +561,12 @@ def main() -> None:
             dones = torch.tensor(done_buf, dtype=torch.float32, device=device)
             values = torch.stack(value_buf).to(device)
             with torch.no_grad():
-                last_obs = preprocess(observation, args.crop_y_start, args.image_size, transform).unsqueeze(0).to(device)
+                last_obs = preprocess(
+                    observation,
+                    args.crop_y_start,
+                    args.image_size,
+                    transform,
+                ).unsqueeze(0).to(device)
                 last_value = value(last_obs).squeeze(0)
                 advantages, returns = compute_gae(rewards, dones, values, last_value, args.gamma, args.gae_lambda)
                 advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)

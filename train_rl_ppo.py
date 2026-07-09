@@ -37,6 +37,7 @@ class PPOConfig:
     entity_name: str
     model: str
     imitation_checkpoint: str | None
+    resume_checkpoint: str | None
     total_steps: int
     max_episode_steps: int
     reset_random_warmup_steps: int
@@ -81,6 +82,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--map-name", default=None, help="Recorded in config; select the map in Duckiematrix itself.")
     parser.add_argument("--model", choices=("mobilenet_v3_small", "resnet18"), default="mobilenet_v3_small")
     parser.add_argument("--imitation-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        default=None,
+        help="Resume PPO training from an RL checkpoint such as last.pt or best_eval.pt.",
+    )
     parser.add_argument("--total-steps", type=int, default=100_000)
     parser.add_argument(
         "--max-episode-steps",
@@ -310,8 +317,20 @@ def save_checkpoint(path, policy, value, policy_optimizer, value_optimizer, conf
     }, path)
 
 
+def load_rl_checkpoint(path, policy, value, policy_optimizer, value_optimizer, device):
+    checkpoint = torch.load(path.expanduser(), map_location=device)
+    policy.load_state_dict(checkpoint["policy_state_dict"])
+    value.load_state_dict(checkpoint["value_state_dict"])
+    policy_optimizer.load_state_dict(checkpoint["policy_optimizer_state_dict"])
+    value_optimizer.load_state_dict(checkpoint["value_optimizer_state_dict"])
+    return checkpoint
+
+
 def main() -> None:
     args = parse_args()
+    if args.resume_checkpoint is not None and args.imitation_checkpoint is not None:
+        raise ValueError("Use either --resume-checkpoint or --imitation-checkpoint, not both.")
+
     set_seed(args.seed)
     reset_rng = np.random.default_rng(args.seed + 1)
     device = resolve_device(args.device)
@@ -326,13 +345,25 @@ def main() -> None:
     (run_dir / "config.json").write_text(json.dumps(asdict(config), indent=2) + "\n")
 
     transform = make_transform()
-    policy = TanhGaussianPolicy(args.model, pretrained=args.imitation_checkpoint is None).to(device)
+    policy = TanhGaussianPolicy(args.model, pretrained=args.imitation_checkpoint is None and args.resume_checkpoint is None).to(device)
     if args.imitation_checkpoint is not None:
         load_imitation_actor(policy, args.imitation_checkpoint)
         policy.to(device)
-    value = ValueNetwork(args.model, pretrained=True).to(device)
+    value = ValueNetwork(args.model, pretrained=args.resume_checkpoint is None).to(device)
     policy_optimizer = torch.optim.AdamW(policy.parameters(), lr=args.policy_lr)
     value_optimizer = torch.optim.AdamW(value.parameters(), lr=args.value_lr)
+    resumed_step = 0
+    if args.resume_checkpoint is not None:
+        checkpoint = load_rl_checkpoint(args.resume_checkpoint, policy, value, policy_optimizer, value_optimizer, device)
+        resumed_step = int(checkpoint.get("step", 0))
+        checkpoint_config = checkpoint.get("config", {})
+        checkpoint_model = checkpoint_config.get("model")
+        if checkpoint_model is not None and checkpoint_model != args.model:
+            raise ValueError(
+                f"Checkpoint model is {checkpoint_model!r}, but --model is {args.model!r}. "
+                "Use the same model architecture when resuming."
+            )
+        print(f"Resumed RL checkpoint {args.resume_checkpoint.expanduser()} at step={resumed_step}", flush=True)
 
     metrics_file = run_dir / "history.csv"
     metrics_fields = [
@@ -372,7 +403,7 @@ def main() -> None:
         episode_return = 0.0
         episode_length = 0
         episode = 0
-        global_step = 0
+        global_step = resumed_step
         rollout = 0
         eval_index = 0
         best_eval_return = -float("inf")

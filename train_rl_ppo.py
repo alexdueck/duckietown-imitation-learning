@@ -62,6 +62,7 @@ class PPOConfig:
     max_grad_norm: float
     image_size: int
     crop_y_start: int
+    debug_initial_action: bool
     seed: int
     device: str
 
@@ -167,6 +168,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crop-y-start", type=int, default=0)
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
+    parser.add_argument(
+        "--debug-initial-action",
+        action="store_true",
+        help="Print the deterministic policy action for the first reset observation before training.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
     return parser.parse_args()
@@ -431,6 +437,20 @@ def main() -> None:
     try:
         env = DuckiematrixDB21JEnv(entity_name=args.entity_name, headless=True, camera_width=args.camera_width, camera_height=args.camera_height)
         observation, info = reset_environment(env, args, reset_rng, seed=args.seed)
+        if args.debug_initial_action:
+            with torch.no_grad():
+                obs_tensor = preprocess(observation, args.crop_y_start, args.image_size, transform).unsqueeze(0).to(device)
+                mean, log_std = policy(obs_tensor)
+                deterministic_action = torch.tanh(mean).squeeze(0).cpu().numpy()
+                raw_mean = mean.squeeze(0).cpu().numpy()
+                std = log_std.exp().squeeze(0).cpu().numpy()
+            print(
+                "debug_initial_action "
+                f"raw_mean_left={raw_mean[0]:+.4f} raw_mean_right={raw_mean[1]:+.4f} "
+                f"action_left={deterministic_action[0]:+.4f} action_right={deterministic_action[1]:+.4f} "
+                f"std_left={std[0]:.4f} std_right={std[1]:.4f}",
+                flush=True,
+            )
         episode_return = 0.0
         episode_length = 0
         episode = 0
@@ -496,7 +516,7 @@ def main() -> None:
                 last_obs = preprocess(observation, args.crop_y_start, args.image_size, transform).unsqueeze(0).to(device)
                 last_value = value(last_obs).squeeze(0)
                 advantages, returns = compute_gae(rewards, dones, values, last_value, args.gamma, args.gae_lambda)
-                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
 
             last_policy_loss = last_value_loss = last_entropy = 0.0
             indices = torch.arange(obs.size(0), device=device)

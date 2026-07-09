@@ -108,25 +108,52 @@ def load_imitation_actor(policy: TanhGaussianPolicy, checkpoint_path: Path) -> N
     if policy.model_name == "mobilenet_v3_small":
         translated = {}
         for key, value in state_dict.items():
-            if key.startswith("features.") or key.startswith("avgpool."):
-                translated[f"encoder.{key}"] = value
-            elif key.startswith("classifier.") and not key.startswith("classifier.3"):
-                translated[f"encoder.3.{key.removeprefix('classifier.')}"] = value
+            if key.startswith("features."):
+                translated[f"encoder.0.{key.removeprefix('features.')}"] = value
+            elif key.startswith("avgpool."):
+                translated[f"encoder.1.{key.removeprefix('avgpool.')}"] = value
+            elif key.startswith("classifier.0."):
+                translated[f"encoder.3.{key.removeprefix('classifier.0.')}"] = value
             elif key == "classifier.3.weight":
                 translated["mean.weight"] = value
             elif key == "classifier.3.bias":
                 translated["mean.bias"] = value
-        policy.load_state_dict(translated, strict=False)
+        missing, unexpected = policy.load_state_dict(translated, strict=False)
+        unexpected = [key for key in unexpected if key != "log_std"]
+        missing = [key for key in missing if key != "log_std"]
+        if missing or unexpected:
+            raise RuntimeError(
+                "Could not map MobileNet imitation checkpoint into RL actor: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
         return
 
     if policy.model_name == "resnet18":
+        encoder_prefixes = {
+            "conv1.": "encoder.0.",
+            "bn1.": "encoder.1.",
+            "layer1.": "encoder.4.",
+            "layer2.": "encoder.5.",
+            "layer3.": "encoder.6.",
+            "layer4.": "encoder.7.",
+        }
         translated = {}
         for key, value in state_dict.items():
             if key.startswith("fc."):
                 translated[key.replace("fc.", "mean.")] = value
             else:
-                translated[f"encoder.{key}"] = value
-        policy.load_state_dict(translated, strict=False)
+                for source_prefix, target_prefix in encoder_prefixes.items():
+                    if key.startswith(source_prefix):
+                        translated[f"{target_prefix}{key.removeprefix(source_prefix)}"] = value
+                        break
+        missing, unexpected = policy.load_state_dict(translated, strict=False)
+        unexpected = [key for key in unexpected if key != "log_std"]
+        missing = [key for key in missing if key != "log_std"]
+        if missing or unexpected:
+            raise RuntimeError(
+                "Could not map ResNet imitation checkpoint into RL actor: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
         return
 
     raise ValueError(f"Unsupported model: {policy.model_name}")

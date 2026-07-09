@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-episode-steps",
         type=int,
-        default=1000,
+        default=1024,
         help="Reset and log an episode after this many steps; set to 0 to rely only on environment termination.",
     )
     parser.add_argument(
@@ -136,7 +136,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--value-coef", type=float, default=0.5)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--image-size", type=int, default=224)
-    parser.add_argument("--crop-y-start", type=int, default=200)
+    parser.add_argument("--crop-y-start", type=int, default=0)
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
     parser.add_argument("--seed", type=int, default=42)

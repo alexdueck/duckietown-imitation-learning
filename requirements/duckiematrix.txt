@@ -1,0 +1,9 @@
+# Common dependencies for Duckiematrix imitation/RL scripts.
+# Install gym-duckiematrix and the Duckietown SDK according to your local Duckiematrix setup.
+numpy
+pandas
+Pillow
+pygame
+torch
+torchvision
+tqdm

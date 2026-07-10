@@ -1,0 +1,21 @@
+# Dependencies for the gym-duckietown PPO trainer and manual reward viewer.
+# Install gym-duckietown itself separately from the cloned repo:
+#   cd ~/git/gym-duckietown
+#   python -m pip install -e . --no-deps
+#
+# The explicit NumPy/OpenCV versions avoid old source builds on modern macOS/Ubuntu.
+numpy==1.26.4
+opencv-python==4.10.0.84
+pyglet==1.5.15
+gym==0.23.1
+PyYAML
+pyzmq
+Pillow
+typing_extensions
+tqdm
+carnivalmirror==0.6.2
+duckietown-world-daffy
+PyGeometry-z6
+zuper-commons-z6
+torch
+torchvision

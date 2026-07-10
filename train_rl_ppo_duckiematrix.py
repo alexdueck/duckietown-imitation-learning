@@ -27,6 +27,7 @@ from gym_duckiematrix.DB21J import DuckiematrixDB21JEnv
 
 from live_eval_imitation_policy import observation_to_rgb, shutdown_dtps
 from rl_models import TanhGaussianPolicy, load_imitation_actor
+from rl_rewards import KalaposRewardCalculator, REWARD_FUNCTION_CHOICES, RewardMetadata
 from train_imitation_learning import IMAGENET_MEAN, IMAGENET_STD, build_model, resolve_device, set_seed
 
 
@@ -35,6 +36,7 @@ class PPOConfig:
     output_dir: str
     map_name: str | None
     entity_name: str
+    reward_function: str
     model: str
     imitation_checkpoint: str | None
     resume_checkpoint: str | None
@@ -84,6 +86,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("checkpoints/rl_ppo"))
     parser.add_argument("--entity-name", default="map_0/vehicle_0")
     parser.add_argument("--map-name", default=None, help="Recorded in config; select the map in Duckiematrix itself.")
+    parser.add_argument(
+        "--reward-function",
+        choices=REWARD_FUNCTION_CHOICES,
+        default="posangle",
+        help=(
+            "Reward seen by PPO. 'default' keeps gym-duckiematrix's reward; "
+            "the other options adapt kaland313/Duckietown-RL reward wrappers."
+        ),
+    )
     parser.add_argument("--model", choices=("mobilenet_v3_small", "resnet18"), default="mobilenet_v3_small")
     parser.add_argument("--imitation-checkpoint", type=Path, default=None)
     parser.add_argument(
@@ -280,6 +291,7 @@ def write_training_episode(
 def evaluate_policy(
     env,
     policy: TanhGaussianPolicy,
+    reward_calculator: KalaposRewardCalculator,
     args: argparse.Namespace,
     transform: transforms.Compose,
     device: torch.device,
@@ -307,9 +319,15 @@ def evaluate_policy(
             with torch.no_grad():
                 action_tensor = policy.act(obs_tensor, deterministic=args.eval_deterministic)
             action = action_tensor.squeeze(0).cpu().numpy().astype(np.float32)
+            previous_pose = getattr(env, "last_pose", None)
             observation, reward, terminated, truncated, info = env.step(action)
 
-            reward = float(reward)
+            reward = reward_calculator.compute(
+                env=env,
+                action=action,
+                previous_pose=previous_pose,
+                env_reward=float(reward),
+            )
             total_return += reward
             episode_return += reward
             episode_length += 1
@@ -394,7 +412,12 @@ def main() -> None:
         if k not in {"camera_width", "camera_height", "device"}
     }
     config = PPOConfig(**config_values, device=str(device))
-    (run_dir / "config.json").write_text(json.dumps(asdict(config), indent=2) + "\n")
+    reward_metadata = RewardMetadata(name=args.reward_function)
+    config_json = {
+        **asdict(config),
+        "reward_metadata": asdict(reward_metadata),
+    }
+    (run_dir / "config.json").write_text(json.dumps(config_json, indent=2) + "\n")
 
     transform = make_transform()
     policy = TanhGaussianPolicy(args.model, pretrained=args.imitation_checkpoint is None and args.resume_checkpoint is None).to(device)
@@ -462,6 +485,8 @@ def main() -> None:
     env = None
     try:
         env = DuckiematrixDB21JEnv(entity_name=args.entity_name, headless=True, camera_width=args.camera_width, camera_height=args.camera_height)
+        reward_calculator = KalaposRewardCalculator(args.reward_function)
+        print(f"Reward function: {args.reward_function}", flush=True)
         observation, info = reset_environment(env, args, reset_rng, seed=args.seed)
         if args.debug_initial_action:
             with torch.no_grad():
@@ -517,19 +542,26 @@ def main() -> None:
                     action_tensor, logp_tensor, _ = policy.sample(obs_tensor.unsqueeze(0))
                     value_tensor = value(obs_tensor.unsqueeze(0))
                 action = action_tensor.squeeze(0).cpu().numpy().astype(np.float32)
+                previous_pose = getattr(env, "last_pose", None)
                 next_observation, reward, terminated, truncated, info = env.step(action)
+                reward = reward_calculator.compute(
+                    env=env,
+                    action=action,
+                    previous_pose=previous_pose,
+                    env_reward=float(reward),
+                )
 
                 obs_buf.append(obs_tensor.cpu())
                 action_buf.append(action_tensor.squeeze(0).cpu())
                 logp_buf.append(logp_tensor.squeeze(0).cpu())
                 value_buf.append(value_tensor.squeeze(0).cpu())
-                episode_return += float(reward)
+                episode_return += reward
                 episode_length += 1
                 global_step += 1
                 env_done = bool(terminated or truncated)
                 time_limit_done = args.max_episode_steps > 0 and episode_length >= args.max_episode_steps
                 done = env_done or time_limit_done
-                reward_buf.append(float(reward))
+                reward_buf.append(reward)
                 done_buf.append(float(done))
                 observation = next_observation
 
@@ -639,7 +671,7 @@ def main() -> None:
                     episode_return = 0.0
                     episode_length = 0
 
-                eval_result = evaluate_policy(env, policy, args, transform, device, reset_rng)
+                eval_result = evaluate_policy(env, policy, reward_calculator, args, transform, device, reset_rng)
                 eval_index += 1
                 eval_row = {
                     "train_step": global_step,

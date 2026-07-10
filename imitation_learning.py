@@ -2,6 +2,7 @@ import asyncio
 import argparse
 import csv
 import json
+import math
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from datetime import datetime
@@ -19,6 +20,7 @@ except ImportError:
 from gym_duckiematrix.DB21J import DuckiematrixDB21JEnv
 from duckietown.sdk.middleware.dtps.base import DTPS
 from duckiematrix_telemetry import TELEMETRY_COLUMNS, collect_state_telemetry, format_telemetry_value
+from rl_rewards import compute_reward_breakdowns
 
 
 # ----------------------------
@@ -27,7 +29,7 @@ from duckiematrix_telemetry import TELEMETRY_COLUMNS, collect_state_telemetry, f
 
 ENTITY_NAME = "map_0/vehicle_0"
 OUT_DIR = Path("~/duckietown/imitation_learning/expert_data").expanduser()
-MAX_STEPS = 3000
+MAX_STEPS = 30000
 JPEG_QUALITY = 95
 TIMESTAMP_COLUMN = "timestamp in seconds since run start"
 NONZERO_ACTION_EPS = 0.1
@@ -44,7 +46,7 @@ AUTO_CENTER_RATE = 0.9
 SOURCE_OBSERVATION_CHANNEL_ORDER = "bgr"
 SAVED_IMAGE_CHANNEL_ORDER = "rgb"
 
-WINDOW_SIZE = (720, 260)
+WINDOW_SIZE = (980, 372)
 WINDOW_BG = (24, 27, 30)
 WINDOW_TEXT = (238, 241, 243)
 WINDOW_MUTED = (172, 179, 186)
@@ -270,6 +272,23 @@ def render_status_line(
     screen.blit(font.render(text, True, color), xy)
 
 
+def format_live_value(value: float, precision: int = 4, signed: bool = True) -> str:
+    value = float(value)
+    if math.isnan(value):
+        return "nan"
+    sign = "+" if signed else ""
+    return f"{value:{sign}.{precision}f}"
+
+
+def reward_total(reward_breakdowns: dict, name: str) -> float:
+    return float(reward_breakdowns[name]["total"])
+
+
+def reward_component(reward_breakdowns: dict, name: str, component: str) -> float:
+    components = reward_breakdowns[name]["components"]
+    return float(components[component])
+
+
 def render_live_status(
     screen: pygame.Surface,
     fonts: dict[str, pygame.font.Font],
@@ -278,6 +297,7 @@ def render_live_status(
     action_controller,
     action: np.ndarray,
     telemetry: dict,
+    reward_breakdowns: dict,
 ) -> None:
     screen.fill(WINDOW_BG)
     render_status_line(
@@ -319,6 +339,34 @@ def render_live_status(
         f"lane_valid={int(bool(telemetry['lane_position_valid']))}   "
         f"terminated={int(bool(telemetry['terminated']))} truncated={int(bool(telemetry['truncated']))}",
         (22, 216),
+        WINDOW_MUTED,
+    )
+    render_status_line(
+        screen,
+        fonts["normal"],
+        "variants "
+        f"default {format_live_value(reward_total(reward_breakdowns, 'default'))}   "
+        f"posangle {format_live_value(reward_total(reward_breakdowns, 'posangle'))}   "
+        f"target {format_live_value(reward_total(reward_breakdowns, 'target_orientation'))}   "
+        f"lane_distance {format_live_value(reward_total(reward_breakdowns, 'lane_distance'))}",
+        (22, 256),
+    )
+    render_status_line(
+        screen,
+        fonts["normal"],
+        "posangle parts "
+        f"DtRewardPosAngle {format_live_value(reward_component(reward_breakdowns, 'posangle', 'DtRewardPosAngle'))}   "
+        f"DtRewardVelocity {format_live_value(reward_component(reward_breakdowns, 'posangle', 'DtRewardVelocity'))}",
+        (22, 292),
+        WINDOW_MUTED,
+    )
+    render_status_line(
+        screen,
+        fonts["normal"],
+        "target parts "
+        f"DtRewardTargetOrientation {format_live_value(reward_component(reward_breakdowns, 'target_orientation', 'DtRewardTargetOrientation'))}   "
+        f"DtRewardVelocity {format_live_value(reward_component(reward_breakdowns, 'target_orientation', 'DtRewardVelocity'))}",
+        (22, 328),
         WINDOW_MUTED,
     )
     pygame.display.flip()
@@ -466,6 +514,7 @@ def main():
         obs, info = env.reset()
         action_controller = KeyboardActionController()
         previous_pose_for_current_observation = None
+        previous_action_for_current_observation = None
         pending_reward = float("nan")
         pending_terminated = False
         pending_truncated = False
@@ -496,6 +545,12 @@ def main():
                 terminated=pending_terminated,
                 truncated=pending_truncated,
             )
+            reward_breakdowns = compute_reward_breakdowns(
+                env=env,
+                action=previous_action_for_current_observation,
+                previous_pose=previous_pose_for_current_observation,
+                env_reward=pending_reward,
+            )
 
             timestamp = time() - t0
 
@@ -519,6 +574,23 @@ def main():
                 f"dist={float(telemetry['lane_dist']):+.4f} "
                 f"lane_valid={int(bool(telemetry['lane_position_valid']))}"
             )
+            print(
+                "reward_variants "
+                f"default={format_live_value(reward_total(reward_breakdowns, 'default'))} "
+                f"posangle={format_live_value(reward_total(reward_breakdowns, 'posangle'))} "
+                f"target_orientation={format_live_value(reward_total(reward_breakdowns, 'target_orientation'))} "
+                f"lane_distance={format_live_value(reward_total(reward_breakdowns, 'lane_distance'))}"
+            )
+            print(
+                "posangle_parts "
+                f"DtRewardPosAngle={format_live_value(reward_component(reward_breakdowns, 'posangle', 'DtRewardPosAngle'))} "
+                f"DtRewardVelocity={format_live_value(reward_component(reward_breakdowns, 'posangle', 'DtRewardVelocity'))}"
+            )
+            print(
+                "target_orientation_parts "
+                f"DtRewardTargetOrientation={format_live_value(reward_component(reward_breakdowns, 'target_orientation', 'DtRewardTargetOrientation'))} "
+                f"DtRewardVelocity={format_live_value(reward_component(reward_breakdowns, 'target_orientation', 'DtRewardVelocity'))}"
+            )
 
             caption_mode = "Observer" if observe_only else "Collector"
             pygame.display.set_caption(
@@ -535,11 +607,13 @@ def main():
                 action_controller=action_controller,
                 action=action,
                 telemetry=telemetry,
+                reward_breakdowns=reward_breakdowns,
             )
 
             pose_before_step = getattr(env, "last_pose", None)
             obs, reward, terminated, truncated, info = env.step(action)
             previous_pose_for_current_observation = pose_before_step
+            previous_action_for_current_observation = action.copy()
             pending_reward = float(reward)
             pending_terminated = bool(terminated)
             pending_truncated = bool(truncated)
@@ -552,6 +626,7 @@ def main():
                     )
                     obs, info = env.reset()
                     previous_pose_for_current_observation = None
+                    previous_action_for_current_observation = None
                     pending_reward = float("nan")
                     pending_terminated = False
                     pending_truncated = False

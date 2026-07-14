@@ -4,6 +4,7 @@
 #   python -m pip install -e . --no-deps
 #
 # The explicit NumPy/OpenCV versions avoid old source builds on modern macOS/Ubuntu.
+argcomplete
 numpy==1.26.4
 opencv-python==4.10.0.84
 pyglet==1.5.15

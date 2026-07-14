@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
 """Train a PPO policy from camera images in gym-duckietown.
 
 This trainer intentionally lives beside the Duckiematrix trainer instead of
@@ -27,6 +28,8 @@ from duckietown_rewards import (
     format_wheel_action,
     patch_duckietown_world_dynamics,
 )
+from cli_completion import parse_args_with_completion
+from duckietown_paths import RL_PPO_GYM_DUCKIETOWN_CHECKPOINT_DIR
 from rl_models import TanhGaussianPolicy, load_imitation_actor
 from train_imitation_learning import IMAGENET_MEAN, IMAGENET_STD, build_model, resolve_device, set_seed
 
@@ -92,7 +95,11 @@ class ValueNetwork(nn.Module):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO in gym-duckietown.")
-    parser.add_argument("--output-dir", type=Path, default=Path("checkpoints/rl_ppo_gym_duckietown"))
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=RL_PPO_GYM_DUCKIETOWN_CHECKPOINT_DIR,
+    )
     parser.add_argument("--map-name", default="loop_empty")
     parser.add_argument(
         "--reward-function",
@@ -160,7 +167,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug-initial-action", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
-    return parser.parse_args()
+    return parse_args_with_completion(parser)
 
 
 def observation_to_rgb(observation: np.ndarray, channel_order: str) -> np.ndarray:

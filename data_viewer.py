@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
+
 import argparse
 import csv
 import json
@@ -8,10 +11,12 @@ from typing import Any
 import numpy as np
 import pygame
 
+from cli_completion import parse_args_with_completion
+from duckietown_paths import IMITATION_LEARNING_TRAIN_DATA_DIR
 from duckiematrix_telemetry import TELEMETRY_COLUMNS
 
 
-DEFAULT_DATA_DIR = Path("~/duckietown/imitation_learning/expert_data").expanduser()
+DEFAULT_DATA_DIR = IMITATION_LEARNING_TRAIN_DATA_DIR
 TIMESTAMP_COLUMN = "timestamp in seconds since run start"
 
 BACKGROUND = (20, 22, 24)
@@ -376,7 +381,7 @@ def parse_args() -> argparse.Namespace:
         default="native",
         help="native shows stored pixel size when it fits; fit scales the image to the viewer.",
     )
-    return parser.parse_args()
+    return parse_args_with_completion(parser)
 
 
 def main() -> None:

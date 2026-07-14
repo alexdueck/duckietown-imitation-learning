@@ -1,9 +1,14 @@
+#!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
+
 from pathlib import Path
 import argparse
 
 import pandas as pd
 from PIL import Image
 from tqdm import tqdm
+
+from cli_completion import parse_args_with_completion
 
 
 def preprocess_image(
@@ -32,7 +37,10 @@ def main():
         "--input-run",
         type=str,
         required=True,
-        help="Pfad zum Run-Ordner, z.B. expert_data/run_20260706_153000",
+        help=(
+            "Pfad zum Run-Ordner, z.B. "
+            "~/duckietown/data/imitation_learning/train/run_001_20260707_094333"
+        ),
     )
     parser.add_argument("--crop-y-start", type=int, default=200)
     parser.add_argument("--out-width", type=int, default=224)
@@ -43,7 +51,7 @@ def main():
         action="store_true",
         help="Existierende Dateien in images_processed überschreiben",
     )
-    args = parser.parse_args()
+    args = parse_args_with_completion(parser)
 
     run_dir = Path(args.input_run)
     input_images_dir = run_dir / "images"

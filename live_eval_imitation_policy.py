@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
 """Run a trained imitation-learning policy live in gym-duckiematrix."""
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ from torchvision import transforms
 from duckietown.sdk.middleware.dtps.base import DTPS
 from gym_duckiematrix.DB21J import DuckiematrixDB21JEnv
 
+from cli_completion import parse_args_with_completion
+from duckietown_paths import IMITATION_LEARNING_CHECKPOINT_DIR
 from train_imitation_learning import (
     IMAGENET_MEAN,
     IMAGENET_STD,
@@ -28,8 +31,10 @@ from train_imitation_learning import (
 
 
 ENTITY_NAME = "map_0/vehicle_0"
-DEFAULT_CHECKPOINT = Path(
-    "checkpoints/imitation_learning/20260707_132144_mobilenet_v3_small/best.pt"
+DEFAULT_CHECKPOINT = (
+    IMITATION_LEARNING_CHECKPOINT_DIR
+    / "20260707_132144_mobilenet_v3_small"
+    / "best.pt"
 )
 SOURCE_OBSERVATION_CHANNEL_ORDER = "bgr"
 CAMERA_WIDTH = 640
@@ -79,7 +84,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Reset the environment and keep running after termination/truncation.",
     )
-    return parser.parse_args()
+    return parse_args_with_completion(parser)
 
 
 def shutdown_dtps(timeout: float = 2.0) -> None:

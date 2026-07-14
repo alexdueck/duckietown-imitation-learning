@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
+
 import asyncio
 import argparse
 import csv
@@ -19,6 +22,8 @@ except ImportError:
 
 from gym_duckiematrix.DB21J import DuckiematrixDB21JEnv
 from duckietown.sdk.middleware.dtps.base import DTPS
+from cli_completion import parse_args_with_completion
+from duckietown_paths import IMITATION_LEARNING_TRAIN_DATA_DIR
 from duckiematrix_telemetry import TELEMETRY_COLUMNS, collect_state_telemetry, format_telemetry_value
 from rl_rewards import compute_reward_breakdowns
 
@@ -28,7 +33,7 @@ from rl_rewards import compute_reward_breakdowns
 # ----------------------------
 
 ENTITY_NAME = "map_0/vehicle_0"
-OUT_DIR = Path("~/duckietown/imitation_learning/expert_data").expanduser()
+OUT_DIR = IMITATION_LEARNING_TRAIN_DATA_DIR
 MAX_STEPS = 30000
 JPEG_QUALITY = 95
 TIMESTAMP_COLUMN = "timestamp in seconds since run start"
@@ -429,7 +434,7 @@ def parse_args():
         action="store_true",
         help="Show live action/reward/lane telemetry without saving any dataset files.",
     )
-    return parser.parse_args()
+    return parse_args_with_completion(parser)
 
 
 def main():

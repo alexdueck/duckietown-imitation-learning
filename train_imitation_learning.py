@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
 """Train a compact imitation-learning policy for Duckiematrix Duckiebots.
 
 The model predicts two continuous motor commands from a preprocessed camera
@@ -23,15 +24,19 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import models, transforms
 
+from cli_completion import parse_args_with_completion
+from duckietown_paths import (
+    IMITATION_LEARNING_CHECKPOINT_DIR,
+    IMITATION_LEARNING_DATA_DIR,
+)
+
 try:
     from tqdm import tqdm
 except ImportError:  # pragma: no cover - only affects terminal nicety
     tqdm = None
 
 
-DEFAULT_RUN_DIR = Path(
-    "~/duckietown-data/imitation_learning/expert_data/run_001_20260707_094333"
-).expanduser()
+DEFAULT_RUN_DIR = IMITATION_LEARNING_DATA_DIR
 TARGET_COLUMNS = ("left_action", "right_action")
 IMAGE_COLUMN = "image"
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -182,7 +187,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("checkpoints/imitation_learning"),
+        default=IMITATION_LEARNING_CHECKPOINT_DIR,
     )
     parser.add_argument(
         "--experiment-name",
@@ -228,7 +233,7 @@ def parse_args() -> argparse.Namespace:
         help="Skip rows whose preprocessed image file is missing.",
     )
     parser.set_defaults(pretrained=True)
-    return parser.parse_args()
+    return parse_args_with_completion(parser)
 
 
 def resolve_image_dir(run_dir: Path, image_dir_arg: Path | None) -> Path:

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
 """Train a PPO policy from camera images in gym-duckiematrix.
 
 Recommended first RL approach: on-policy PPO with a squashed Gaussian actor. It is
@@ -25,6 +26,8 @@ from torchvision import transforms
 from duckietown.sdk.middleware.dtps.base import DTPS
 from gym_duckiematrix.DB21J import DuckiematrixDB21JEnv
 
+from cli_completion import parse_args_with_completion
+from duckietown_paths import RL_PPO_DUCKIEMATRIX_CHECKPOINT_DIR
 from live_eval_imitation_policy import observation_to_rgb, shutdown_dtps
 from rl_models import TanhGaussianPolicy, load_imitation_actor
 from rl_rewards import KalaposRewardCalculator, REWARD_FUNCTION_CHOICES, RewardMetadata
@@ -83,7 +86,11 @@ class ValueNetwork(nn.Module):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO in Duckiematrix.")
-    parser.add_argument("--output-dir", type=Path, default=Path("checkpoints/rl_ppo"))
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=RL_PPO_DUCKIEMATRIX_CHECKPOINT_DIR,
+    )
     parser.add_argument("--entity-name", default="map_0/vehicle_0")
     parser.add_argument("--map-name", default=None, help="Recorded in config; select the map in Duckiematrix itself.")
     parser.add_argument(
@@ -186,7 +193,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
-    return parser.parse_args()
+    return parse_args_with_completion(parser)
 
 
 def make_transform() -> transforms.Compose:

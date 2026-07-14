@@ -1,5 +1,6 @@
 # Common dependencies for Duckiematrix imitation/RL scripts.
 # Install gym-duckiematrix and the Duckietown SDK according to your local Duckiematrix setup.
+argcomplete
 numpy
 pandas
 Pillow

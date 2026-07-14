@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # PYTHON_ARGCOMPLETE_OK
-"""Visually evaluate a Duckiematrix-trained IL policy in gym-duckietown."""
+"""Visually evaluate a trained PPO policy in gym-duckietown on macOS."""
 
 from __future__ import annotations
 
 import argparse
-import csv
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -14,19 +13,18 @@ from typing import Any
 import numpy as np
 import pyglet
 import torch
-from PIL import Image
-from torchvision import transforms
 
 from cli_completion import parse_args_with_completion
 from duckietown_paths import (
     EVALUATION_SCREENSHOT_DIR,
-    IL_GYM_DUCKIETOWN_EVALUATION_DIR,
+    RL_GYM_DUCKIETOWN_EVALUATION_DIR,
 )
 from duckietown_rewards import (
     GymDuckietownRewardCalculator,
     REWARD_FUNCTION_CHOICES,
     format_wheel_action,
 )
+from live_eval_imitation_policy_gym_duckietown import ReturnRecorder, reset_raw, step_raw
 from manual_control_gym_duckietown import (
     ACCENT,
     BACKGROUND,
@@ -45,22 +43,19 @@ from manual_control_gym_duckietown import (
     prepare_window_2d,
     save_screenshot,
 )
-from train_imitation_learning import (
-    IMAGENET_MEAN,
-    IMAGENET_STD,
-    TARGET_COLUMNS,
-    build_model,
-    resolve_device,
-)
+from rl_models import TanhGaussianPolicy
+from train_imitation_learning import resolve_device
+from train_rl_ppo_gym_duckietown import make_transform, preprocess
 
 
-SIDEBAR_WIDTH = 460
+SIDEBAR_WIDTH = 480
 
 
 @dataclass
-class EvalState:
-    raw_action: np.ndarray
+class ViewerState:
+    mean_action: np.ndarray
     action: np.ndarray
+    std: np.ndarray
     env_reward: float
     selected_reward: float
     env_return: float
@@ -74,91 +69,59 @@ class EvalState:
     paused: bool
 
 
-class ReturnRecorder:
-    FIELDNAMES = (
-        "episode",
-        "status",
-        "length",
-        "selected_reward_function",
-        "selected_return",
-        "gym_duckietown_return",
-        "done_reason",
-    )
-
-    def __init__(self, path: Path) -> None:
-        self.path = path.expanduser()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("w", newline="") as file:
-            csv.DictWriter(file, fieldnames=self.FIELDNAMES).writeheader()
-
-    def record(
-        self,
-        episode: int,
-        status: str,
-        length: int,
-        reward_function: str,
-        selected_return: float,
-        env_return: float,
-        reason: str,
-    ) -> None:
-        row = {
-            "episode": episode,
-            "status": status,
-            "length": length,
-            "selected_reward_function": reward_function,
-            "selected_return": selected_return,
-            "gym_duckietown_return": env_return,
-            "done_reason": reason,
-        }
-        with self.path.open("a", newline="") as file:
-            csv.DictWriter(file, fieldnames=self.FIELDNAMES).writerow(row)
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a trained imitation-learning policy visually in gym-duckietown."
+        description="Run a trained PPO policy visually in gym-duckietown on macOS."
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--map-name", default="loop_empty")
+    parser.add_argument(
+        "--map-name",
+        default=None,
+        help="Defaults to the map stored in the checkpoint.",
+    )
     parser.add_argument(
         "--reward-function",
         choices=REWARD_FUNCTION_CHOICES,
-        default="posangle",
-        help="Reward accumulated as selected_return; the original simulator return is tracked too.",
+        default=None,
+        help="Defaults to the reward function stored in the checkpoint.",
     )
-    parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--max-steps", type=int, default=1024)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Simulator episode limit; defaults to the checkpoint's max_episode_steps.",
+    )
     parser.add_argument(
         "--episodes",
         type=int,
         default=0,
         help="Number of completed episodes before exiting; 0 runs until Escape.",
     )
-    parser.add_argument("--frame-rate", type=int, default=30)
-    parser.add_argument("--frame-skip", type=int, default=1)
-    parser.add_argument("--camera-width", type=int, default=640)
-    parser.add_argument("--camera-height", type=int, default=480)
+    parser.add_argument("--frame-rate", type=int, default=None)
+    parser.add_argument("--frame-skip", type=int, default=None)
+    parser.add_argument("--camera-width", type=int, default=None)
+    parser.add_argument("--camera-height", type=int, default=None)
     parser.add_argument("--robot-speed", type=float, default=None)
-    parser.add_argument("--accept-start-angle-deg", type=float, default=4.0)
-    parser.add_argument("--domain-rand", action="store_true")
-    parser.add_argument("--distortion", action="store_true")
-    parser.add_argument("--dynamics-rand", action="store_true")
-    parser.add_argument("--camera-rand", action="store_true")
-    parser.add_argument("--draw-curve", action="store_true")
-    parser.add_argument("--draw-bbox", action="store_true")
-    parser.add_argument("--crop-y-start", type=int, default=0)
-    parser.add_argument(
-        "--image-size",
-        type=int,
-        default=None,
-        help="Model input size; defaults to the checkpoint config or 224.",
-    )
+    parser.add_argument("--accept-start-angle-deg", type=float, default=None)
+    parser.add_argument("--domain-rand", dest="domain_rand", action="store_true")
+    parser.add_argument("--no-domain-rand", dest="domain_rand", action="store_false")
+    parser.add_argument("--distortion", dest="distortion", action="store_true")
+    parser.add_argument("--no-distortion", dest="distortion", action="store_false")
+    parser.set_defaults(domain_rand=None, distortion=None)
+    parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument("--crop-y-start", type=int, default=None)
     parser.add_argument(
         "--source-observation-channel-order",
         choices=("rgb", "bgr"),
-        default="rgb",
+        default=None,
     )
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
+    parser.add_argument(
+        "--stochastic",
+        action="store_true",
+        help="Sample actions from the learned Gaussian instead of using tanh(mean).",
+    )
     parser.add_argument(
         "--stop-on-done",
         action="store_true",
@@ -172,13 +135,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "CSV destination; defaults to "
-            f"{IL_GYM_DUCKIETOWN_EVALUATION_DIR}/<timestamp>_returns.csv."
+            f"{RL_GYM_DUCKIETOWN_EVALUATION_DIR}/<timestamp>_returns.csv."
         ),
     )
     parser.add_argument(
         "--screenshot-path",
         type=Path,
-        default=EVALUATION_SCREENSHOT_DIR / "gym_duckietown_il_eval.png",
+        default=EVALUATION_SCREENSHOT_DIR / "gym_duckietown_rl_eval.png",
     )
     parser.add_argument(
         "--log-level",
@@ -188,101 +151,123 @@ def parse_args() -> argparse.Namespace:
     return parse_args_with_completion(parser)
 
 
+def config_value(value, config: dict[str, Any], key: str, default):
+    return config.get(key, default) if value is None else value
+
+
 def load_policy(
     checkpoint_path: Path,
     device: torch.device,
-) -> tuple[torch.nn.Module, dict[str, Any]]:
+) -> tuple[TanhGaussianPolicy, dict[str, Any], int]:
     checkpoint_path = checkpoint_path.expanduser()
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    if "policy_state_dict" not in checkpoint:
+        raise ValueError(
+            f"{checkpoint_path} is not an RL checkpoint: policy_state_dict is missing"
+        )
+    env_backend = checkpoint.get("env_backend")
+    if env_backend not in (None, "gym-duckietown"):
+        raise ValueError(
+            f"Checkpoint backend is {env_backend!r}, expected 'gym-duckietown'"
+        )
+
     config = checkpoint.get("config", {})
-    target_columns = tuple(checkpoint.get("target_columns", TARGET_COLUMNS))
-    if target_columns != TARGET_COLUMNS:
-        raise ValueError(f"Checkpoint predicts {target_columns}, expected {TARGET_COLUMNS}")
+    model_name = config.get("model", "mobilenet_v3_small")
+    policy = TanhGaussianPolicy(model_name, pretrained=False)
+    policy.load_state_dict(checkpoint["policy_state_dict"])
+    policy.to(device)
+    policy.eval()
+    return policy, config, int(checkpoint.get("step", 0))
 
-    model = build_model(
-        model_name=config.get("model", "mobilenet_v3_small"),
-        pretrained=False,
-        train_backbone=bool(config.get("train_backbone", False)),
+
+def apply_checkpoint_defaults(args: argparse.Namespace, config: dict[str, Any]) -> None:
+    args.map_name = config_value(args.map_name, config, "map_name", "loop_empty")
+    args.reward_function = config_value(
+        args.reward_function,
+        config,
+        "reward_function",
+        "posangle",
     )
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(device)
-    model.eval()
-    return model, config
-
-
-def make_transform() -> transforms.Compose:
-    return transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-        ]
+    args.seed = int(config_value(args.seed, config, "seed", 42))
+    args.frame_rate = int(config_value(args.frame_rate, config, "frame_rate", 30))
+    args.frame_skip = int(config_value(args.frame_skip, config, "frame_skip", 1))
+    args.camera_width = int(
+        config_value(args.camera_width, config, "camera_width", 640)
+    )
+    args.camera_height = int(
+        config_value(args.camera_height, config, "camera_height", 480)
+    )
+    args.robot_speed = config_value(args.robot_speed, config, "robot_speed", None)
+    args.accept_start_angle_deg = float(
+        config_value(
+            args.accept_start_angle_deg,
+            config,
+            "accept_start_angle_deg",
+            4.0,
+        )
+    )
+    args.domain_rand = bool(
+        config_value(args.domain_rand, config, "domain_rand", False)
+    )
+    args.distortion = bool(
+        config_value(args.distortion, config, "distortion", False)
+    )
+    args.image_size = int(config_value(args.image_size, config, "image_size", 224))
+    args.crop_y_start = int(
+        config_value(args.crop_y_start, config, "crop_y_start", 0)
+    )
+    args.source_observation_channel_order = config_value(
+        args.source_observation_channel_order,
+        config,
+        "source_observation_channel_order",
+        "rgb",
     )
 
+    if args.max_steps is None:
+        max_episode_steps = int(config.get("max_episode_steps", 0) or 0)
+        simulator_max_steps = config.get("simulator_max_steps")
+        if max_episode_steps > 0:
+            args.max_steps = max_episode_steps
+        elif simulator_max_steps is not None and int(simulator_max_steps) > 0:
+            args.max_steps = int(simulator_max_steps)
+        else:
+            args.max_steps = 100_000_000
 
-def observation_to_rgb(observation: np.ndarray, channel_order: str) -> np.ndarray:
-    image = np.ascontiguousarray(observation)
-    if image.dtype != np.uint8:
-        image = np.clip(image, 0, 255).astype(np.uint8)
-    if image.ndim != 3 or image.shape[2] != 3:
-        raise ValueError(f"Expected observation shape (H, W, 3), got {image.shape}")
-    if channel_order == "rgb":
-        return image
-    return np.ascontiguousarray(image[:, :, [2, 1, 0]])
-
-
-def preprocess_observation(
-    observation: np.ndarray,
-    crop_y_start: int,
-    image_size: int,
-    channel_order: str,
-    transform: transforms.Compose,
-) -> torch.Tensor:
-    image = Image.fromarray(observation_to_rgb(observation, channel_order)).convert("RGB")
-    width, height = image.size
-    crop_y_start = max(0, min(crop_y_start, height - 1))
-    image = image.crop((0, crop_y_start, width, height))
-    image = image.resize((image_size, image_size), Image.BILINEAR)
-    return transform(image)
+    # make_env() shares these optional viewer settings with manual control.
+    args.dynamics_rand = False
+    args.camera_rand = False
+    args.draw_curve = False
+    args.draw_bbox = False
 
 
 @torch.no_grad()
 def predict_action(
-    model: torch.nn.Module,
+    policy: TanhGaussianPolicy,
     observation: np.ndarray,
-    transform: transforms.Compose,
+    transform,
+    args: argparse.Namespace,
     device: torch.device,
-    crop_y_start: int,
-    image_size: int,
-    channel_order: str,
-) -> tuple[np.ndarray, np.ndarray]:
-    tensor = preprocess_observation(
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    obs_tensor = preprocess(
         observation,
-        crop_y_start,
-        image_size,
-        channel_order,
+        args.crop_y_start,
+        args.image_size,
+        args.source_observation_channel_order,
         transform,
     ).unsqueeze(0).to(device)
-    raw_action = model(tensor).squeeze(0).cpu().numpy().astype(np.float32)
-    return raw_action, format_wheel_action(raw_action)
-
-
-def reset_raw(env) -> np.ndarray:
-    result = env.reset()
-    if isinstance(result, tuple):
-        return result[0]
-    return result
-
-
-def step_raw(env, action: np.ndarray) -> tuple[np.ndarray, float, bool, dict[str, Any]]:
-    result = env.step(action)
-    if len(result) == 5:
-        observation, reward, terminated, truncated, info = result
-        return observation, float(reward), bool(terminated or truncated), info
-    observation, reward, done, info = result
-    return observation, float(reward), bool(done), info
+    mean, log_std = policy(obs_tensor)
+    distribution = torch.distributions.Normal(mean, log_std.exp())
+    raw_action = distribution.sample() if args.stochastic else distribution.mean
+    action = torch.tanh(raw_action)
+    mean_action = torch.tanh(distribution.mean)
+    return (
+        mean_action.squeeze(0).cpu().numpy().astype(np.float32),
+        format_wheel_action(action.squeeze(0).cpu().numpy()),
+        log_std.exp().squeeze(0).cpu().numpy().astype(np.float32),
+    )
 
 
 def fmt(value: float | None, precision: int = 4) -> str:
@@ -291,22 +276,36 @@ def fmt(value: float | None, precision: int = 4) -> str:
     return f"{float(value):+.{precision}f}"
 
 
-def draw_sidebar(state: EvalState, args: argparse.Namespace, x: int, height: int) -> None:
+def draw_sidebar(
+    state: ViewerState,
+    args: argparse.Namespace,
+    checkpoint_step: int,
+    x: int,
+    height: int,
+) -> None:
     draw_rect(x, 0, SIDEBAR_WIDTH, height, SIDEBAR_BG)
     status = "paused" if state.paused else "running"
+    mode = "stochastic" if args.stochastic else "deterministic"
     status_color = BAD if state.paused else GOOD
     selected_return_color = GOOD if state.selected_return >= 0.0 else BAD
     env_return_color = GOOD if state.env_return >= 0.0 else BAD
     lines = [
-        ("IL policy in gym-duckietown", 18, ACCENT, True),
+        ("RL policy in gym-duckietown", 18, ACCENT, True),
         (f"map {args.map_name}   {status}", 13, status_color, True),
+        (f"checkpoint step {checkpoint_step}   {mode}", 12, MUTED, False),
         (f"episode {state.episode}   step {state.episode_length}", 13, MUTED, False),
         ("", 8, MUTED, False),
         (f"left {fmt(state.action[0], 3)}   right {fmt(state.action[1], 3)}", 16, TEXT, True),
-        (f"raw left {fmt(state.raw_action[0], 3)}   right {fmt(state.raw_action[1], 3)}", 12, MUTED, False),
+        (f"mean {fmt(state.mean_action[0], 3)}   {fmt(state.mean_action[1], 3)}", 12, MUTED, False),
+        (f"std {state.std[0]:.4f}   {state.std[1]:.4f}", 12, MUTED, False),
         ("", 8, MUTED, False),
         (f"{args.reward_function} reward {fmt(state.selected_reward)}", 15, TEXT, True),
-        (f"{args.reward_function} return {fmt(state.selected_return)}", 17, selected_return_color, True),
+        (
+            f"{args.reward_function} return {fmt(state.selected_return)}",
+            17,
+            selected_return_color,
+            True,
+        ),
         (f"default reward {fmt(state.env_reward)}", 13, MUTED, False),
         (f"default return {fmt(state.env_return)}", 15, env_return_color, True),
         ("", 8, MUTED, False),
@@ -324,17 +323,55 @@ def draw_sidebar(state: EvalState, args: argparse.Namespace, x: int, height: int
     cursor_y = height - 30
     for text, font_size, color, bold in lines:
         if text:
-            draw_label(text, x + 18, cursor_y, font_size=font_size, color=color, bold=bold)
+            draw_label(
+                text,
+                x + 18,
+                cursor_y,
+                font_size=font_size,
+                color=color,
+                bold=bold,
+            )
         cursor_y -= max(16, font_size + 8)
 
 
 def default_returns_path() -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return IL_GYM_DUCKIETOWN_EVALUATION_DIR / f"{timestamp}_returns.csv"
+    return RL_GYM_DUCKIETOWN_EVALUATION_DIR / f"{timestamp}_returns.csv"
+
+
+def empty_state(
+    episode: int,
+    completed_returns: list[float],
+    paused: bool,
+    std: np.ndarray,
+) -> ViewerState:
+    return ViewerState(
+        mean_action=np.zeros(2, dtype=np.float32),
+        action=np.zeros(2, dtype=np.float32),
+        std=std.copy(),
+        env_reward=0.0,
+        selected_reward=0.0,
+        env_return=0.0,
+        selected_return=0.0,
+        episode=episode,
+        episode_length=0,
+        completed_episodes=len(completed_returns),
+        mean_completed_return=(
+            float(np.mean(completed_returns)) if completed_returns else None
+        ),
+        done=False,
+        done_reason="in-progress",
+        paused=paused,
+    )
 
 
 def main() -> None:
     args = parse_args()
+    configure_logging(args.log_level)
+    device = resolve_device(args.device)
+    policy, checkpoint_config, checkpoint_step = load_policy(args.checkpoint, device)
+    apply_checkpoint_defaults(args, checkpoint_config)
+
     if args.max_steps <= 0:
         raise ValueError("--max-steps must be positive")
     if args.episodes < 0:
@@ -342,19 +379,17 @@ def main() -> None:
     if args.frame_rate <= 0:
         raise ValueError("--frame-rate must be positive")
 
-    configure_logging(args.log_level)
-    device = resolve_device(args.device)
-    model, checkpoint_config = load_policy(args.checkpoint, device)
-    image_size = args.image_size or int(checkpoint_config.get("image_size", 224))
     transform = make_transform()
     returns_path = args.returns_file or default_returns_path()
     recorder = ReturnRecorder(returns_path)
-
     env = make_env(args)
     _, _, image_width, image_height = import_simulator()
     reward_calculator = GymDuckietownRewardCalculator(args.reward_function)
     observation = reset_raw(env)
     reward_calculator.reset()
+
+    with torch.no_grad():
+        learned_std = policy.log_std.clamp(-5.0, 2.0).exp().cpu().numpy()
 
     episode = 0
     episode_length = 0
@@ -363,21 +398,7 @@ def main() -> None:
     completed_returns: list[float] = []
     current_episode_recorded = False
     paused = bool(args.start_paused)
-    state = EvalState(
-        raw_action=np.zeros(2, dtype=np.float32),
-        action=np.zeros(2, dtype=np.float32),
-        env_reward=0.0,
-        selected_reward=0.0,
-        env_return=0.0,
-        selected_return=0.0,
-        episode=episode,
-        episode_length=0,
-        completed_episodes=0,
-        mean_completed_return=None,
-        done=False,
-        done_reason="in-progress",
-        paused=paused,
-    )
+    state = empty_state(episode, completed_returns, paused, learned_std)
 
     from pyglet import window as pyglet_window
     from pyglet.window import key
@@ -386,21 +407,23 @@ def main() -> None:
         width=image_width + SIDEBAR_WIDTH,
         height=image_height,
         resizable=False,
-        caption="gym-duckietown IL policy evaluation",
+        caption="gym-duckietown RL policy evaluation",
     )
 
-    print(f"Checkpoint:      {args.checkpoint.expanduser()}", flush=True)
+    print(f"Checkpoint:       {args.checkpoint.expanduser()}", flush=True)
+    print(f"Checkpoint step:  {checkpoint_step}", flush=True)
     print(f"Checkpoint model: {checkpoint_config.get('model', 'mobilenet_v3_small')}", flush=True)
-    print(f"Device:          {device}", flush=True)
-    print(f"Map:             {args.map_name}", flush=True)
-    print(f"Reward function: {args.reward_function}", flush=True)
+    print(f"Device:           {device}", flush=True)
+    print(f"Map:              {args.map_name}", flush=True)
+    print(f"Reward function:  {args.reward_function}", flush=True)
+    print(f"Policy mode:      {'stochastic' if args.stochastic else 'deterministic'}", flush=True)
     print(
-        "Preprocess:      "
-        f"RGB={args.source_observation_channel_order == 'rgb'}, "
-        f"crop_y_start={args.crop_y_start}, image_size={image_size}",
+        "Preprocess:       "
+        f"channel_order={args.source_observation_channel_order}, "
+        f"crop_y_start={args.crop_y_start}, image_size={args.image_size}",
         flush=True,
     )
-    print(f"Returns CSV:     {recorder.path}", flush=True)
+    print(f"Returns CSV:      {recorder.path}", flush=True)
     print("space pauses, backspace resets, enter saves screenshot, escape exits", flush=True)
 
     def record_current_episode(status: str, reason: str) -> None:
@@ -434,23 +457,7 @@ def main() -> None:
         selected_return = 0.0
         env_return = 0.0
         current_episode_recorded = False
-        state = EvalState(
-            raw_action=np.zeros(2, dtype=np.float32),
-            action=np.zeros(2, dtype=np.float32),
-            env_reward=0.0,
-            selected_reward=0.0,
-            env_return=0.0,
-            selected_return=0.0,
-            episode=episode,
-            episode_length=0,
-            completed_episodes=len(completed_returns),
-            mean_completed_return=(
-                float(np.mean(completed_returns)) if completed_returns else None
-            ),
-            done=False,
-            done_reason="in-progress",
-            paused=paused,
-        )
+        state = empty_state(episode, completed_returns, paused, learned_std)
 
     @window.event
     def on_key_press(symbol, modifiers):
@@ -481,23 +488,21 @@ def main() -> None:
         window.clear()
         draw_rect(0, 0, image_width + SIDEBAR_WIDTH, image_height, BACKGROUND)
         draw_rgb(rgb, 0, 0, image_width, image_height)
-        draw_sidebar(state, args, image_width, image_height)
+        draw_sidebar(state, args, checkpoint_step, image_width, image_height)
 
     def update(dt):
         del dt
         nonlocal observation, episode_length, selected_return, env_return
-        nonlocal paused, current_episode_recorded, state
+        nonlocal paused, state
         if paused:
             return
 
-        raw_action, action = predict_action(
-            model,
+        mean_action, action, std = predict_action(
+            policy,
             observation,
             transform,
+            args,
             device,
-            args.crop_y_start,
-            image_size,
-            args.source_observation_channel_order,
         )
         observation, step_env_reward, done, info = step_raw(env, action)
         step_selected_reward = reward_calculator.compute(env, step_env_reward)
@@ -506,9 +511,10 @@ def main() -> None:
         selected_return += step_selected_reward
         reason = done_reason(done, info)
 
-        state = EvalState(
-            raw_action=raw_action,
+        state = ViewerState(
+            mean_action=mean_action,
             action=action,
+            std=std,
             env_reward=step_env_reward,
             selected_reward=step_selected_reward,
             env_return=env_return,

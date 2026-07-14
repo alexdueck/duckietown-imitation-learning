@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
 """Manual gym-duckietown control with a reward diagnostics sidebar."""
 
 from __future__ import annotations
@@ -15,6 +16,8 @@ from typing import Any
 import numpy as np
 import pyglet
 
+from cli_completion import parse_args_with_completion
+from duckietown_paths import EVALUATION_SCREENSHOT_DIR
 from duckietown_rewards import (
     DISPLAY_REWARD_FUNCTIONS,
     compute_reward_breakdowns,
@@ -119,9 +122,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steering-rate", type=float, default=0.75)
     parser.add_argument("--auto-center-rate", type=float, default=0.55)
     parser.add_argument("--boost-multiplier", type=float, default=1.35)
-    parser.add_argument("--screenshot-path", type=Path, default=Path("gym_duckietown_manual.png"))
+    parser.add_argument(
+        "--screenshot-path",
+        type=Path,
+        default=EVALUATION_SCREENSHOT_DIR / "gym_duckietown_manual.png",
+    )
     parser.add_argument("--log-level", default="WARNING", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
-    return parser.parse_args()
+    return parse_args_with_completion(parser)
 
 
 def move_towards(value: float, target: float, max_delta: float) -> float:
@@ -376,9 +383,11 @@ def draw_sidebar(state: ViewerState, map_name: str, x: int, height: int) -> None
 
 
 def save_screenshot(window, path: Path) -> None:
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
     buffer = pyglet.image.get_buffer_manager().get_color_buffer()
-    buffer.save(str(path.expanduser()))
-    print(f"saved screenshot {path.expanduser()}", flush=True)
+    buffer.save(str(path))
+    print(f"saved screenshot {path}", flush=True)
 
 
 def main() -> None:

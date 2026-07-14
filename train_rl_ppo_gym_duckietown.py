@@ -16,6 +16,7 @@ import logging
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import torch
@@ -221,6 +222,13 @@ def compute_gae(rewards, dones, values, last_value, gamma, gae_lambda):
         advantages[step] = gae
     returns = advantages + values
     return advantages, returns
+
+
+def synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps" and hasattr(torch.mps, "synchronize"):
+        torch.mps.synchronize()
 
 
 def ensure_gym_duckietown_available() -> None:
@@ -560,6 +568,23 @@ def main() -> None:
     ]
     with metrics_file.open("w", newline="") as file:
         csv.DictWriter(file, fieldnames=metrics_fields).writeheader()
+    rollout_metrics_file = run_dir / "rollout_history.csv"
+    rollout_metrics_fields = [
+        "step",
+        "rollout",
+        "rollout_steps",
+        "rollout_return",
+        "rollout_reward_per_step",
+        "rollout_seconds",
+        "update_seconds",
+        "rollout_update_seconds",
+        "environment_steps_per_second",
+        "policy_loss",
+        "value_loss",
+        "entropy",
+    ]
+    with rollout_metrics_file.open("w", newline="") as file:
+        csv.DictWriter(file, fieldnames=rollout_metrics_fields).writeheader()
     eval_metrics_file = run_dir / "eval_history.csv"
     eval_metrics_fields = [
         "train_step",
@@ -629,6 +654,8 @@ def main() -> None:
         best_eval_return = -float("inf")
 
         while global_step < args.total_steps:
+            synchronize_device(device)
+            rollout_started_at = perf_counter()
             obs_buf, action_buf, logp_buf, reward_buf, done_buf, value_buf = [], [], [], [], [], []
             for _ in range(args.rollout_steps):
                 obs_tensor = preprocess(
@@ -683,6 +710,11 @@ def main() -> None:
                 if global_step >= args.total_steps:
                     break
 
+            synchronize_device(device)
+            rollout_finished_at = perf_counter()
+            rollout_seconds = rollout_finished_at - rollout_started_at
+            update_started_at = rollout_finished_at
+
             obs = torch.stack(obs_buf).to(device)
             actions = torch.stack(action_buf).to(device)
             old_logp = torch.stack(logp_buf).to(device)
@@ -730,13 +762,41 @@ def main() -> None:
                     value_optimizer.step()
                     last_policy_loss, last_value_loss, last_entropy = policy_loss.item(), value_loss.item(), entropy.item()
 
+            synchronize_device(device)
+            update_finished_at = perf_counter()
+            update_seconds = update_finished_at - update_started_at
+            rollout_update_seconds = update_finished_at - rollout_started_at
+            rollout_step_count = len(reward_buf)
+            environment_steps_per_second = rollout_step_count / max(rollout_seconds, 1e-12)
+            rollout_return = sum(reward_buf)
+            rollout_reward_per_step = rollout_return / max(1, rollout_step_count)
+
             save_checkpoint(run_dir / "last.pt", policy, value, policy_optimizer, value_optimizer, config, global_step)
             rollout += 1
+            with rollout_metrics_file.open("a", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=rollout_metrics_fields)
+                writer.writerow({
+                    "step": global_step,
+                    "rollout": rollout,
+                    "rollout_steps": rollout_step_count,
+                    "rollout_return": rollout_return,
+                    "rollout_reward_per_step": rollout_reward_per_step,
+                    "rollout_seconds": rollout_seconds,
+                    "update_seconds": update_seconds,
+                    "rollout_update_seconds": rollout_update_seconds,
+                    "environment_steps_per_second": environment_steps_per_second,
+                    "policy_loss": last_policy_loss,
+                    "value_loss": last_value_loss,
+                    "entropy": last_entropy,
+                })
             print(
-                f"update step={global_step} rollout={rollout} rollout_return={sum(reward_buf):.3f} "
-                f"rollout_reward_per_step={sum(reward_buf) / max(1, len(reward_buf)):.4f} "
+                f"update step={global_step} rollout={rollout} rollout_return={rollout_return:.3f} "
+                f"rollout_reward_per_step={rollout_reward_per_step:.4f} "
                 f"current_episode_return={episode_return:.3f} current_episode_length={episode_length} "
-                f"policy_loss={last_policy_loss:.4f} value_loss={last_value_loss:.4f} entropy={last_entropy:.4f}",
+                f"policy_loss={last_policy_loss:.4f} value_loss={last_value_loss:.4f} entropy={last_entropy:.4f} "
+                f"rollout_seconds={rollout_seconds:.3f} update_seconds={update_seconds:.3f} "
+                f"rollout_update_seconds={rollout_update_seconds:.3f} "
+                f"environment_steps_per_second={environment_steps_per_second:.2f}",
                 flush=True,
             )
 

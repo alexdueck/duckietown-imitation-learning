@@ -6,21 +6,36 @@ from typing import Any
 
 import numpy as np
 
+from velopose_reward import (
+    DirectedLaneTracker,
+    VELOPPOSE_LANE_HALF_WIDTH_FACTOR,
+    compute_velopose_breakdown,
+    invalid_velopose_breakdown,
+)
+
 
 REWARD_FUNCTION_CHOICES = (
     "default",
     "default_clipped",
     "posangle",
     "target_orientation",
-    "lane_distance",
+    "distance_travelled",
+    "velopose",
 )
 
 DISPLAY_REWARD_FUNCTIONS = (
     "default",
     "posangle",
     "target_orientation",
-    "lane_distance",
+    "distance_travelled",
+    "velopose",
 )
+
+
+def reward_source(name: str) -> str:
+    if name == "velopose":
+        return "Custom signed forward-velocity and lane-pose reward"
+    return "kaland313/Duckietown-RL reward_wrappers.py"
 
 
 def pose_position(pose: dict[str, Any]) -> np.ndarray:
@@ -48,6 +63,10 @@ def pose_yaw(pose: dict[str, Any]) -> float:
     return float(quaternion_to_euler(quat_rot)[-1])
 
 
+def pose_timestamp(pose: dict[str, Any]) -> float:
+    return float(pose["header"]["timestamp"])
+
+
 def safe_float(value: float) -> float:
     value = float(value)
     if math.isnan(value):
@@ -62,12 +81,29 @@ def velocity_reward(action: np.ndarray | None) -> float:
 
 
 class KalaposRewardCalculator:
-    """Duckietown-RL reward functions adapted to gym-duckiematrix pose APIs."""
+    """Project reward functions adapted to gym-duckiematrix pose APIs."""
 
     def __init__(self, name: str) -> None:
         if name not in REWARD_FUNCTION_CHOICES:
             raise ValueError(f"Unknown reward function {name!r}")
         self.name = name
+        self.velopose_lane_tracker = DirectedLaneTracker()
+
+    def reset(self, env=None) -> None:
+        self.velopose_lane_tracker.reset()
+        if env is None or self.name != "velopose":
+            return
+        current_pose = getattr(env, "last_pose", None)
+        if current_pose is None or not hasattr(env, "lp_cal"):
+            return
+        try:
+            self.velopose_lane_tracker.update(
+                position=pose_position(current_pose),
+                robot_yaw=pose_yaw(current_pose),
+                closest_curve_point=env.lp_cal.closest_curve_point,
+            )
+        except Exception:
+            pass
 
     def compute(
         self,
@@ -101,9 +137,11 @@ class KalaposRewardCalculator:
             return self._posangle_breakdown(env, action, target_orientation_only=False)
         if self.name == "target_orientation":
             return self._posangle_breakdown(env, action, target_orientation_only=True)
-        if self.name == "lane_distance":
-            total = safe_float(self._lane_distance_reward(env, previous_pose))
+        if self.name == "distance_travelled":
+            total = safe_float(self._distance_travelled_reward(env, previous_pose))
             return {"total": total, "components": {"DtRewardDistanceTravelled": total}}
+        if self.name == "velopose":
+            return self._velopose_breakdown(env, previous_pose)
         raise AssertionError(f"Unhandled reward function {self.name!r}")
 
     def _current_lane_position(self, env):
@@ -180,7 +218,7 @@ class KalaposRewardCalculator:
             },
         }
 
-    def _lane_distance_reward(self, env, previous_pose: dict[str, Any] | None) -> float:
+    def _distance_travelled_reward(self, env, previous_pose: dict[str, Any] | None) -> float:
         current_pose = getattr(env, "last_pose", None)
         if previous_pose is None or current_pose is None or not hasattr(env, "lp_cal"):
             return 0.0
@@ -210,11 +248,50 @@ class KalaposRewardCalculator:
 
         return 50.0 * distance
 
+    def _velopose_breakdown(
+        self,
+        env,
+        previous_pose: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        current_pose = getattr(env, "last_pose", None)
+        if current_pose is None or not hasattr(env, "lp_cal"):
+            return invalid_velopose_breakdown()
+
+        if previous_pose is None:
+            previous_pose = current_pose
+
+        pos = pose_position(current_pose)
+        prev_pos = pose_position(previous_pose)
+        yaw = pose_yaw(current_pose)
+        try:
+            lane_reference = self.velopose_lane_tracker.update(
+                position=pos,
+                robot_yaw=yaw,
+                closest_curve_point=env.lp_cal.closest_curve_point,
+            )
+            if lane_reference is None:
+                return invalid_velopose_breakdown()
+            lane_half_width = (
+                VELOPPOSE_LANE_HALF_WIDTH_FACTOR
+                * float(env.lp_cal.road_tile_size)
+            )
+            return compute_velopose_breakdown(
+                current_position=pos,
+                previous_position=prev_pos,
+                lane_tangent=lane_reference.tangent,
+                robot_forward=lane_reference.robot_forward,
+                delta_time=pose_timestamp(current_pose) - pose_timestamp(previous_pose),
+                lane_distance=lane_reference.lane_distance,
+                lane_half_width=lane_half_width,
+            )
+        except Exception:
+            return invalid_velopose_breakdown()
+
 
 @dataclass(frozen=True)
 class RewardMetadata:
     name: str
-    source: str = "kaland313/Duckietown-RL reward_wrappers.py"
+    source: str
     supported: tuple[str, ...] = REWARD_FUNCTION_CHOICES
 
 
@@ -224,9 +301,12 @@ def compute_reward_breakdowns(
     previous_pose: dict[str, Any] | None,
     env_reward: float,
     names: tuple[str, ...] = DISPLAY_REWARD_FUNCTIONS,
+    calculators: dict[str, KalaposRewardCalculator] | None = None,
 ) -> dict[str, dict[str, float | dict[str, float]]]:
+    if calculators is None:
+        calculators = {name: KalaposRewardCalculator(name) for name in names}
     return {
-        name: KalaposRewardCalculator(name).compute_breakdown(
+        name: calculators[name].compute_breakdown(
             env=env,
             action=action,
             previous_pose=previous_pose,

@@ -25,7 +25,7 @@ from duckietown.sdk.middleware.dtps.base import DTPS
 from cli_completion import parse_args_with_completion
 from duckietown_paths import IMITATION_LEARNING_TRAIN_DATA_DIR
 from duckiematrix_telemetry import TELEMETRY_COLUMNS, collect_state_telemetry, format_telemetry_value
-from rl_rewards import compute_reward_breakdowns
+from rl_rewards import DISPLAY_REWARD_FUNCTIONS, KalaposRewardCalculator, compute_reward_breakdowns
 
 
 # ----------------------------
@@ -353,7 +353,7 @@ def render_live_status(
         f"default {format_live_value(reward_total(reward_breakdowns, 'default'))}   "
         f"posangle {format_live_value(reward_total(reward_breakdowns, 'posangle'))}   "
         f"target {format_live_value(reward_total(reward_breakdowns, 'target_orientation'))}   "
-        f"lane_distance {format_live_value(reward_total(reward_breakdowns, 'lane_distance'))}",
+        f"distance_travelled {format_live_value(reward_total(reward_breakdowns, 'distance_travelled'))}",
         (22, 256),
     )
     render_status_line(
@@ -517,6 +517,12 @@ def main():
         )
 
         obs, info = env.reset()
+        reward_calculators = {
+            name: KalaposRewardCalculator(name)
+            for name in DISPLAY_REWARD_FUNCTIONS
+        }
+        for calculator in reward_calculators.values():
+            calculator.reset(env)
         action_controller = KeyboardActionController()
         previous_pose_for_current_observation = None
         previous_action_for_current_observation = None
@@ -555,6 +561,7 @@ def main():
                 action=previous_action_for_current_observation,
                 previous_pose=previous_pose_for_current_observation,
                 env_reward=pending_reward,
+                calculators=reward_calculators,
             )
 
             timestamp = time() - t0
@@ -584,7 +591,7 @@ def main():
                 f"default={format_live_value(reward_total(reward_breakdowns, 'default'))} "
                 f"posangle={format_live_value(reward_total(reward_breakdowns, 'posangle'))} "
                 f"target_orientation={format_live_value(reward_total(reward_breakdowns, 'target_orientation'))} "
-                f"lane_distance={format_live_value(reward_total(reward_breakdowns, 'lane_distance'))}"
+                f"distance_travelled={format_live_value(reward_total(reward_breakdowns, 'distance_travelled'))}"
             )
             print(
                 "posangle_parts "

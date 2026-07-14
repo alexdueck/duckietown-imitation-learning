@@ -5,21 +5,36 @@ from typing import Any
 
 import numpy as np
 
+from velopose_reward import (
+    DirectedLaneTracker,
+    VELOPPOSE_LANE_HALF_WIDTH_FACTOR,
+    compute_velopose_breakdown,
+    invalid_velopose_breakdown,
+)
+
 
 REWARD_FUNCTION_CHOICES = (
     "default",
     "default_clipped",
     "posangle",
     "target_orientation",
-    "lane_distance",
+    "distance_travelled",
+    "velopose",
 )
 
 DISPLAY_REWARD_FUNCTIONS = (
     "default",
     "posangle",
     "target_orientation",
-    "lane_distance",
+    "distance_travelled",
+    "velopose",
 )
+
+
+def reward_source(name: str) -> str:
+    if name == "velopose":
+        return "Custom signed forward-velocity and lane-pose reward"
+    return "kaland313/Duckietown-RL reward_wrappers.py on gym-duckietown Simulator"
 
 
 def safe_float(value: float) -> float:
@@ -88,20 +103,36 @@ def patch_duckietown_world_dynamics() -> None:
 
 
 class GymDuckietownRewardCalculator:
-    """Kalapos/Duckietown-RL rewards on top of gym-duckietown Simulator state."""
+    """Project reward functions on top of gym-duckietown Simulator state."""
 
     def __init__(self, name: str) -> None:
         if name not in REWARD_FUNCTION_CHOICES:
             raise ValueError(f"Unknown reward function {name!r}")
         self.name = name
         self.prev_pos: np.ndarray | None = None
+        self.prev_timestamp: float | None = None
+        self.velopose_lane_tracker = DirectedLaneTracker()
         self.orientation_reward = 0.0
         self.velocity_reward = 0.0
 
-    def reset(self) -> None:
+    def reset(self, env=None) -> None:
         self.prev_pos = None
+        self.prev_timestamp = None
+        self.velopose_lane_tracker.reset()
         self.orientation_reward = 0.0
         self.velocity_reward = 0.0
+        if env is not None and self.name == "velopose":
+            raw_env = unwrapped_env(env)
+            self.prev_pos = np.asarray(raw_env.cur_pos, dtype=np.float64).copy()
+            self.prev_timestamp = float(raw_env.timestamp)
+            try:
+                self.velopose_lane_tracker.update(
+                    position=self.prev_pos,
+                    robot_yaw=float(raw_env.cur_angle),
+                    closest_curve_point=raw_env.closest_curve_point,
+                )
+            except Exception:
+                pass
 
     def compute(self, env, env_reward: float) -> float:
         return safe_float(float(self.compute_breakdown(env, env_reward)["total"]))
@@ -117,9 +148,11 @@ class GymDuckietownRewardCalculator:
             return self._posangle_breakdown(env, target_orientation_only=False)
         if self.name == "target_orientation":
             return self._posangle_breakdown(env, target_orientation_only=True)
-        if self.name == "lane_distance":
-            total = safe_float(self._lane_distance_reward(env))
+        if self.name == "distance_travelled":
+            total = safe_float(self._distance_travelled_reward(env))
             return {"total": total, "components": {"DtRewardDistanceTravelled": total}}
+        if self.name == "velopose":
+            return self._velopose_breakdown(env)
         raise AssertionError(f"Unhandled reward function {self.name!r}")
 
     @staticmethod
@@ -185,7 +218,7 @@ class GymDuckietownRewardCalculator:
         wheel_vels = getattr(raw_env, "wheelVels", np.array([0.0, 0.0]))
         return safe_float(float(np.max(np.asarray(wheel_vels, dtype=np.float64))) * 0.25)
 
-    def _lane_distance_reward(self, env) -> float:
+    def _distance_travelled_reward(self, env) -> float:
         raw_env = unwrapped_env(env)
         pos = np.asarray(raw_env.cur_pos, dtype=np.float64).copy()
         prev_pos = None if self.prev_pos is None else self.prev_pos.copy()
@@ -214,6 +247,38 @@ class GymDuckietownRewardCalculator:
 
         return safe_float(50.0 * distance)
 
+    def _velopose_breakdown(self, env) -> dict[str, Any]:
+        raw_env = unwrapped_env(env)
+        pos = np.asarray(raw_env.cur_pos, dtype=np.float64).copy()
+        timestamp = float(raw_env.timestamp)
+        previous_pos = pos if self.prev_pos is None else self.prev_pos.copy()
+        previous_timestamp = timestamp if self.prev_timestamp is None else self.prev_timestamp
+        self.prev_pos = pos
+        self.prev_timestamp = timestamp
+
+        try:
+            lane_reference = self.velopose_lane_tracker.update(
+                position=pos,
+                robot_yaw=float(raw_env.cur_angle),
+                closest_curve_point=raw_env.closest_curve_point,
+            )
+            if lane_reference is None:
+                return invalid_velopose_breakdown()
+            lane_half_width = (
+                VELOPPOSE_LANE_HALF_WIDTH_FACTOR * float(raw_env.road_tile_size)
+            )
+            return compute_velopose_breakdown(
+                current_position=pos,
+                previous_position=previous_pos,
+                lane_tangent=lane_reference.tangent,
+                robot_forward=lane_reference.robot_forward,
+                delta_time=timestamp - previous_timestamp,
+                lane_distance=lane_reference.lane_distance,
+                lane_half_width=lane_half_width,
+            )
+        except Exception:
+            return invalid_velopose_breakdown()
+
 
 def create_reward_calculators(
     names: tuple[str, ...] = DISPLAY_REWARD_FUNCTIONS,
@@ -221,9 +286,12 @@ def create_reward_calculators(
     return {name: GymDuckietownRewardCalculator(name) for name in names}
 
 
-def reset_reward_calculators(calculators: dict[str, GymDuckietownRewardCalculator]) -> None:
+def reset_reward_calculators(
+    calculators: dict[str, GymDuckietownRewardCalculator],
+    env=None,
+) -> None:
     for calculator in calculators.values():
-        calculator.reset()
+        calculator.reset(env)
 
 
 def compute_reward_breakdowns(

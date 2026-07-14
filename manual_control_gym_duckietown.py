@@ -30,6 +30,7 @@ from duckietown_rewards import (
 
 
 SIDEBAR_WIDTH = 500
+MIN_VIEWER_HEIGHT = 760
 BACKGROUND = (18, 22, 26)
 SIDEBAR_BG = (27, 31, 36)
 TEXT = (238, 241, 245, 255)
@@ -257,7 +258,7 @@ def make_viewer_state(
 
 def reset_env(env, calculators) -> ViewerState:
     env.reset()
-    reset_reward_calculators(calculators)
+    reset_reward_calculators(calculators, env)
     action = np.zeros(2, dtype=np.float32)
     return make_viewer_state(env, calculators, action, current_env_reward(env), False, {})
 
@@ -332,6 +333,27 @@ def fmt(value: Any, precision: int = 4) -> str:
         return str(value)
 
 
+def append_component_lines(
+    lines: list[tuple[str, int, tuple[int, int, int, int], bool]],
+    components: dict[str, Any],
+    depth: int = 1,
+) -> None:
+    prefix = "  " * depth
+    for component_name, component_value in components.items():
+        if isinstance(component_value, dict):
+            total = component_value.get("total")
+            lines.append(
+                (f"{prefix}{component_name} {fmt(total, 4)}", 12, MUTED, True)
+            )
+            nested = component_value.get("components", {})
+            if isinstance(nested, dict):
+                append_component_lines(lines, nested, depth + 1)
+        else:
+            lines.append(
+                (f"{prefix}{component_name} {fmt(component_value, 4)}", 11, MUTED, False)
+            )
+
+
 def sidebar_lines(state: ViewerState, map_name: str) -> list[tuple[str, int, tuple[int, int, int, int], bool]]:
     lane = state.lane_metrics
     lines: list[tuple[str, int, tuple[int, int, int, int], bool]] = [
@@ -368,8 +390,7 @@ def sidebar_lines(state: ViewerState, map_name: str) -> list[tuple[str, int, tup
         lines.append((f"{name} {fmt(total, 4)}", 15, color, True))
         components = breakdown.get("components", {})
         if isinstance(components, dict) and name != "default":
-            for component_name, component_value in components.items():
-                lines.append((f"  {component_name} {fmt(component_value, 4)}", 12, MUTED, False))
+            append_component_lines(lines, components)
     return lines
 
 
@@ -395,6 +416,8 @@ def main() -> None:
     configure_logging(args.log_level)
     env = make_env(args)
     _, _, image_width, image_height = import_simulator()
+    viewer_height = max(image_height, MIN_VIEWER_HEIGHT)
+    image_y = (viewer_height - image_height) // 2
     calculators = create_reward_calculators(DISPLAY_REWARD_FUNCTIONS)
     state = reset_env(env, calculators)
     action_controller = ManualActionController()
@@ -405,7 +428,7 @@ def main() -> None:
 
     window = pyglet_window.Window(
         width=image_width + SIDEBAR_WIDTH,
-        height=image_height,
+        height=viewer_height,
         resizable=False,
         caption="gym-duckietown reward control",
     )
@@ -437,11 +460,11 @@ def main() -> None:
     @window.event
     def on_draw():
         rgb = env.render(mode="rgb_array")
-        prepare_window_2d(window, image_width + SIDEBAR_WIDTH, image_height)
+        prepare_window_2d(window, image_width + SIDEBAR_WIDTH, viewer_height)
         window.clear()
-        draw_rect(0, 0, image_width + SIDEBAR_WIDTH, image_height, BACKGROUND)
-        draw_rgb(rgb, 0, 0, image_width, image_height)
-        draw_sidebar(state, args.map_name, image_width, image_height)
+        draw_rect(0, 0, image_width + SIDEBAR_WIDTH, viewer_height, BACKGROUND)
+        draw_rgb(rgb, 0, image_y, image_width, image_height)
+        draw_sidebar(state, args.map_name, image_width, viewer_height)
 
     def update(dt):
         nonlocal state, paused_due_to_done

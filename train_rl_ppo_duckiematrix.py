@@ -30,7 +30,12 @@ from cli_completion import parse_args_with_completion
 from duckietown_paths import RL_PPO_DUCKIEMATRIX_CHECKPOINT_DIR
 from live_eval_imitation_policy import observation_to_rgb, shutdown_dtps
 from rl_models import TanhGaussianPolicy, load_imitation_actor
-from rl_rewards import KalaposRewardCalculator, REWARD_FUNCTION_CHOICES, RewardMetadata
+from rl_rewards import (
+    KalaposRewardCalculator,
+    REWARD_FUNCTION_CHOICES,
+    RewardMetadata,
+    reward_source,
+)
 from train_imitation_learning import IMAGENET_MEAN, IMAGENET_STD, build_model, resolve_device, set_seed
 
 
@@ -238,10 +243,12 @@ def reset_environment(
     env,
     args: argparse.Namespace,
     rng: np.random.Generator,
+    reward_calculator: KalaposRewardCalculator,
     seed: int | None = None,
     use_random_warmup: bool = True,
 ):
     observation, info = env.reset(seed=seed)
+    reward_calculator.reset(env)
     warmup_steps = max(0, args.reset_random_warmup_steps) if use_random_warmup else 0
     if warmup_steps == 0:
         return observation, info
@@ -253,13 +260,21 @@ def reset_environment(
         warmup_done = False
         for _ in range(warmup_steps):
             action = sample_random_action(env, rng, args.reset_random_action_scale)
-            warmup_observation, _, terminated, truncated, warmup_info = env.step(action)
+            previous_pose = getattr(env, "last_pose", None)
+            warmup_observation, env_reward, terminated, truncated, warmup_info = env.step(action)
+            reward_calculator.compute(
+                env=env,
+                action=action,
+                previous_pose=previous_pose,
+                env_reward=float(env_reward),
+            )
             warmup_done = bool(terminated or truncated)
             if warmup_done:
                 break
         if not warmup_done:
             return warmup_observation, warmup_info
         observation, info = env.reset()
+        reward_calculator.reset(env)
 
     return observation, info
 
@@ -304,7 +319,13 @@ def evaluate_policy(
     device: torch.device,
     reset_rng: np.random.Generator,
 ) -> dict[str, float | int]:
-    observation, info = reset_environment(env, args, reset_rng, use_random_warmup=False)
+    observation, info = reset_environment(
+        env,
+        args,
+        reset_rng,
+        reward_calculator,
+        use_random_warmup=False,
+    )
     total_return = 0.0
     episode_return = 0.0
     episode_length = 0
@@ -346,7 +367,13 @@ def evaluate_policy(
                 terminated_count += int(bool(terminated))
                 truncated_count += int(bool(truncated))
                 time_limit_count += int(time_limit_done and not terminated and not truncated)
-                observation, info = reset_environment(env, args, reset_rng, use_random_warmup=False)
+                observation, info = reset_environment(
+                    env,
+                    args,
+                    reset_rng,
+                    reward_calculator,
+                    use_random_warmup=False,
+                )
                 episode_return = 0.0
                 episode_length = 0
     finally:
@@ -419,7 +446,10 @@ def main() -> None:
         if k not in {"camera_width", "camera_height", "device"}
     }
     config = PPOConfig(**config_values, device=str(device))
-    reward_metadata = RewardMetadata(name=args.reward_function)
+    reward_metadata = RewardMetadata(
+        name=args.reward_function,
+        source=reward_source(args.reward_function),
+    )
     config_json = {
         **asdict(config),
         "reward_metadata": asdict(reward_metadata),
@@ -494,7 +524,13 @@ def main() -> None:
         env = DuckiematrixDB21JEnv(entity_name=args.entity_name, headless=True, camera_width=args.camera_width, camera_height=args.camera_height)
         reward_calculator = KalaposRewardCalculator(args.reward_function)
         print(f"Reward function: {args.reward_function}", flush=True)
-        observation, info = reset_environment(env, args, reset_rng, seed=args.seed)
+        observation, info = reset_environment(
+            env,
+            args,
+            reset_rng,
+            reward_calculator,
+            seed=args.seed,
+        )
         if args.debug_initial_action:
             with torch.no_grad():
                 obs_tensor = preprocess(
@@ -589,7 +625,7 @@ def main() -> None:
                         f"done_reason={reason}",
                         flush=True,
                     )
-                    observation, info = reset_environment(env, args, reset_rng)
+                    observation, info = reset_environment(env, args, reset_rng, reward_calculator)
                     episode += 1
                     episode_return = 0.0
                     episode_length = 0
@@ -714,7 +750,7 @@ def main() -> None:
                         f"checkpoint={run_dir / 'best_eval.pt'}",
                         flush=True,
                     )
-                observation, info = reset_environment(env, args, reset_rng)
+                observation, info = reset_environment(env, args, reset_rng, reward_calculator)
     finally:
         if env is not None:
             env.close()

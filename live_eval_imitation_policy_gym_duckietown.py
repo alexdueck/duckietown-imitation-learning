@@ -354,7 +354,7 @@ def main() -> None:
     _, _, image_width, image_height = import_simulator()
     reward_calculator = GymDuckietownRewardCalculator(args.reward_function)
     observation = reset_raw(env)
-    reward_calculator.reset()
+    reward_calculator.reset(env)
 
     episode = 0
     episode_length = 0
@@ -428,7 +428,7 @@ def main() -> None:
         nonlocal observation, episode, episode_length, selected_return, env_return
         nonlocal current_episode_recorded, state
         observation = reset_raw(env)
-        reward_calculator.reset()
+        reward_calculator.reset(env)
         episode += 1
         episode_length = 0
         selected_return = 0.0

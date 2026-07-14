@@ -27,6 +27,7 @@ from duckietown_rewards import (
     REWARD_FUNCTION_CHOICES,
     format_wheel_action,
     patch_duckietown_world_dynamics,
+    reward_source,
 )
 from cli_completion import parse_args_with_completion
 from duckietown_paths import RL_PPO_GYM_DUCKIETOWN_CHECKPOINT_DIR
@@ -293,7 +294,7 @@ def reset_environment(
     use_random_warmup: bool = True,
 ):
     observation, info = reset_raw(env, seed=seed)
-    reward_calculator.reset()
+    reward_calculator.reset(env)
     warmup_steps = max(0, args.reset_random_warmup_steps) if use_random_warmup else 0
     if warmup_steps == 0:
         return observation, info
@@ -313,7 +314,7 @@ def reset_environment(
         if not warmup_done:
             return warmup_observation, warmup_info
         observation, info = reset_raw(env)
-        reward_calculator.reset()
+        reward_calculator.reset(env)
 
     return observation, info
 
@@ -474,7 +475,7 @@ def main() -> None:
         "env_backend": "gym-duckietown",
         "reward_metadata": {
             "name": args.reward_function,
-            "source": "kaland313/Duckietown-RL reward_wrappers.py on gym-duckietown Simulator",
+            "source": reward_source(args.reward_function),
             "supported": REWARD_FUNCTION_CHOICES,
         },
     }

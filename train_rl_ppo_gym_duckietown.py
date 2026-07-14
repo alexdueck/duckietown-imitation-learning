@@ -234,6 +234,16 @@ def synchronize_device(device: torch.device) -> None:
         torch.mps.synchronize()
 
 
+def format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(float(seconds))))
+    days, remainder = divmod(total_seconds, 24 * 60 * 60)
+    hours, remainder = divmod(remainder, 60 * 60)
+    minutes, seconds = divmod(remainder, 60)
+    if days:
+        return f"{days}d{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 def ensure_gym_duckietown_available() -> None:
     try:
         import gym_duckietown.simulator  # noqa: F401
@@ -596,6 +606,11 @@ def main() -> None:
         "update_seconds",
         "rollout_update_seconds",
         "environment_steps_per_second",
+        "cycle_steps_per_second",
+        "overall_steps_per_second",
+        "progress_percent",
+        "elapsed_seconds",
+        "eta_seconds",
         "policy_loss",
         "value_loss",
         "entropy",
@@ -669,6 +684,8 @@ def main() -> None:
         rollout = 0
         eval_index = 0
         best_eval_return = -float("inf")
+        training_started_at = perf_counter()
+        training_start_step = global_step
 
         while global_step < args.total_steps:
             synchronize_device(device)
@@ -788,8 +805,16 @@ def main() -> None:
             environment_steps_per_second = rollout_step_count / max(rollout_seconds, 1e-12)
             rollout_return = sum(reward_buf)
             rollout_reward_per_step = rollout_return / max(1, rollout_step_count)
+            cycle_steps_per_second = rollout_step_count / max(rollout_update_seconds, 1e-12)
 
             save_checkpoint(run_dir / "last.pt", policy, value, policy_optimizer, value_optimizer, config, global_step)
+            metrics_recorded_at = perf_counter()
+            elapsed_seconds = metrics_recorded_at - training_started_at
+            completed_training_steps = global_step - training_start_step
+            overall_steps_per_second = completed_training_steps / max(elapsed_seconds, 1e-12)
+            progress_percent = 100.0 * global_step / max(1, args.total_steps)
+            remaining_steps = max(0, args.total_steps - global_step)
+            eta_seconds = remaining_steps / max(overall_steps_per_second, 1e-12)
             rollout += 1
             with rollout_metrics_file.open("a", newline="") as file:
                 writer = csv.DictWriter(file, fieldnames=rollout_metrics_fields)
@@ -803,6 +828,11 @@ def main() -> None:
                     "update_seconds": update_seconds,
                     "rollout_update_seconds": rollout_update_seconds,
                     "environment_steps_per_second": environment_steps_per_second,
+                    "cycle_steps_per_second": cycle_steps_per_second,
+                    "overall_steps_per_second": overall_steps_per_second,
+                    "progress_percent": progress_percent,
+                    "elapsed_seconds": elapsed_seconds,
+                    "eta_seconds": eta_seconds,
                     "policy_loss": last_policy_loss,
                     "value_loss": last_value_loss,
                     "entropy": last_entropy,
@@ -814,7 +844,11 @@ def main() -> None:
                 f"policy_loss={last_policy_loss:.4f} value_loss={last_value_loss:.4f} entropy={last_entropy:.4f} "
                 f"rollout_seconds={rollout_seconds:.3f} update_seconds={update_seconds:.3f} "
                 f"rollout_update_seconds={rollout_update_seconds:.3f} "
-                f"environment_steps_per_second={environment_steps_per_second:.2f}",
+                f"environment_steps_per_second={environment_steps_per_second:.2f} "
+                f"cycle_steps_per_second={cycle_steps_per_second:.2f} "
+                f"overall_steps_per_second={overall_steps_per_second:.2f} "
+                f"progress={progress_percent:.2f}% elapsed={format_duration(elapsed_seconds)} "
+                f"eta={format_duration(eta_seconds)}",
                 flush=True,
             )
 

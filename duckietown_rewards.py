@@ -7,6 +7,7 @@ import numpy as np
 
 from velopose_reward import (
     DirectedLaneTracker,
+    VELOPPOSE_INVALID_POSE_PENALTY,
     VELOPPOSE_LANE_HALF_WIDTH_FACTOR,
     compute_velopose_breakdown,
     invalid_velopose_breakdown,
@@ -30,6 +31,9 @@ DISPLAY_REWARD_FUNCTIONS = (
     "velopose",
 )
 
+INVALID_POSE_DONE_CODE = "invalid-pose"
+MAX_STEPS_DONE_CODE = "max-steps-reached"
+
 
 def reward_source(name: str) -> str:
     if name == "velopose":
@@ -42,6 +46,20 @@ def safe_float(value: float) -> float:
     if math.isnan(value):
         return 0.0
     return value
+
+
+def gym_duckietown_done_code(done: bool, info: dict[str, Any] | None) -> str:
+    simulator_info = info.get("Simulator", {}) if isinstance(info, dict) else {}
+    code = simulator_info.get("done_code")
+    if code:
+        return str(code)
+
+    message = str(simulator_info.get("msg", "")).lower()
+    if "invalid pose" in message:
+        return INVALID_POSE_DONE_CODE
+    if "max_steps" in message or "max steps" in message:
+        return MAX_STEPS_DONE_CODE
+    return "terminated" if done else "in-progress"
 
 
 def unwrapped_env(env):
@@ -134,10 +152,15 @@ class GymDuckietownRewardCalculator:
             except Exception:
                 pass
 
-    def compute(self, env, env_reward: float) -> float:
-        return safe_float(float(self.compute_breakdown(env, env_reward)["total"]))
+    def compute(self, env, env_reward: float, done_code: str | None = None) -> float:
+        return safe_float(float(self.compute_breakdown(env, env_reward, done_code)["total"]))
 
-    def compute_breakdown(self, env, env_reward: float) -> dict[str, float | dict[str, float]]:
+    def compute_breakdown(
+        self,
+        env,
+        env_reward: float,
+        done_code: str | None = None,
+    ) -> dict[str, float | dict[str, float]]:
         if self.name == "default":
             total = safe_float(env_reward)
             return {"total": total, "components": {"gym_duckietown": total}}
@@ -152,7 +175,15 @@ class GymDuckietownRewardCalculator:
             total = safe_float(self._distance_travelled_reward(env))
             return {"total": total, "components": {"DtRewardDistanceTravelled": total}}
         if self.name == "velopose":
-            return self._velopose_breakdown(env)
+            breakdown = self._velopose_breakdown(env)
+            if done_code == INVALID_POSE_DONE_CODE:
+                components = dict(breakdown["components"])
+                components["InvalidPosePenalty"] = VELOPPOSE_INVALID_POSE_PENALTY
+                return {
+                    "total": float(breakdown["total"]) + VELOPPOSE_INVALID_POSE_PENALTY,
+                    "components": components,
+                }
+            return breakdown
         raise AssertionError(f"Unhandled reward function {self.name!r}")
 
     @staticmethod
@@ -298,8 +329,12 @@ def compute_reward_breakdowns(
     env,
     env_reward: float,
     calculators: dict[str, GymDuckietownRewardCalculator],
+    done_code: str | None = None,
 ) -> dict[str, dict[str, float | dict[str, float]]]:
-    return {name: calculator.compute_breakdown(env, env_reward) for name, calculator in calculators.items()}
+    return {
+        name: calculator.compute_breakdown(env, env_reward, done_code)
+        for name, calculator in calculators.items()
+    }
 
 
 def get_lane_metrics(env) -> dict[str, Any]:

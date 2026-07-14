@@ -24,6 +24,7 @@ from duckietown_rewards import (
     create_reward_calculators,
     format_wheel_action,
     get_lane_metrics,
+    gym_duckietown_done_code,
     patch_duckietown_world_dynamics,
     reset_reward_calculators,
 )
@@ -44,7 +45,9 @@ BAD = (238, 118, 118, 255)
 class ViewerState:
     action: np.ndarray
     env_reward: float
+    env_return: float
     reward_breakdowns: dict[str, dict[str, float | dict[str, float]]]
+    reward_returns: dict[str, float]
     lane_metrics: dict[str, Any]
     done: bool
     done_reason: str
@@ -235,14 +238,7 @@ def current_env_reward(env) -> float:
 
 
 def done_reason(done: bool, info: dict[str, Any]) -> str:
-    simulator_info = info.get("Simulator", {}) if isinstance(info, dict) else {}
-    code = simulator_info.get("done_code")
-    message = simulator_info.get("msg")
-    if code:
-        return str(code)
-    if message:
-        return str(message)
-    return "done" if done else "in-progress"
+    return gym_duckietown_done_code(done, info)
 
 
 def make_viewer_state(
@@ -252,15 +248,34 @@ def make_viewer_state(
     env_reward: float,
     done: bool,
     info: dict[str, Any] | None = None,
+    previous_state: ViewerState | None = None,
 ) -> ViewerState:
     info = {} if info is None else info
+    code = done_reason(done, info)
+    reward_breakdowns = compute_reward_breakdowns(
+        env,
+        env_reward,
+        calculators,
+        done_code=code,
+    )
+    if previous_state is None:
+        env_return = 0.0
+        reward_returns = {name: 0.0 for name in reward_breakdowns}
+    else:
+        env_return = previous_state.env_return + float(env_reward)
+        reward_returns = {
+            name: previous_state.reward_returns.get(name, 0.0) + float(breakdown["total"])
+            for name, breakdown in reward_breakdowns.items()
+        }
     return ViewerState(
         action=format_wheel_action(action),
         env_reward=float(env_reward),
-        reward_breakdowns=compute_reward_breakdowns(env, env_reward, calculators),
+        env_return=env_return,
+        reward_breakdowns=reward_breakdowns,
+        reward_returns=reward_returns,
         lane_metrics=get_lane_metrics(env),
         done=bool(done),
-        done_reason=done_reason(done, info),
+        done_reason=code,
         step_count=int(getattr(env, "step_count", 0)),
         timestamp=float(getattr(env, "timestamp", 0.0)),
     )
@@ -372,7 +387,12 @@ def sidebar_lines(state: ViewerState, map_name: str) -> list[tuple[str, int, tup
         (f"step {state.step_count}  t {state.timestamp:.2f}s", 13, MUTED, False),
         ("", 8, MUTED, False),
         (f"left {fmt(state.action[0], 3)}   right {fmt(state.action[1], 3)}", 16, TEXT, True),
-        (f"default reward {fmt(state.env_reward, 4)}", 16, TEXT, True),
+        (
+            f"default reward {fmt(state.env_reward, 4)}  return {fmt(state.env_return, 4)}",
+            15,
+            TEXT,
+            True,
+        ),
         (
             f"speed {float(lane['speed']):.4f}   lane_valid {int(bool(lane['lane_valid']))}",
             13,
@@ -397,7 +417,10 @@ def sidebar_lines(state: ViewerState, map_name: str) -> list[tuple[str, int, tup
         breakdown = state.reward_breakdowns.get(name, {"total": 0.0, "components": {}})
         total = float(breakdown["total"])
         color = GOOD if total >= 0.0 else BAD
-        lines.append((f"{name} {fmt(total, 4)}", 15, color, True))
+        reward_return = state.reward_returns.get(name, 0.0)
+        lines.append(
+            (f"{name} reward {fmt(total, 4)}  return {fmt(reward_return, 4)}", 14, color, True)
+        )
         components = breakdown.get("components", {})
         if isinstance(components, dict) and name != "default":
             append_component_lines(lines, components)
@@ -485,7 +508,15 @@ def main() -> None:
         action = action_controller.update(pressed_keys, key, args, dt)
         observation, env_reward, done, info = env.step(action)
         del observation
-        state = make_viewer_state(env, calculators, action, float(env_reward), bool(done), info)
+        state = make_viewer_state(
+            env,
+            calculators,
+            action,
+            float(env_reward),
+            bool(done),
+            info,
+            previous_state=state,
+        )
         if done:
             print(f"done step={state.step_count} reason={state.done_reason}", flush=True)
             if args.auto_reset:

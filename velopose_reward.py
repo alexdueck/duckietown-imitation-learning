@@ -15,6 +15,7 @@ import numpy as np
 VELOPPOSE_REFERENCE_SPEED_MPS = 0.6
 VELOPPOSE_VELOCITY_WEIGHT = 1.0
 VELOPPOSE_POSE_WEIGHT = 0.2
+VELOPPOSE_INVALID_POSE_PENALTY = -20.0
 # Duckietown's right-lane centerline sits 0.2 tile widths from either boundary.
 VELOPPOSE_LANE_HALF_WIDTH_FACTOR = 0.2
 
@@ -122,13 +123,9 @@ def compute_velopose_breakdown(
     )
 
     heading_quality = float(np.clip(np.dot(robot_forward, tangent), -1.0, 1.0))
-    normalized_abs_lane_distance = float(
-        np.clip(abs(float(lane_distance)) / lane_half_width, 0.0, 1.0)
-    )
-    lane_center_quality = 1.0 - normalized_abs_lane_distance
-    aligned_heading_contribution = lane_center_quality * heading_quality
-    lane_distance_penalty = -normalized_abs_lane_distance
-    pose_quality = aligned_heading_contribution + lane_distance_penalty
+    scaled_abs_lane_distance = abs(float(lane_distance)) / lane_half_width
+    lane_distance_penalty = -2.0 * scaled_abs_lane_distance
+    pose_quality = heading_quality + lane_distance_penalty
 
     velocity_contribution = VELOPPOSE_VELOCITY_WEIGHT * normalized_forward_progress
     pose_contribution = VELOPPOSE_POSE_WEIGHT * pose_quality
@@ -152,9 +149,7 @@ def compute_velopose_breakdown(
                 "total": float(pose_contribution),
                 "components": {
                     "HeadingQuality": heading_quality,
-                    "NormalizedAbsLaneDistance": normalized_abs_lane_distance,
-                    "LaneCenterQuality": lane_center_quality,
-                    "AlignedHeadingContribution": aligned_heading_contribution,
+                    "ScaledAbsLaneDistance": scaled_abs_lane_distance,
                     "LaneDistancePenalty": lane_distance_penalty,
                     "PoseQuality": float(pose_quality),
                     "Weight": VELOPPOSE_POSE_WEIGHT,

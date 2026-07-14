@@ -506,11 +506,15 @@ def main() -> None:
             device,
         )
         observation, step_env_reward, done, info = step_raw(env, action)
-        step_selected_reward = reward_calculator.compute(env, step_env_reward)
+        reason = done_reason(done, info)
+        step_selected_reward = reward_calculator.compute(
+            env,
+            step_env_reward,
+            done_code=reason,
+        )
         episode_length += 1
         env_return += step_env_reward
         selected_return += step_selected_reward
-        reason = done_reason(done, info)
 
         state = ViewerState(
             mean_action=mean_action,

@@ -26,8 +26,10 @@ from torchvision import transforms
 
 from duckietown_rewards import (
     GymDuckietownRewardCalculator,
+    MAX_STEPS_DONE_CODE,
     REWARD_FUNCTION_CHOICES,
     format_wheel_action,
+    gym_duckietown_done_code,
     patch_duckietown_world_dynamics,
     reward_source,
 )
@@ -35,6 +37,7 @@ from cli_completion import parse_args_with_completion
 from duckietown_paths import RL_PPO_GYM_DUCKIETOWN_CHECKPOINT_DIR
 from rl_models import TanhGaussianPolicy, load_imitation_actor
 from train_imitation_learning import IMAGENET_MEAN, IMAGENET_STD, build_model, resolve_device, set_seed
+from velopose_reward import VELOPPOSE_INVALID_POSE_PENALTY
 
 
 @dataclass
@@ -309,11 +312,11 @@ def reset_raw(env, seed: int | None = None):
 def step_raw(env, action: np.ndarray):
     result = env.step(format_wheel_action(action))
     if len(result) == 5:
-        return result
+        observation, reward, terminated, truncated, info = result
+        return observation, reward, bool(terminated), bool(truncated), info
     observation, reward, done, info = result
-    simulator_info = info.get("Simulator", {}) if isinstance(info, dict) else {}
-    done_code = simulator_info.get("done_code")
-    truncated = bool(done and done_code == "max-steps-reached")
+    done_code = gym_duckietown_done_code(bool(done), info)
+    truncated = bool(done and done_code == MAX_STEPS_DONE_CODE)
     terminated = bool(done and not truncated)
     return observation, reward, terminated, truncated, info
 
@@ -347,7 +350,8 @@ def reset_environment(
         for _ in range(warmup_steps):
             action = sample_random_action(env, rng, args.reset_random_action_scale)
             warmup_observation, reward, terminated, truncated, warmup_info = step_raw(env, action)
-            reward_calculator.compute(env, float(reward))
+            done_code = gym_duckietown_done_code(bool(terminated or truncated), warmup_info)
+            reward_calculator.compute(env, float(reward), done_code)
             warmup_done = bool(terminated or truncated)
             if warmup_done:
                 break
@@ -359,11 +363,18 @@ def reset_environment(
     return observation, info
 
 
-def done_reason(terminated: bool, truncated: bool, time_limit_done: bool) -> str:
+def done_reason(
+    terminated: bool,
+    truncated: bool,
+    time_limit_done: bool,
+    info: dict[str, Any] | None = None,
+) -> str:
     if terminated:
-        return "terminated"
+        code = gym_duckietown_done_code(True, info)
+        return code if code != "terminated" else "terminated"
     if truncated:
-        return "truncated"
+        code = gym_duckietown_done_code(True, info)
+        return code if code == MAX_STEPS_DONE_CODE else "truncated"
     if time_limit_done:
         return "time_limit"
     return "unknown"
@@ -423,7 +434,8 @@ def evaluate_policy(
                 action_tensor = policy.act(obs_tensor, deterministic=args.eval_deterministic)
                 action = format_wheel_action(action_tensor.squeeze(0).cpu().numpy())
                 observation, reward, terminated, truncated, info = step_raw(env, action)
-            reward = reward_calculator.compute(env, float(reward))
+            done_code = gym_duckietown_done_code(bool(terminated or truncated), info)
+            reward = reward_calculator.compute(env, float(reward), done_code)
             total_return += reward
             episode_return += reward
             episode_length += 1
@@ -519,6 +531,11 @@ def main() -> None:
             "name": args.reward_function,
             "source": reward_source(args.reward_function),
             "supported": REWARD_FUNCTION_CHOICES,
+            "invalid_pose_penalty": (
+                VELOPPOSE_INVALID_POSE_PENALTY
+                if args.reward_function == "velopose"
+                else 0.0
+            ),
         },
     }
     (run_dir / "config.json").write_text(json.dumps(config_json, indent=2) + "\n")
@@ -670,7 +687,8 @@ def main() -> None:
                     value_tensor = value(obs_tensor.unsqueeze(0))
                 action = format_wheel_action(action_tensor.squeeze(0).cpu().numpy())
                 next_observation, reward, terminated, truncated, info = step_raw(env, action)
-                reward = reward_calculator.compute(env, float(reward))
+                done_code = gym_duckietown_done_code(bool(terminated or truncated), info)
+                reward = reward_calculator.compute(env, float(reward), done_code)
 
                 obs_buf.append(obs_tensor.cpu())
                 action_buf.append(torch.from_numpy(action))
@@ -687,7 +705,7 @@ def main() -> None:
                 observation = next_observation
 
                 if done:
-                    reason = done_reason(terminated, truncated, time_limit_done)
+                    reason = done_reason(terminated, truncated, time_limit_done, info)
                     write_training_episode(
                         metrics_file,
                         metrics_fields,

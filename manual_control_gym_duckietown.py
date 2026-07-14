@@ -128,7 +128,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=EVALUATION_SCREENSHOT_DIR / "gym_duckietown_manual.png",
     )
-    parser.add_argument("--log-level", default="WARNING", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+    parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     return parse_args_with_completion(parser)
 
 
@@ -142,6 +142,13 @@ def move_towards(value: float, target: float, max_delta: float) -> float:
 
 def configure_logging(level_name: str) -> None:
     level = getattr(logging, level_name.upper())
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        logging.basicConfig(level=level)
+    root_logger.setLevel(level)
+    for handler in root_logger.handlers:
+        handler.setLevel(level)
+
     for logger_name in (
         "gym-duckietown",
         "duckietown_world",
@@ -151,7 +158,10 @@ def configure_logging(level_name: str) -> None:
         "nodes",
         "aido_schemas",
     ):
-        logging.getLogger(logger_name).setLevel(level)
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(level)
+        for handler in logger.handlers:
+            handler.setLevel(level)
 
 
 def install_windowed_check_hw_stub() -> None:
@@ -415,6 +425,7 @@ def main() -> None:
     args = parse_args()
     configure_logging(args.log_level)
     env = make_env(args)
+    configure_logging(args.log_level)
     _, _, image_width, image_height = import_simulator()
     viewer_height = max(image_height, MIN_VIEWER_HEIGHT)
     image_y = (viewer_height - image_height) // 2

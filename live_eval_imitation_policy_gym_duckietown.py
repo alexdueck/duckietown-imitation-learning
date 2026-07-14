@@ -182,7 +182,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--log-level",
-        default="WARNING",
+        default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
     )
     return parse_args_with_completion(parser)
@@ -351,6 +351,7 @@ def main() -> None:
     recorder = ReturnRecorder(returns_path)
 
     env = make_env(args)
+    configure_logging(args.log_level)
     _, _, image_width, image_height = import_simulator()
     reward_calculator = GymDuckietownRewardCalculator(args.reward_function)
     observation = reset_raw(env)

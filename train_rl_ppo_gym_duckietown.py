@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -77,6 +78,7 @@ class PPOConfig:
     simulator_max_steps: int | None
     camera_width: int
     camera_height: int
+    log_level: str
     debug_initial_action: bool
     seed: int
     device: str
@@ -165,6 +167,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
+    parser.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default="INFO",
+        help="Logging level for gym-duckietown and its Duckietown dependencies.",
+    )
     parser.add_argument("--debug-initial-action", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
@@ -224,6 +232,30 @@ def ensure_gym_duckietown_available() -> None:
             "gym-duckietown is not installed in this Python environment. "
             "Install it first, then rerun train_rl_ppo_gym_duckietown.py."
         ) from error
+
+
+def configure_gym_duckietown_logging(level_name: str) -> None:
+    level = getattr(logging, level_name.upper())
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        logging.basicConfig(level=level)
+    root_logger.setLevel(level)
+    for handler in root_logger.handlers:
+        handler.setLevel(level)
+
+    for logger_name in (
+        "gym-duckietown",
+        "duckietown_world",
+        "geometry",
+        "typing",
+        "commons",
+        "nodes",
+        "aido_schemas",
+    ):
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(level)
+        for handler in logger.handlers:
+            handler.setLevel(level)
 
 
 def make_env(args: argparse.Namespace, seed: int | None = None):
@@ -457,7 +489,9 @@ def main() -> None:
     args = parse_args()
     if args.resume_checkpoint is not None and args.imitation_checkpoint is not None:
         raise ValueError("Use either --resume-checkpoint or --imitation-checkpoint, not both.")
+    configure_gym_duckietown_logging(args.log_level)
     ensure_gym_duckietown_available()
+    configure_gym_duckietown_logging(args.log_level)
 
     set_seed(args.seed)
     reset_rng = np.random.default_rng(args.seed + 1)

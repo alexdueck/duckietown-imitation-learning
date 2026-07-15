@@ -1543,7 +1543,9 @@ def main() -> None:
                     f"mean_scenario_length={eval_result['eval_mean_scenario_length']:.1f}",
                     flush=True,
                 )
-                eval_checkpoint = run_dir / f"eval_step_{global_step:010d}.pt"
+                eval_checkpoint = (
+                    run_dir / f"eval_{eval_index:04d}_step_{global_step:010d}.pt"
+                )
                 save_checkpoint(
                     eval_checkpoint,
                     policy,

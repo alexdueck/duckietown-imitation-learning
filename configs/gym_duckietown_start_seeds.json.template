@@ -1,0 +1,6 @@
+{
+  "map_name": "loop_empty",
+  "training_seeds": [123, 456, 789],
+  "evaluation_seeds": [321, 654],
+  "training_poses": []
+}

@@ -18,6 +18,7 @@ import pyglet
 
 from cli_completion import parse_args_with_completion
 from duckietown_paths import EVALUATION_SCREENSHOT_DIR
+from gym_duckietown_start_config import TrainingPose, append_training_pose
 from duckietown_rewards import (
     DISPLAY_REWARD_FUNCTIONS,
     compute_reward_breakdowns,
@@ -53,6 +54,7 @@ class ViewerState:
     done_reason: str
     step_count: int
     timestamp: float
+    reset_seed: int | None
 
 
 @dataclass
@@ -118,6 +120,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--distortion", action="store_true")
     parser.add_argument("--dynamics-rand", action="store_true")
     parser.add_argument("--camera-rand", action="store_true")
+    parser.add_argument(
+        "--start-seeds-config",
+        type=Path,
+        default="configs/gym_duckietown_start_seeds.json",
+        help="Existing local start config to which P appends the current training pose.",
+    )
     parser.add_argument("--auto-reset", action="store_true", help="Reset immediately after gym-duckietown returns done.")
     parser.add_argument("--forward-target", type=float, default=0.45)
     parser.add_argument("--backward-target", type=float, default=0.30)
@@ -249,6 +257,7 @@ def make_viewer_state(
     done: bool,
     info: dict[str, Any] | None = None,
     previous_state: ViewerState | None = None,
+    reset_seed: int | None = None,
 ) -> ViewerState:
     info = {} if info is None else info
     code = done_reason(done, info)
@@ -278,14 +287,50 @@ def make_viewer_state(
         done_reason=code,
         step_count=int(getattr(env, "step_count", 0)),
         timestamp=float(getattr(env, "timestamp", 0.0)),
+        reset_seed=previous_state.reset_seed if previous_state is not None else reset_seed,
     )
 
 
-def reset_env(env, calculators) -> ViewerState:
+def reset_env(env, calculators, seed: int | None = None) -> ViewerState:
+    if seed is not None:
+        env.seed(seed)
     env.reset()
     reset_reward_calculators(calculators, env)
     action = np.zeros(2, dtype=np.float32)
-    return make_viewer_state(env, calculators, action, current_env_reward(env), False, {})
+    return make_viewer_state(
+        env,
+        calculators,
+        action,
+        current_env_reward(env),
+        False,
+        {},
+        reset_seed=seed,
+    )
+
+
+def capture_training_pose(env) -> TrainingPose:
+    raw_env = getattr(env, "unwrapped", env)
+    position = np.asarray(raw_env.cur_pos, dtype=np.float64)
+    angle = float(raw_env.cur_angle)
+    if not raw_env._valid_pose(position, angle):
+        raise ValueError("current pose is not valid")
+
+    tile_x, tile_y = raw_env.get_grid_coords(position)
+    tile = raw_env._get_tile(tile_x, tile_y)
+    if tile is None or not tile.get("drivable", False):
+        raise ValueError("current pose is not on a drivable tile")
+
+    tile_size = float(raw_env.road_tile_size)
+    local_position = (
+        float(position[0] - tile_x * tile_size),
+        0.0,
+        float(position[2] - tile_y * tile_size),
+    )
+    return TrainingPose(
+        tile=(tile_x, tile_y),
+        position=local_position,
+        angle=angle,
+    )
 
 
 def draw_rect(x: float, y: float, width: float, height: float, color: tuple[int, int, int]) -> None:
@@ -379,11 +424,18 @@ def append_component_lines(
             )
 
 
-def sidebar_lines(state: ViewerState, map_name: str) -> list[tuple[str, int, tuple[int, int, int, int], bool]]:
+def sidebar_lines(
+    state: ViewerState,
+    map_name: str,
+    seed_input: str | None = None,
+    pose_save_status: str | None = None,
+) -> list[tuple[str, int, tuple[int, int, int, int], bool]]:
     lane = state.lane_metrics
+    seed_label = str(state.reset_seed) if state.reset_seed is not None else "continued RNG"
     lines: list[tuple[str, int, tuple[int, int, int, int], bool]] = [
         ("gym-duckietown rewards", 18, ACCENT, True),
         (f"map {map_name}", 13, MUTED, False),
+        (f"reset seed {seed_label}", 13, MUTED, False),
         (f"step {state.step_count}  t {state.timestamp:.2f}s", 13, MUTED, False),
         ("", 8, MUTED, False),
         (f"left {fmt(state.action[0], 3)}   right {fmt(state.action[1], 3)}", 16, TEXT, True),
@@ -409,6 +461,11 @@ def sidebar_lines(state: ViewerState, map_name: str) -> list[tuple[str, int, tup
         ("", 8, MUTED, False),
     ]
 
+    if seed_input is not None:
+        lines.insert(3, (f"new seed > {seed_input}_", 15, ACCENT, True))
+    if pose_save_status is not None:
+        lines.insert(3, (pose_save_status, 13, ACCENT, True))
+
     if state.done:
         lines.append((f"done {state.done_reason}", 15, BAD, True))
         lines.append(("", 8, MUTED, False))
@@ -427,10 +484,22 @@ def sidebar_lines(state: ViewerState, map_name: str) -> list[tuple[str, int, tup
     return lines
 
 
-def draw_sidebar(state: ViewerState, map_name: str, x: int, height: int) -> None:
+def draw_sidebar(
+    state: ViewerState,
+    map_name: str,
+    x: int,
+    height: int,
+    seed_input: str | None = None,
+    pose_save_status: str | None = None,
+) -> None:
     draw_rect(x, 0, SIDEBAR_WIDTH, height, SIDEBAR_BG)
     cursor_y = height - 30
-    for text, font_size, color, bold in sidebar_lines(state, map_name):
+    for text, font_size, color, bold in sidebar_lines(
+        state,
+        map_name,
+        seed_input,
+        pose_save_status,
+    ):
         if text:
             draw_label(text, x + 18, cursor_y, font_size=font_size, color=color, bold=bold)
         cursor_y -= max(16, font_size + 8)
@@ -453,10 +522,11 @@ def main() -> None:
     viewer_height = max(image_height, MIN_VIEWER_HEIGHT)
     image_y = (viewer_height - image_height) // 2
     calculators = create_reward_calculators(DISPLAY_REWARD_FUNCTIONS)
-    env.seed(args.seed)
-    state = reset_env(env, calculators)
+    state = reset_env(env, calculators, seed=args.seed)
     action_controller = ManualActionController()
     paused_due_to_done = False
+    seed_input: str | None = None
+    pose_save_status: str | None = None
 
     from pyglet import window as pyglet_window
     from pyglet.window import key
@@ -470,11 +540,60 @@ def main() -> None:
     pressed_keys: set[int] = set()
 
     print("manual gym-duckietown reward viewer started", flush=True)
-    print("WASD drives, arrow keys also work, space stops, backspace or slash resets, enter saves screenshot, escape exits", flush=True)
+    print(
+        "WASD drives, arrow keys also work, R enters a reset seed, P saves a training pose, space stops, "
+        "backspace or slash resets, enter saves screenshot, escape exits",
+        flush=True,
+    )
 
     @window.event
     def on_key_press(symbol, modifiers):
-        nonlocal state, paused_due_to_done
+        nonlocal state, paused_due_to_done, seed_input, pose_save_status
+        if seed_input is not None:
+            if symbol == key.BACKSPACE:
+                seed_input = seed_input[:-1]
+            elif symbol in (key.ENTER, key.RETURN) and seed_input:
+                seed = int(seed_input)
+                state = reset_env(env, calculators, seed=seed)
+                action_controller.reset()
+                pressed_keys.clear()
+                paused_due_to_done = False
+                seed_input = None
+                print(f"reset seed={seed}", flush=True)
+            elif symbol == key.ESCAPE:
+                seed_input = None
+            return
+
+        if symbol == key.R:
+            seed_input = ""
+            action_controller.reset()
+            pressed_keys.clear()
+            return
+
+        if symbol == key.P:
+            if symbol in pressed_keys:
+                return
+            pressed_keys.add(symbol)
+            if args.start_seeds_config is None:
+                pose_save_status = "pose not saved: no config"
+                print("Cannot save pose without --start-seeds-config", flush=True)
+                return
+            try:
+                pose = capture_training_pose(env)
+                pose_index = append_training_pose(args.start_seeds_config, args.map_name, pose)
+            except (OSError, ValueError) as error:
+                pose_save_status = "pose save failed; see terminal"
+                print(f"Could not save training pose: {error}", flush=True)
+            else:
+                pose_save_status = f"saved training pose #{pose_index}"
+                print(
+                    f"saved training_pose={pose_index} tile={pose.tile} "
+                    f"position={pose.position} angle={pose.angle:.8f} "
+                    f"config={args.start_seeds_config.expanduser()}",
+                    flush=True,
+                )
+            return
+
         pressed_keys.add(symbol)
         if symbol in (key.BACKSPACE, key.SLASH):
             state = reset_env(env, calculators)
@@ -489,6 +608,13 @@ def main() -> None:
             pyglet.app.exit()
 
     @window.event
+    def on_text(text):
+        nonlocal seed_input
+        if seed_input is not None:
+            digits = "".join(character for character in text if character.isdigit())
+            seed_input = (seed_input + digits)[:20]
+
+    @window.event
     def on_key_release(symbol, modifiers):
         pressed_keys.discard(symbol)
 
@@ -499,11 +625,18 @@ def main() -> None:
         window.clear()
         draw_rect(0, 0, image_width + SIDEBAR_WIDTH, viewer_height, BACKGROUND)
         draw_rgb(rgb, 0, image_y, image_width, image_height)
-        draw_sidebar(state, args.map_name, image_width, viewer_height)
+        draw_sidebar(
+            state,
+            args.map_name,
+            image_width,
+            viewer_height,
+            seed_input,
+            pose_save_status,
+        )
 
     def update(dt):
         nonlocal state, paused_due_to_done
-        if paused_due_to_done:
+        if paused_due_to_done or seed_input is not None:
             return
 
         action = action_controller.update(pressed_keys, key, args, dt)

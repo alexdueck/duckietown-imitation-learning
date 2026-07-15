@@ -13,6 +13,7 @@ import argparse
 import csv
 import json
 import logging
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +37,13 @@ from duckietown_rewards import (
 )
 from cli_completion import parse_args_with_completion
 from duckietown_paths import RL_PPO_GYM_DUCKIETOWN_CHECKPOINT_DIR
+from gym_duckietown_start_config import (
+    StartConfig,
+    TrainingPose,
+    TrainingStart,
+    choose_training_start,
+    load_start_config,
+)
 from rl_models import TanhGaussianPolicy, load_imitation_actor, tanh_normal_log_prob
 from train_imitation_learning import IMAGENET_MEAN, IMAGENET_STD, build_model, resolve_device, set_seed
 from velopose_reward import (
@@ -58,6 +66,10 @@ class PPOConfig:
     reset_random_warmup_steps: int
     reset_random_warmup_retries: int
     reset_random_action_scale: float
+    start_seeds_config: str | None
+    hard_start_probability: float
+    training_start_seeds: tuple[int, ...]
+    training_start_poses: tuple[TrainingPose, ...]
     eval_interval_rollouts: int
     eval_steps: int
     eval_seeds: tuple[int, ...]
@@ -94,6 +106,12 @@ class PPOConfig:
     device: str
 
 
+@dataclass(frozen=True)
+class EnvironmentStartDefaults:
+    user_tile_start: Any
+    start_pose: Any
+
+
 class ValueNetwork(nn.Module):
     def __init__(self, model_name: str, pretrained: bool = False) -> None:
         super().__init__()
@@ -116,6 +134,16 @@ def parse_eval_seeds(value: str) -> tuple[int, ...]:
     if len(set(seeds)) != len(seeds):
         raise argparse.ArgumentTypeError("--eval-seeds must not contain duplicates")
     return seeds
+
+
+def parse_probability(value: str) -> float:
+    try:
+        probability = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("probability must be a number between 0 and 1") from error
+    if not 0.0 <= probability <= 1.0:
+        raise argparse.ArgumentTypeError("probability must be between 0 and 1")
+    return probability
 
 
 def parse_args() -> argparse.Namespace:
@@ -150,6 +178,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reset-random-warmup-steps", type=int, default=0)
     parser.add_argument("--reset-random-warmup-retries", type=int, default=3)
     parser.add_argument("--reset-random-action-scale", type=float, default=0.6)
+    parser.add_argument(
+        "--start-seeds-config",
+        type=Path,
+        default=None,
+        help=(
+            "JSON config containing training_seeds, optional training_poses, and evaluation_seeds. "
+            "Its evaluation seeds replace --eval-seeds."
+        ),
+    )
+    parser.add_argument(
+        "--hard-start-probability",
+        type=parse_probability,
+        default=0.5,
+        help="Probability of selecting a training seed from --start-seeds-config at each episode reset.",
+    )
     parser.add_argument("--eval-interval-rollouts", type=int, default=10)
     parser.add_argument(
         "--eval-steps",
@@ -494,6 +537,53 @@ def reset_environment(
     return observation, info
 
 
+def capture_environment_start_defaults(env) -> EnvironmentStartDefaults:
+    raw_env = getattr(env, "unwrapped", env)
+    return EnvironmentStartDefaults(
+        user_tile_start=deepcopy(getattr(raw_env, "user_tile_start", None)),
+        start_pose=deepcopy(getattr(raw_env, "start_pose", None)),
+    )
+
+
+def apply_training_start(env, training_start: TrainingStart, defaults: EnvironmentStartDefaults) -> None:
+    raw_env = getattr(env, "unwrapped", env)
+    if training_start.pose is None:
+        raw_env.user_tile_start = deepcopy(defaults.user_tile_start)
+        raw_env.start_pose = deepcopy(defaults.start_pose)
+        return
+
+    raw_env.user_tile_start = tuple(training_start.pose.tile)
+    raw_env.start_pose = [list(training_start.pose.position), training_start.pose.angle]
+
+
+def reset_training_environment(
+    env,
+    args: argparse.Namespace,
+    rng: np.random.Generator,
+    reward_calculator: GymDuckietownRewardCalculator,
+    training_start: TrainingStart,
+    defaults: EnvironmentStartDefaults,
+):
+    apply_training_start(env, training_start, defaults)
+    observation, info = reset_environment(
+        env,
+        args,
+        rng,
+        reward_calculator,
+        seed=training_start.seed,
+        use_random_warmup=training_start.pose is None,
+    )
+    if training_start.pose is not None:
+        raw_env = getattr(env, "unwrapped", env)
+        if not raw_env._valid_pose(raw_env.cur_pos, raw_env.cur_angle):
+            pose_label = training_start.name or "unnamed"
+            raise ValueError(
+                f"Training pose {pose_label!r} from {args.start_seeds_config} is not valid "
+                f"on map {args.map_name!r}"
+            )
+    return observation, info
+
+
 def done_reason(
     terminated: bool,
     truncated: bool,
@@ -519,6 +609,7 @@ def write_training_episode(
     episode_return: float,
     episode_length: int,
     reason: str,
+    training_start: TrainingStart,
 ) -> None:
     with metrics_file.open("a", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=metrics_fields)
@@ -529,6 +620,9 @@ def write_training_episode(
             "episode_length": episode_length,
             "episode_return_per_step": episode_return / max(1, episode_length),
             "done_reason": reason,
+            "start_type": training_start.kind,
+            "start_seed": training_start.seed,
+            "start_name": training_start.name,
         })
 
 
@@ -685,12 +779,18 @@ def main() -> None:
     args = parse_args()
     if args.resume_checkpoint is not None and args.imitation_checkpoint is not None:
         raise ValueError("Use either --resume-checkpoint or --imitation-checkpoint, not both.")
+    start_config = None
+    if args.start_seeds_config is not None:
+        start_config = load_start_config(args.start_seeds_config, args.map_name)
+        args.start_seeds_config = start_config.source_path
+        args.eval_seeds = start_config.evaluation_seeds
     configure_gym_duckietown_logging(args.log_level)
     ensure_gym_duckietown_available()
     configure_gym_duckietown_logging(args.log_level)
 
     set_seed(args.seed)
     reset_rng = np.random.default_rng(args.seed + 1)
+    start_rng = np.random.default_rng(args.seed + 2)
     device = resolve_device(args.device)
     run_dir = args.output_dir.expanduser() / datetime.now().strftime("%Y%m%d_%H%M%S_ppo_gym_duckietown")
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -699,6 +799,12 @@ def main() -> None:
         for k, v in vars(args).items()
         if k != "device"
     }
+    config_values["training_start_seeds"] = (
+        start_config.training_seeds if start_config is not None else ()
+    )
+    config_values["training_start_poses"] = (
+        start_config.training_poses if start_config is not None else ()
+    )
     config = PPOConfig(**config_values, device=str(device))
     config_json = {
         **asdict(config),
@@ -722,6 +828,23 @@ def main() -> None:
                 if args.reward_function == "velopose"
                 else None
             ),
+        },
+        "curated_start_oversampling": {
+            "enabled": start_config is not None,
+            "source_path": (
+                str(start_config.source_path) if start_config is not None else None
+            ),
+            "map_name": start_config.map_name if start_config is not None else args.map_name,
+            "hard_start_probability": args.hard_start_probability,
+            "training_seeds": (
+                list(start_config.training_seeds) if start_config is not None else []
+            ),
+            "training_poses": (
+                [pose.as_json() for pose in start_config.training_poses]
+                if start_config is not None
+                else []
+            ),
+            "evaluation_seeds": list(args.eval_seeds),
         },
     }
     (run_dir / "config.json").write_text(json.dumps(config_json, indent=2) + "\n")
@@ -775,6 +898,9 @@ def main() -> None:
         "episode_length",
         "episode_return_per_step",
         "done_reason",
+        "start_type",
+        "start_seed",
+        "start_name",
         "policy_loss",
         "value_loss",
         "entropy",
@@ -890,12 +1016,36 @@ def main() -> None:
     eval_reward_calculator = GymDuckietownRewardCalculator(args.reward_function)
     try:
         env = make_env(args, seed=args.seed)
+        training_start_defaults = capture_environment_start_defaults(env)
         if args.eval_interval_rollouts > 0 and args.eval_steps > 0:
             eval_env = make_env(args, seed=args.eval_seeds[0])
         print(f"Environment: gym-duckietown map={args.map_name}", flush=True)
         print(f"Reward function: {args.reward_function}", flush=True)
+        if start_config is not None:
+            print(
+                f"Hard starts: seeds={len(start_config.training_seeds)} "
+                f"poses={len(start_config.training_poses)} "
+                f"probability={args.hard_start_probability:.3f} "
+                f"config={start_config.source_path}",
+                flush=True,
+            )
         print(f"Evaluation seeds: {','.join(str(seed) for seed in args.eval_seeds)}", flush=True)
-        observation, info = reset_environment(env, args, reset_rng, reward_calculator, seed=args.seed)
+        if start_config is None:
+            training_start = TrainingStart(kind="random", seed=args.seed)
+        else:
+            training_start = choose_training_start(
+                start_config,
+                args.hard_start_probability,
+                start_rng,
+            )
+        observation, info = reset_training_environment(
+            env,
+            args,
+            reset_rng,
+            reward_calculator,
+            training_start,
+            training_start_defaults,
+        )
         if args.debug_initial_action:
             with torch.no_grad():
                 obs_tensor = preprocess(
@@ -1008,15 +1158,30 @@ def main() -> None:
                         episode_return,
                         episode_length,
                         reason,
+                        training_start,
                     )
                     print(
                         f"step={global_step} episode={episode} return={episode_return:.3f} "
                         f"length={episode_length} reward_per_step={episode_return / max(1, episode_length):.4f} "
-                        f"done_reason={reason}",
+                        f"done_reason={reason} start_type={training_start.kind} "
+                        f"start_seed={training_start.seed if training_start.seed is not None else 'continued_rng'} "
+                        f"start_name={training_start.name or '-'}",
                         flush=True,
                     )
                     phase_started_at = perf_counter()
-                    observation, info = reset_environment(env, args, reset_rng, reward_calculator)
+                    training_start = choose_training_start(
+                        start_config,
+                        args.hard_start_probability,
+                        start_rng,
+                    )
+                    observation, info = reset_training_environment(
+                        env,
+                        args,
+                        reset_rng,
+                        reward_calculator,
+                        training_start,
+                        training_start_defaults,
+                    )
                     reward_and_reset_seconds += perf_counter() - phase_started_at
                     episode += 1
                     episode_return = 0.0

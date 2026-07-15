@@ -13,10 +13,11 @@ import argparse
 import csv
 import json
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
+from typing import Any
 
 import numpy as np
 import torch
@@ -35,9 +36,13 @@ from duckietown_rewards import (
 )
 from cli_completion import parse_args_with_completion
 from duckietown_paths import RL_PPO_GYM_DUCKIETOWN_CHECKPOINT_DIR
-from rl_models import TanhGaussianPolicy, load_imitation_actor
+from rl_models import TanhGaussianPolicy, load_imitation_actor, tanh_normal_log_prob
 from train_imitation_learning import IMAGENET_MEAN, IMAGENET_STD, build_model, resolve_device, set_seed
-from velopose_reward import VELOPPOSE_INVALID_POSE_PENALTY
+from velopose_reward import (
+    VELOPPOSE_INVALID_POSE_PENALTY,
+    VELOPPOSE_POSE_WEIGHT,
+    VELOPPOSE_VELOCITY_WEIGHT,
+)
 
 
 @dataclass
@@ -55,6 +60,7 @@ class PPOConfig:
     reset_random_action_scale: float
     eval_interval_rollouts: int
     eval_steps: int
+    eval_seeds: tuple[int, ...]
     eval_deterministic: bool
     initial_log_std: float | None
     min_log_std: float
@@ -100,6 +106,18 @@ class ValueNetwork(nn.Module):
         return self.value(self.encoder(observations)).squeeze(1)
 
 
+def parse_eval_seeds(value: str) -> tuple[int, ...]:
+    try:
+        seeds = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("--eval-seeds must be a comma-separated list of integers") from error
+    if not seeds:
+        raise argparse.ArgumentTypeError("--eval-seeds must contain at least one integer")
+    if len(set(seeds)) != len(seeds):
+        raise argparse.ArgumentTypeError("--eval-seeds must not contain duplicates")
+    return seeds
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO in gym-duckietown.")
     parser.add_argument(
@@ -120,7 +138,7 @@ def parse_args() -> argparse.Namespace:
         "--resume-checkpoint",
         type=Path,
         default=None,
-        help="Resume PPO training from an RL checkpoint such as last.pt or best_eval.pt.",
+        help="Resume PPO training from an RL checkpoint such as last.pt, best_return.pt, or best_safe.pt.",
     )
     parser.add_argument("--total-steps", type=int, default=100_000)
     parser.add_argument(
@@ -133,7 +151,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reset-random-warmup-retries", type=int, default=3)
     parser.add_argument("--reset-random-action-scale", type=float, default=0.6)
     parser.add_argument("--eval-interval-rollouts", type=int, default=10)
-    parser.add_argument("--eval-steps", type=int, default=500)
+    parser.add_argument(
+        "--eval-steps",
+        type=int,
+        default=250,
+        help="Maximum steps for each fixed evaluation scenario.",
+    )
+    parser.add_argument(
+        "--eval-seeds",
+        type=parse_eval_seeds,
+        default=(10042, 10043, 10044, 10045, 10046),
+        help="Comma-separated reset seeds defining the fixed evaluation scenarios.",
+    )
     parser.add_argument("--eval-stochastic", action="store_false", dest="eval_deterministic")
     parser.add_argument("--initial-log-std", type=float, default=None)
     parser.add_argument("--min-log-std", type=float, default=-5.0)
@@ -144,7 +173,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--clip-ratio", type=float, default=0.2)
-    parser.add_argument("--policy-lr", type=float, default=3e-4)
+    parser.add_argument("--policy-lr", type=float, default=1e-5)
     parser.add_argument("--value-lr", type=float, default=1e-4)
     parser.add_argument("--entropy-coef", type=float, default=0.01)
     parser.add_argument("--value-coef", type=float, default=0.5)
@@ -242,6 +271,98 @@ def format_duration(seconds: float) -> str:
     if days:
         return f"{days}d{hours:02d}:{minutes:02d}:{seconds:02d}"
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def flatten_reward_breakdown(breakdown: dict[str, Any]) -> dict[str, float]:
+    flattened = {"Reward": float(breakdown["total"])}
+
+    def visit(components: dict[str, Any], prefix: str = "") -> None:
+        for name, value in components.items():
+            path = f"{prefix}.{name}" if prefix else str(name)
+            if isinstance(value, dict):
+                if "total" in value:
+                    flattened[path] = float(value["total"])
+                nested = value.get("components")
+                if isinstance(nested, dict):
+                    visit(nested, path)
+            elif isinstance(value, (int, float, np.number)):
+                flattened[path] = float(value)
+
+    components = breakdown.get("components")
+    if isinstance(components, dict):
+        visit(components)
+    return flattened
+
+
+@dataclass
+class RewardComponentAccumulator:
+    steps: int = 0
+    sums: dict[str, float] = field(default_factory=dict)
+    present_counts: dict[str, int] = field(default_factory=dict)
+
+    def add(self, breakdown: dict[str, Any]) -> float:
+        flattened = flatten_reward_breakdown(breakdown)
+        self.steps += 1
+        for name, value in flattened.items():
+            self.sums[name] = self.sums.get(name, 0.0) + value
+            self.present_counts[name] = self.present_counts.get(name, 0) + 1
+        return flattened["Reward"]
+
+    def merge(self, other: "RewardComponentAccumulator") -> None:
+        self.steps += other.steps
+        for name, value in other.sums.items():
+            self.sums[name] = self.sums.get(name, 0.0) + value
+            self.present_counts[name] = self.present_counts.get(name, 0) + other.present_counts[name]
+
+
+REWARD_COMPONENT_FIELDS = [
+    "phase",
+    "train_step",
+    "train_rollout",
+    "eval_index",
+    "scenario_index",
+    "scenario_seed",
+    "component",
+    "component_sum",
+    "component_mean_per_step",
+    "component_mean_when_present",
+    "present_count",
+    "step_count",
+]
+
+
+def write_reward_components(
+    path: Path,
+    accumulator: RewardComponentAccumulator,
+    *,
+    phase: str,
+    train_step: int,
+    train_rollout: int,
+    eval_index: int | None = None,
+    scenario_index: int | None = None,
+    scenario_seed: int | None = None,
+) -> None:
+    if accumulator.steps == 0:
+        return
+    with path.open("a", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=REWARD_COMPONENT_FIELDS)
+        for component in sorted(accumulator.sums):
+            component_sum = accumulator.sums[component]
+            present_count = accumulator.present_counts[component]
+            writer.writerow({
+                "phase": phase,
+                "train_step": train_step,
+                "train_rollout": train_rollout,
+                "eval_index": "" if eval_index is None else eval_index,
+                "scenario_index": "" if scenario_index is None else scenario_index,
+                "scenario_seed": "" if scenario_seed is None else scenario_seed,
+                "component": component,
+                "component_sum": component_sum,
+                "component_mean_per_step": component_sum / accumulator.steps,
+                "component_mean_when_present": component_sum / present_count,
+                "present_count": present_count,
+                "step_count": accumulator.steps,
+            })
 
 
 def ensure_gym_duckietown_available() -> None:
@@ -418,20 +539,37 @@ def evaluate_policy(
     args: argparse.Namespace,
     transform: transforms.Compose,
     device: torch.device,
-    reset_rng: np.random.Generator,
-) -> dict[str, float | int]:
-    observation, info = reset_environment(env, args, reset_rng, reward_calculator, use_random_warmup=False)
+) -> dict[str, Any]:
     total_return = 0.0
-    episode_return = 0.0
-    episode_length = 0
-    completed_episodes = 0
+    total_steps = 0
     terminated_count = 0
     truncated_count = 0
     time_limit_count = 0
+    scenario_results: list[dict[str, Any]] = []
+    scenario_components: list[RewardComponentAccumulator] = []
+    aggregate_components = RewardComponentAccumulator()
 
-    was_training = policy.training
     policy.eval()
-    try:
+    for scenario_index, scenario_seed in enumerate(args.eval_seeds, start=1):
+        scenario_rng = np.random.default_rng(scenario_seed)
+        observation, info = reset_environment(
+            env,
+            args,
+            scenario_rng,
+            reward_calculator,
+            seed=scenario_seed,
+            use_random_warmup=False,
+        )
+        raw_env = getattr(env, "unwrapped", env)
+        start_position = np.asarray(raw_env.cur_pos, dtype=np.float64).copy()
+        start_angle = float(raw_env.cur_angle)
+        scenario_return = 0.0
+        scenario_steps = 0
+        scenario_terminated = False
+        scenario_truncated = False
+        last_info = info
+        components = RewardComponentAccumulator()
+
         for _ in range(args.eval_steps):
             obs_tensor = preprocess(
                 observation,
@@ -443,37 +581,65 @@ def evaluate_policy(
             with torch.no_grad():
                 action_tensor = policy.act(obs_tensor, deterministic=args.eval_deterministic)
                 action = format_wheel_action(action_tensor.squeeze(0).cpu().numpy())
-                observation, reward, terminated, truncated, info = step_raw(env, action)
-            done_code = gym_duckietown_done_code(bool(terminated or truncated), info)
-            reward = reward_calculator.compute(env, float(reward), done_code)
+                observation, env_reward, terminated, truncated, last_info = step_raw(env, action)
+            done_code = gym_duckietown_done_code(bool(terminated or truncated), last_info)
+            breakdown = reward_calculator.compute_breakdown(env, float(env_reward), done_code)
+            reward = components.add(breakdown)
             total_return += reward
-            episode_return += reward
-            episode_length += 1
+            scenario_return += reward
+            total_steps += 1
+            scenario_steps += 1
+            scenario_terminated = bool(terminated)
+            scenario_truncated = bool(truncated)
+            if scenario_terminated or scenario_truncated:
+                break
 
-            time_limit_done = args.max_episode_steps > 0 and episode_length >= args.max_episode_steps
-            done = bool(terminated or truncated or time_limit_done)
-            if done:
-                completed_episodes += 1
-                terminated_count += int(bool(terminated))
-                truncated_count += int(bool(truncated))
-                time_limit_count += int(time_limit_done and not terminated and not truncated)
-                observation, info = reset_environment(env, args, reset_rng, reward_calculator, use_random_warmup=False)
-                episode_return = 0.0
-                episode_length = 0
-    finally:
-        if was_training:
-            policy.train()
+        scenario_time_limit = not scenario_terminated and not scenario_truncated
+        terminated_count += int(scenario_terminated)
+        truncated_count += int(scenario_truncated)
+        time_limit_count += int(scenario_time_limit)
+        aggregate_components.merge(components)
+        scenario_components.append(components)
+        scenario_results.append({
+            "scenario_index": scenario_index,
+            "scenario_seed": scenario_seed,
+            "start_x": float(start_position[0]),
+            "start_y": float(start_position[1]),
+            "start_z": float(start_position[2]),
+            "start_angle": start_angle,
+            "scenario_return": scenario_return,
+            "scenario_mean_reward": scenario_return / max(1, scenario_steps),
+            "scenario_steps": scenario_steps,
+            "terminated": int(scenario_terminated),
+            "truncated": int(scenario_truncated),
+            "time_limit": int(scenario_time_limit),
+            "done_reason": done_reason(
+                scenario_terminated,
+                scenario_truncated,
+                scenario_time_limit,
+                last_info,
+            ),
+        })
+
+    scenario_lengths = [int(result["scenario_steps"]) for result in scenario_results]
+    scenario_count = len(scenario_results)
 
     return {
         "eval_return": total_return,
-        "eval_mean_reward": total_return / max(1, args.eval_steps),
-        "eval_steps": args.eval_steps,
-        "eval_completed_episodes": completed_episodes,
-        "eval_open_episode_return": episode_return,
-        "eval_open_episode_length": episode_length,
+        "eval_mean_scenario_return": total_return / max(1, scenario_count),
+        "eval_mean_reward": total_return / max(1, total_steps),
+        "eval_steps": total_steps,
+        "eval_scenarios": scenario_count,
+        "eval_safe_scenarios": scenario_count - terminated_count,
+        "eval_mean_scenario_length": float(np.mean(scenario_lengths)) if scenario_lengths else 0.0,
+        "eval_min_scenario_length": min(scenario_lengths, default=0),
+        "eval_max_scenario_length": max(scenario_lengths, default=0),
         "eval_terminated": terminated_count,
         "eval_truncated": truncated_count,
         "eval_time_limit": time_limit_count,
+        "scenario_results": scenario_results,
+        "scenario_components": scenario_components,
+        "reward_components": aggregate_components,
     }
 
 
@@ -546,6 +712,16 @@ def main() -> None:
                 if args.reward_function == "velopose"
                 else 0.0
             ),
+            "velocity_weight": (
+                VELOPPOSE_VELOCITY_WEIGHT
+                if args.reward_function == "velopose"
+                else None
+            ),
+            "pose_weight": (
+                VELOPPOSE_POSE_WEIGHT
+                if args.reward_function == "velopose"
+                else None
+            ),
         },
     }
     (run_dir / "config.json").write_text(json.dumps(config_json, indent=2) + "\n")
@@ -569,6 +745,10 @@ def main() -> None:
     resumed_step = 0
     if args.resume_checkpoint is not None:
         checkpoint = load_rl_checkpoint(args.resume_checkpoint, policy, value, policy_optimizer, value_optimizer, device)
+        for parameter_group in policy_optimizer.param_groups:
+            parameter_group["lr"] = args.policy_lr
+        for parameter_group in value_optimizer.param_groups:
+            parameter_group["lr"] = args.value_lr
         resumed_step = int(checkpoint.get("step", 0))
         checkpoint_config = checkpoint.get("config", {})
         checkpoint_model = checkpoint_config.get("model")
@@ -580,6 +760,12 @@ def main() -> None:
         with torch.no_grad():
             policy.log_std.clamp_(args.min_log_std, args.max_log_std)
         print(f"Resumed RL checkpoint {args.resume_checkpoint.expanduser()} at step={resumed_step}", flush=True)
+
+    # PPO log-probability ratios require a deterministic network for fixed
+    # observations and parameters. Eval mode freezes BatchNorm while gradients
+    # through convolutional and linear parameters remain enabled.
+    policy.eval()
+    value.eval()
 
     metrics_file = run_dir / "history.csv"
     metrics_fields = [
@@ -603,6 +789,11 @@ def main() -> None:
         "rollout_return",
         "rollout_reward_per_step",
         "rollout_seconds",
+        "preprocess_seconds",
+        "policy_value_inference_seconds",
+        "env_step_seconds",
+        "reward_and_reset_seconds",
+        "rollout_overhead_seconds",
         "update_seconds",
         "rollout_update_seconds",
         "environment_steps_per_second",
@@ -617,30 +808,93 @@ def main() -> None:
     ]
     with rollout_metrics_file.open("w", newline="") as file:
         csv.DictWriter(file, fieldnames=rollout_metrics_fields).writeheader()
+    ppo_diagnostics_file = run_dir / "ppo_diagnostics.csv"
+    ppo_diagnostics_fields = [
+        "step",
+        "rollout",
+        "pre_update_mean_abs_log_ratio",
+        "pre_update_max_abs_log_ratio",
+        "approx_kl",
+        "clip_fraction",
+        "ratio_mean",
+        "ratio_min",
+        "ratio_max",
+        "log_std_left",
+        "log_std_right",
+        "std_left",
+        "std_right",
+        "sampled_action_left_mean",
+        "sampled_action_right_mean",
+        "sampled_action_left_std",
+        "sampled_action_right_std",
+        "deterministic_action_left_mean",
+        "deterministic_action_right_mean",
+        "action_noise_left_std",
+        "action_noise_right_std",
+        "action_noise_steering_std",
+        "sampled_steering_std",
+        "sampled_action_saturation_fraction",
+        "deterministic_action_saturation_fraction",
+        "squashed_entropy_estimate",
+    ]
+    with ppo_diagnostics_file.open("w", newline="") as file:
+        csv.DictWriter(file, fieldnames=ppo_diagnostics_fields).writeheader()
+    reward_components_file = run_dir / "reward_components_history.csv"
+    with reward_components_file.open("w", newline="") as file:
+        csv.DictWriter(file, fieldnames=REWARD_COMPONENT_FIELDS).writeheader()
     eval_metrics_file = run_dir / "eval_history.csv"
     eval_metrics_fields = [
         "train_step",
         "train_rollout",
         "eval_index",
         "eval_return",
+        "eval_mean_scenario_return",
         "eval_mean_reward",
         "eval_steps",
-        "eval_completed_episodes",
-        "eval_open_episode_return",
-        "eval_open_episode_length",
+        "eval_scenarios",
+        "eval_safe_scenarios",
+        "eval_mean_scenario_length",
+        "eval_min_scenario_length",
+        "eval_max_scenario_length",
         "eval_terminated",
         "eval_truncated",
         "eval_time_limit",
     ]
     with eval_metrics_file.open("w", newline="") as file:
         csv.DictWriter(file, fieldnames=eval_metrics_fields).writeheader()
+    eval_scenarios_file = run_dir / "eval_scenarios.csv"
+    eval_scenario_fields = [
+        "train_step",
+        "train_rollout",
+        "eval_index",
+        "scenario_index",
+        "scenario_seed",
+        "start_x",
+        "start_y",
+        "start_z",
+        "start_angle",
+        "scenario_return",
+        "scenario_mean_reward",
+        "scenario_steps",
+        "terminated",
+        "truncated",
+        "time_limit",
+        "done_reason",
+    ]
+    with eval_scenarios_file.open("w", newline="") as file:
+        csv.DictWriter(file, fieldnames=eval_scenario_fields).writeheader()
 
     env = None
+    eval_env = None
     reward_calculator = GymDuckietownRewardCalculator(args.reward_function)
+    eval_reward_calculator = GymDuckietownRewardCalculator(args.reward_function)
     try:
         env = make_env(args, seed=args.seed)
+        if args.eval_interval_rollouts > 0 and args.eval_steps > 0:
+            eval_env = make_env(args, seed=args.eval_seeds[0])
         print(f"Environment: gym-duckietown map={args.map_name}", flush=True)
         print(f"Reward function: {args.reward_function}", flush=True)
+        print(f"Evaluation seeds: {','.join(str(seed) for seed in args.eval_seeds)}", flush=True)
         observation, info = reset_environment(env, args, reset_rng, reward_calculator, seed=args.seed)
         if args.debug_initial_action:
             with torch.no_grad():
@@ -684,14 +938,22 @@ def main() -> None:
         rollout = 0
         eval_index = 0
         best_eval_return = -float("inf")
+        best_safe_score: tuple[int, float, float] | None = None
         training_started_at = perf_counter()
         training_start_step = global_step
 
         while global_step < args.total_steps:
             synchronize_device(device)
             rollout_started_at = perf_counter()
-            obs_buf, action_buf, logp_buf, reward_buf, done_buf, value_buf = [], [], [], [], [], []
+            obs_buf, action_buf, raw_action_buf = [], [], []
+            deterministic_action_buf, logp_buf, reward_buf, done_buf, value_buf = [], [], [], [], []
+            rollout_reward_components = RewardComponentAccumulator()
+            preprocess_seconds = 0.0
+            policy_value_inference_seconds = 0.0
+            env_step_seconds = 0.0
+            reward_and_reset_seconds = 0.0
             for _ in range(args.rollout_steps):
+                phase_started_at = perf_counter()
                 obs_tensor = preprocess(
                     observation,
                     args.crop_y_start,
@@ -699,16 +961,31 @@ def main() -> None:
                     args.source_observation_channel_order,
                     transform,
                 ).to(device)
+                preprocess_seconds += perf_counter() - phase_started_at
+
+                phase_started_at = perf_counter()
                 with torch.no_grad():
-                    action_tensor, logp_tensor, _ = policy.sample(obs_tensor.unsqueeze(0))
+                    action_tensor, raw_action_tensor, logp_tensor, deterministic_action_tensor = (
+                        policy.sample_with_raw(obs_tensor.unsqueeze(0))
+                    )
                     value_tensor = value(obs_tensor.unsqueeze(0))
                 action = format_wheel_action(action_tensor.squeeze(0).cpu().numpy())
+                policy_value_inference_seconds += perf_counter() - phase_started_at
+
+                phase_started_at = perf_counter()
                 next_observation, reward, terminated, truncated, info = step_raw(env, action)
+                env_step_seconds += perf_counter() - phase_started_at
+
+                phase_started_at = perf_counter()
                 done_code = gym_duckietown_done_code(bool(terminated or truncated), info)
-                reward = reward_calculator.compute(env, float(reward), done_code)
+                reward_breakdown = reward_calculator.compute_breakdown(env, float(reward), done_code)
+                reward = rollout_reward_components.add(reward_breakdown)
+                reward_and_reset_seconds += perf_counter() - phase_started_at
 
                 obs_buf.append(obs_tensor.cpu())
                 action_buf.append(torch.from_numpy(action))
+                raw_action_buf.append(raw_action_tensor.squeeze(0).cpu())
+                deterministic_action_buf.append(deterministic_action_tensor.squeeze(0).cpu())
                 logp_buf.append(logp_tensor.squeeze(0).cpu())
                 value_buf.append(value_tensor.squeeze(0).cpu())
                 episode_return += reward
@@ -738,7 +1015,9 @@ def main() -> None:
                         f"done_reason={reason}",
                         flush=True,
                     )
+                    phase_started_at = perf_counter()
                     observation, info = reset_environment(env, args, reset_rng, reward_calculator)
+                    reward_and_reset_seconds += perf_counter() - phase_started_at
                     episode += 1
                     episode_return = 0.0
                     episode_length = 0
@@ -748,10 +1027,19 @@ def main() -> None:
             synchronize_device(device)
             rollout_finished_at = perf_counter()
             rollout_seconds = rollout_finished_at - rollout_started_at
+            measured_rollout_seconds = (
+                preprocess_seconds
+                + policy_value_inference_seconds
+                + env_step_seconds
+                + reward_and_reset_seconds
+            )
+            rollout_overhead_seconds = max(0.0, rollout_seconds - measured_rollout_seconds)
             update_started_at = rollout_finished_at
 
             obs = torch.stack(obs_buf).to(device)
             actions = torch.stack(action_buf).to(device)
+            raw_actions = torch.stack(raw_action_buf).to(device)
+            deterministic_actions = torch.stack(deterministic_action_buf).to(device)
             old_logp = torch.stack(logp_buf).to(device)
             rewards = torch.tensor(reward_buf, dtype=torch.float32, device=device)
             dones = torch.tensor(done_buf, dtype=torch.float32, device=device)
@@ -768,6 +1056,17 @@ def main() -> None:
                 advantages, returns = compute_gae(rewards, dones, values, last_value, args.gamma, args.gae_lambda)
                 advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
 
+                pre_update_distribution = policy.distribution(obs)
+                pre_update_actions = torch.tanh(raw_actions)
+                pre_update_logp = tanh_normal_log_prob(
+                    pre_update_distribution,
+                    raw_actions,
+                    pre_update_actions,
+                )
+                pre_update_log_ratio = pre_update_logp - old_logp
+                pre_update_mean_abs_log_ratio = pre_update_log_ratio.abs().mean().item()
+                pre_update_max_abs_log_ratio = pre_update_log_ratio.abs().max().item()
+
             last_policy_loss = last_value_loss = last_entropy = 0.0
             indices = torch.arange(obs.size(0), device=device)
             for _ in range(args.epochs):
@@ -775,8 +1074,9 @@ def main() -> None:
                 for start in range(0, obs.size(0), args.batch_size):
                     batch = permutation[start:start + args.batch_size]
                     distribution = policy.distribution(obs[batch])
-                    raw_actions = torch.atanh(actions[batch].clamp(-0.999, 0.999))
-                    logp = (distribution.log_prob(raw_actions) - torch.log(1.0 - actions[batch].pow(2) + 1e-6)).sum(dim=1)
+                    batch_raw_actions = raw_actions[batch]
+                    batch_actions = torch.tanh(batch_raw_actions)
+                    logp = tanh_normal_log_prob(distribution, batch_raw_actions, batch_actions)
                     ratio = torch.exp(logp - old_logp[batch])
                     clipped = torch.clamp(ratio, 1.0 - args.clip_ratio, 1.0 + args.clip_ratio) * advantages[batch]
                     policy_loss = -torch.min(ratio * advantages[batch], clipped).mean()
@@ -796,6 +1096,48 @@ def main() -> None:
                     nn.utils.clip_grad_norm_(value.parameters(), args.max_grad_norm)
                     value_optimizer.step()
                     last_policy_loss, last_value_loss, last_entropy = policy_loss.item(), value_loss.item(), entropy.item()
+
+            with torch.no_grad():
+                final_distribution = policy.distribution(obs)
+                final_actions = torch.tanh(raw_actions)
+                final_logp = tanh_normal_log_prob(final_distribution, raw_actions, final_actions)
+                final_log_ratio = final_logp - old_logp
+                final_ratio = final_log_ratio.exp()
+                approx_kl = ((final_ratio - 1.0) - final_log_ratio).mean().item()
+                clip_fraction = ((final_ratio - 1.0).abs() > args.clip_ratio).float().mean().item()
+                action_noise = actions - deterministic_actions
+                sampled_steering = 0.5 * (actions[:, 1] - actions[:, 0])
+                action_noise_steering = 0.5 * (action_noise[:, 1] - action_noise[:, 0])
+                effective_log_std = policy.log_std.clamp(args.min_log_std, args.max_log_std)
+                effective_std = effective_log_std.exp()
+                ppo_diagnostics = {
+                    "pre_update_mean_abs_log_ratio": pre_update_mean_abs_log_ratio,
+                    "pre_update_max_abs_log_ratio": pre_update_max_abs_log_ratio,
+                    "approx_kl": approx_kl,
+                    "clip_fraction": clip_fraction,
+                    "ratio_mean": final_ratio.mean().item(),
+                    "ratio_min": final_ratio.min().item(),
+                    "ratio_max": final_ratio.max().item(),
+                    "log_std_left": effective_log_std[0].item(),
+                    "log_std_right": effective_log_std[1].item(),
+                    "std_left": effective_std[0].item(),
+                    "std_right": effective_std[1].item(),
+                    "sampled_action_left_mean": actions[:, 0].mean().item(),
+                    "sampled_action_right_mean": actions[:, 1].mean().item(),
+                    "sampled_action_left_std": actions[:, 0].std(unbiased=False).item(),
+                    "sampled_action_right_std": actions[:, 1].std(unbiased=False).item(),
+                    "deterministic_action_left_mean": deterministic_actions[:, 0].mean().item(),
+                    "deterministic_action_right_mean": deterministic_actions[:, 1].mean().item(),
+                    "action_noise_left_std": action_noise[:, 0].std(unbiased=False).item(),
+                    "action_noise_right_std": action_noise[:, 1].std(unbiased=False).item(),
+                    "action_noise_steering_std": action_noise_steering.std(unbiased=False).item(),
+                    "sampled_steering_std": sampled_steering.std(unbiased=False).item(),
+                    "sampled_action_saturation_fraction": (actions.abs() > 0.95).float().mean().item(),
+                    "deterministic_action_saturation_fraction": (
+                        deterministic_actions.abs() > 0.95
+                    ).float().mean().item(),
+                    "squashed_entropy_estimate": (-old_logp).mean().item(),
+                }
 
             synchronize_device(device)
             update_finished_at = perf_counter()
@@ -825,6 +1167,11 @@ def main() -> None:
                     "rollout_return": rollout_return,
                     "rollout_reward_per_step": rollout_reward_per_step,
                     "rollout_seconds": rollout_seconds,
+                    "preprocess_seconds": preprocess_seconds,
+                    "policy_value_inference_seconds": policy_value_inference_seconds,
+                    "env_step_seconds": env_step_seconds,
+                    "reward_and_reset_seconds": reward_and_reset_seconds,
+                    "rollout_overhead_seconds": rollout_overhead_seconds,
                     "update_seconds": update_seconds,
                     "rollout_update_seconds": rollout_update_seconds,
                     "environment_steps_per_second": environment_steps_per_second,
@@ -837,6 +1184,20 @@ def main() -> None:
                     "value_loss": last_value_loss,
                     "entropy": last_entropy,
                 })
+            with ppo_diagnostics_file.open("a", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=ppo_diagnostics_fields)
+                writer.writerow({
+                    "step": global_step,
+                    "rollout": rollout,
+                    **ppo_diagnostics,
+                })
+            write_reward_components(
+                reward_components_file,
+                rollout_reward_components,
+                phase="train_rollout",
+                train_step=global_step,
+                train_rollout=rollout,
+            )
             print(
                 f"update step={global_step} rollout={rollout} rollout_return={rollout_return:.3f} "
                 f"rollout_reward_per_step={rollout_reward_per_step:.4f} "
@@ -844,6 +1205,11 @@ def main() -> None:
                 f"policy_loss={last_policy_loss:.4f} value_loss={last_value_loss:.4f} entropy={last_entropy:.4f} "
                 f"rollout_seconds={rollout_seconds:.3f} update_seconds={update_seconds:.3f} "
                 f"rollout_update_seconds={rollout_update_seconds:.3f} "
+                f"preprocess_seconds={preprocess_seconds:.3f} "
+                f"policy_value_inference_seconds={policy_value_inference_seconds:.3f} "
+                f"env_step_seconds={env_step_seconds:.3f} "
+                f"reward_and_reset_seconds={reward_and_reset_seconds:.3f} "
+                f"rollout_overhead_seconds={rollout_overhead_seconds:.3f} "
                 f"environment_steps_per_second={environment_steps_per_second:.2f} "
                 f"cycle_steps_per_second={cycle_steps_per_second:.2f} "
                 f"overall_steps_per_second={overall_steps_per_second:.2f} "
@@ -858,50 +1224,85 @@ def main() -> None:
                 and rollout % args.eval_interval_rollouts == 0
             )
             if should_eval:
-                if episode_length > 0:
-                    write_training_episode(
-                        metrics_file,
-                        metrics_fields,
-                        global_step,
-                        episode,
-                        episode_return,
-                        episode_length,
-                        "eval_interrupt",
-                    )
-                    print(
-                        f"step={global_step} episode={episode} return={episode_return:.3f} "
-                        f"length={episode_length} reward_per_step={episode_return / max(1, episode_length):.4f} "
-                        f"done_reason=eval_interrupt",
-                        flush=True,
-                    )
-                    episode += 1
-                    episode_return = 0.0
-                    episode_length = 0
-
-                eval_result = evaluate_policy(env, policy, reward_calculator, args, transform, device, reset_rng)
+                if eval_env is None:
+                    raise RuntimeError("Evaluation environment was not initialized")
+                eval_result = evaluate_policy(
+                    eval_env,
+                    policy,
+                    eval_reward_calculator,
+                    args,
+                    transform,
+                    device,
+                )
                 eval_index += 1
                 eval_row = {
                     "train_step": global_step,
                     "train_rollout": rollout,
                     "eval_index": eval_index,
-                    **eval_result,
+                    **{field: eval_result[field] for field in eval_metrics_fields if field in eval_result},
                 }
                 with eval_metrics_file.open("a", newline="") as file:
                     writer = csv.DictWriter(file, fieldnames=eval_metrics_fields)
                     writer.writerow(eval_row)
+                with eval_scenarios_file.open("a", newline="") as file:
+                    writer = csv.DictWriter(file, fieldnames=eval_scenario_fields)
+                    for scenario_result in eval_result["scenario_results"]:
+                        writer.writerow({
+                            "train_step": global_step,
+                            "train_rollout": rollout,
+                            "eval_index": eval_index,
+                            **scenario_result,
+                        })
+                write_reward_components(
+                    reward_components_file,
+                    eval_result["reward_components"],
+                    phase="eval",
+                    train_step=global_step,
+                    train_rollout=rollout,
+                    eval_index=eval_index,
+                )
+                for scenario_result, scenario_component_values in zip(
+                    eval_result["scenario_results"],
+                    eval_result["scenario_components"],
+                ):
+                    write_reward_components(
+                        reward_components_file,
+                        scenario_component_values,
+                        phase="eval_scenario",
+                        train_step=global_step,
+                        train_rollout=rollout,
+                        eval_index=eval_index,
+                        scenario_index=int(scenario_result["scenario_index"]),
+                        scenario_seed=int(scenario_result["scenario_seed"]),
+                    )
                 print(
                     f"eval step={global_step} rollout={rollout} eval_index={eval_index} "
-                    f"return={eval_result['eval_return']:.3f} steps={eval_result['eval_steps']} "
+                    f"return={eval_result['eval_return']:.3f} "
+                    f"mean_scenario_return={eval_result['eval_mean_scenario_return']:.3f} "
+                    f"steps={eval_result['eval_steps']} scenarios={eval_result['eval_scenarios']} "
                     f"mean_reward={eval_result['eval_mean_reward']:.4f} "
-                    f"completed_episodes={eval_result['eval_completed_episodes']} "
-                    f"open_episode_return={eval_result['eval_open_episode_return']:.3f} "
-                    f"open_episode_length={eval_result['eval_open_episode_length']}",
+                    f"safe_scenarios={eval_result['eval_safe_scenarios']} "
+                    f"terminated={eval_result['eval_terminated']} "
+                    f"mean_scenario_length={eval_result['eval_mean_scenario_length']:.1f}",
                     flush=True,
                 )
-                if float(eval_result["eval_return"]) > best_eval_return:
-                    best_eval_return = float(eval_result["eval_return"])
+                eval_checkpoint = run_dir / f"eval_step_{global_step:010d}.pt"
+                save_checkpoint(
+                    eval_checkpoint,
+                    policy,
+                    value,
+                    policy_optimizer,
+                    value_optimizer,
+                    config,
+                    global_step,
+                )
+                print(f"eval_checkpoint step={global_step} checkpoint={eval_checkpoint}", flush=True)
+
+                mean_scenario_return = float(eval_result["eval_mean_scenario_return"])
+                if mean_scenario_return > best_eval_return:
+                    best_eval_return = mean_scenario_return
                     save_checkpoint(
-                        run_dir / "best_eval.pt",
+                        run_dir / "best_return.pt",
                         policy,
                         value,
                         policy_optimizer,
@@ -910,12 +1311,36 @@ def main() -> None:
                         global_step,
                     )
                     print(
-                        f"new_best_eval step={global_step} return={best_eval_return:.3f} "
-                        f"checkpoint={run_dir / 'best_eval.pt'}",
+                        f"new_best_return step={global_step} mean_scenario_return={best_eval_return:.3f} "
+                        f"checkpoint={run_dir / 'best_return.pt'}",
                         flush=True,
                     )
-                observation, info = reset_environment(env, args, reset_rng, reward_calculator)
+                safe_score = (
+                    int(eval_result["eval_safe_scenarios"]),
+                    float(eval_result["eval_mean_scenario_length"]),
+                    mean_scenario_return,
+                )
+                if best_safe_score is None or safe_score > best_safe_score:
+                    best_safe_score = safe_score
+                    save_checkpoint(
+                        run_dir / "best_safe.pt",
+                        policy,
+                        value,
+                        policy_optimizer,
+                        value_optimizer,
+                        config,
+                        global_step,
+                    )
+                    print(
+                        f"new_best_safe step={global_step} safe_scenarios={safe_score[0]} "
+                        f"mean_scenario_length={safe_score[1]:.1f} "
+                        f"mean_scenario_return={safe_score[2]:.3f} "
+                        f"checkpoint={run_dir / 'best_safe.pt'}",
+                        flush=True,
+                    )
     finally:
+        if eval_env is not None:
+            eval_env.close()
         if env is not None:
             env.close()
 

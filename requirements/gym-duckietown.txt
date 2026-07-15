@@ -1,4 +1,4 @@
-# Dependencies for the gym-duckietown PPO trainer and manual reward viewer.
+# Dependencies for the gym-duckietown PPO tools and control tests.
 # Install gym-duckietown itself separately from the cloned repo:
 #   cd ~/git/gym-duckietown
 #   python -m pip install -e . --no-deps
@@ -9,6 +9,7 @@ numpy==1.26.4
 opencv-python==4.10.0.84
 pyglet==1.5.15
 gym==0.23.1
+pygame==2.6.1
 PyYAML
 pyzmq
 Pillow

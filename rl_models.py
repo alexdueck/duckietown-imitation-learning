@@ -42,11 +42,18 @@ class TanhGaussianPolicy(nn.Module):
         return torch.distributions.Normal(mean, log_std.exp())
 
     def sample(self, observations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        action, _, log_prob, deterministic_action = self.sample_with_raw(observations)
+        return action, log_prob, deterministic_action
+
+    def sample_with_raw(
+        self,
+        observations: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         distribution = self.distribution(observations)
         raw_action = distribution.rsample()
         action = torch.tanh(raw_action)
         log_prob = tanh_normal_log_prob(distribution, raw_action, action)
-        return action, log_prob, torch.tanh(distribution.mean)
+        return action, raw_action, log_prob, torch.tanh(distribution.mean)
 
     def act(self, observations: torch.Tensor, deterministic: bool) -> torch.Tensor:
         distribution = self.distribution(observations)
@@ -77,6 +84,9 @@ def build_encoder(model_name: str, pretrained: bool) -> tuple[nn.Module, int]:
     if model_name == "mobilenet_v3_small":
         weights = models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
         model = models.mobilenet_v3_small(weights=weights)
+        for module in model.modules():
+            if isinstance(module, nn.Dropout):
+                module.p = 0.0
         features_dim = model.classifier[-1].in_features
         encoder = nn.Sequential(model.features, model.avgpool, nn.Flatten(), *model.classifier[:-1])
         return encoder, features_dim

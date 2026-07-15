@@ -453,6 +453,7 @@ def main() -> None:
     viewer_height = max(image_height, MIN_VIEWER_HEIGHT)
     image_y = (viewer_height - image_height) // 2
     calculators = create_reward_calculators(DISPLAY_REWARD_FUNCTIONS)
+    env.seed(args.seed)
     state = reset_env(env, calculators)
     action_controller = ManualActionController()
     paused_due_to_done = False

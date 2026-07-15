@@ -14,7 +14,7 @@ import numpy as np
 # Nominal DB18 dynamics: (u_alpha_right + u_alpha_left) / u1 = 3 / 5 m/s.
 VELOPPOSE_REFERENCE_SPEED_MPS = 0.6
 VELOPPOSE_VELOCITY_WEIGHT = 1.0
-VELOPPOSE_POSE_WEIGHT = 0.2
+VELOPPOSE_POSE_WEIGHT = 1.0
 VELOPPOSE_INVALID_POSE_PENALTY = -20.0
 # Duckietown's right-lane centerline sits 0.2 tile widths from either boundary.
 VELOPPOSE_LANE_HALF_WIDTH_FACTOR = 0.2

@@ -18,7 +18,12 @@ import pyglet
 
 from cli_completion import parse_args_with_completion
 from duckietown_paths import EVALUATION_SCREENSHOT_DIR
-from gym_duckietown_start_config import TrainingPose, append_training_pose
+from gym_duckietown_start_config import (
+    TrainingPose,
+    append_training_pose,
+    apply_env_start_pose,
+    load_pose_file,
+)
 from duckietown_rewards import (
     DISPLAY_REWARD_FUNCTIONS,
     compute_reward_breakdowns,
@@ -32,7 +37,7 @@ from duckietown_rewards import (
 
 
 SIDEBAR_WIDTH = 500
-MIN_VIEWER_HEIGHT = 760
+MIN_VIEWER_HEIGHT = 860
 BACKGROUND = (18, 22, 26)
 SIDEBAR_BG = (27, 31, 36)
 TEXT = (238, 241, 245, 255)
@@ -40,6 +45,14 @@ MUTED = (166, 174, 184, 255)
 ACCENT = (116, 211, 208, 255)
 GOOD = (132, 210, 142, 255)
 BAD = (238, 118, 118, 255)
+
+
+@dataclass(frozen=True)
+class CurrentPose:
+    position: tuple[float, float, float]
+    tile: tuple[int, int]
+    local_position: tuple[float, float, float]
+    angle: float
 
 
 @dataclass
@@ -55,6 +68,7 @@ class ViewerState:
     step_count: int
     timestamp: float
     reset_seed: int | None
+    current_pose: CurrentPose
 
 
 @dataclass
@@ -120,6 +134,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--distortion", action="store_true")
     parser.add_argument("--dynamics-rand", action="store_true")
     parser.add_argument("--camera-rand", action="store_true")
+    parser.add_argument(
+        "--start-pose-file",
+        type=Path,
+        default=None,
+        help="JSON file containing exactly one pose; startup and ordinary resets return to it.",
+    )
     parser.add_argument(
         "--start-seeds-config",
         type=Path,
@@ -249,6 +269,23 @@ def done_reason(done: bool, info: dict[str, Any]) -> str:
     return gym_duckietown_done_code(done, info)
 
 
+def current_pose(env) -> CurrentPose:
+    raw_env = getattr(env, "unwrapped", env)
+    position = np.asarray(raw_env.cur_pos, dtype=np.float64)
+    tile_x, tile_y = raw_env.get_grid_coords(position)
+    tile_size = float(raw_env.road_tile_size)
+    return CurrentPose(
+        position=tuple(float(value) for value in position),
+        tile=(int(tile_x), int(tile_y)),
+        local_position=(
+            float(position[0] - tile_x * tile_size),
+            float(position[1]),
+            float(position[2] - tile_y * tile_size),
+        ),
+        angle=float(raw_env.cur_angle),
+    )
+
+
 def make_viewer_state(
     env,
     calculators,
@@ -288,13 +325,25 @@ def make_viewer_state(
         step_count=int(getattr(env, "step_count", 0)),
         timestamp=float(getattr(env, "timestamp", 0.0)),
         reset_seed=previous_state.reset_seed if previous_state is not None else reset_seed,
+        current_pose=current_pose(env),
     )
 
 
-def reset_env(env, calculators, seed: int | None = None) -> ViewerState:
+def reset_env(
+    env,
+    calculators,
+    seed: int | None = None,
+    start_pose: TrainingPose | None = None,
+) -> ViewerState:
+    if start_pose is not None:
+        apply_env_start_pose(env, start_pose)
     if seed is not None:
         env.seed(seed)
     env.reset()
+    raw_env = getattr(env, "unwrapped", env)
+    if start_pose is not None and not raw_env._valid_pose(raw_env.cur_pos, raw_env.cur_angle):
+        pose_label = start_pose.name or "unnamed"
+        raise ValueError(f"Start pose {pose_label!r} is not valid on this map")
     reset_reward_calculators(calculators, env)
     action = np.zeros(2, dtype=np.float32)
     return make_viewer_state(
@@ -431,12 +480,33 @@ def sidebar_lines(
     pose_save_status: str | None = None,
 ) -> list[tuple[str, int, tuple[int, int, int, int], bool]]:
     lane = state.lane_metrics
+    pose = state.current_pose
     seed_label = str(state.reset_seed) if state.reset_seed is not None else "continued RNG"
     lines: list[tuple[str, int, tuple[int, int, int, int], bool]] = [
         ("gym-duckietown rewards", 18, ACCENT, True),
         (f"map {map_name}", 13, MUTED, False),
         (f"reset seed {seed_label}", 13, MUTED, False),
         (f"step {state.step_count}  t {state.timestamp:.2f}s", 13, MUTED, False),
+        (
+            f"pose world x {pose.position[0]:+.5f}  y {pose.position[1]:+.5f}  "
+            f"z {pose.position[2]:+.5f}",
+            12,
+            MUTED,
+            False,
+        ),
+        (
+            f"pose tile {pose.tile}  local x {pose.local_position[0]:+.5f}  "
+            f"z {pose.local_position[2]:+.5f}",
+            12,
+            MUTED,
+            False,
+        ),
+        (
+            f"pose angle {pose.angle:+.6f} rad  {np.degrees(pose.angle):+.2f} deg",
+            12,
+            MUTED,
+            False,
+        ),
         ("", 8, MUTED, False),
         (f"left {fmt(state.action[0], 3)}   right {fmt(state.action[1], 3)}", 16, TEXT, True),
         (
@@ -516,13 +586,21 @@ def save_screenshot(window, path: Path) -> None:
 def main() -> None:
     args = parse_args()
     configure_logging(args.log_level)
+    try:
+        start_pose = (
+            load_pose_file(args.start_pose_file)
+            if args.start_pose_file is not None
+            else None
+        )
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"Could not load --start-pose-file: {error}") from error
     env = make_env(args)
     configure_logging(args.log_level)
     _, _, image_width, image_height = import_simulator()
     viewer_height = max(image_height, MIN_VIEWER_HEIGHT)
     image_y = (viewer_height - image_height) // 2
     calculators = create_reward_calculators(DISPLAY_REWARD_FUNCTIONS)
-    state = reset_env(env, calculators, seed=args.seed)
+    state = reset_env(env, calculators, seed=args.seed, start_pose=start_pose)
     action_controller = ManualActionController()
     paused_due_to_done = False
     seed_input: str | None = None
@@ -540,6 +618,13 @@ def main() -> None:
     pressed_keys: set[int] = set()
 
     print("manual gym-duckietown reward viewer started", flush=True)
+    if start_pose is not None:
+        print(
+            f"loaded start pose name={start_pose.name or '-'} tile={start_pose.tile} "
+            f"position={start_pose.position} angle={start_pose.angle:.10f} "
+            f"file={args.start_pose_file.expanduser()}",
+            flush=True,
+        )
     print(
         "WASD drives, arrow keys also work, R enters a reset seed, P saves a training pose, space stops, "
         "backspace or slash resets, enter saves screenshot, escape exits",
@@ -554,7 +639,12 @@ def main() -> None:
                 seed_input = seed_input[:-1]
             elif symbol in (key.ENTER, key.RETURN) and seed_input:
                 seed = int(seed_input)
-                state = reset_env(env, calculators, seed=seed)
+                state = reset_env(
+                    env,
+                    calculators,
+                    seed=seed,
+                    start_pose=start_pose,
+                )
                 action_controller.reset()
                 pressed_keys.clear()
                 paused_due_to_done = False
@@ -596,7 +686,7 @@ def main() -> None:
 
         pressed_keys.add(symbol)
         if symbol in (key.BACKSPACE, key.SLASH):
-            state = reset_env(env, calculators)
+            state = reset_env(env, calculators, start_pose=start_pose)
             action_controller.reset()
             paused_due_to_done = False
             print("reset", flush=True)
@@ -654,7 +744,7 @@ def main() -> None:
         if done:
             print(f"done step={state.step_count} reason={state.done_reason}", flush=True)
             if args.auto_reset:
-                state = reset_env(env, calculators)
+                state = reset_env(env, calculators, start_pose=start_pose)
                 action_controller.reset()
             else:
                 action_controller.reset()

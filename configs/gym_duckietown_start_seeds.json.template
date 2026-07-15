@@ -2,5 +2,32 @@
   "map_name": "loop_empty",
   "training_seeds": [123, 456, 789],
   "evaluation_seeds": [321, 654],
-  "training_poses": []
+  "training_poses": [
+    {
+      "tile": [
+        3,
+        5
+      ],
+      "position": [
+        0.5102808120106852,
+        0.0,
+        0.4257585486353568
+      ],
+      "angle": 0.7038412294071169
+    }
+  ],
+  "evaluation_poses": [
+    {
+      "tile": [
+        3,
+        5
+      ],
+      "position": [
+        0.5102808120106852,
+        0.0,
+        0.4257585486353568
+      ],
+      "angle": 0.7038412294071169
+    }
+  ]
 }

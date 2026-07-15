@@ -41,12 +41,15 @@ from gym_duckietown_start_config import (
     StartConfig,
     TrainingPose,
     TrainingStart,
+    apply_env_start_pose,
     choose_training_start,
     load_start_config,
 )
 from rl_models import TanhGaussianPolicy, load_imitation_actor, tanh_normal_log_prob
 from train_imitation_learning import IMAGENET_MEAN, IMAGENET_STD, build_model, resolve_device, set_seed
 from velopose_reward import (
+    VELOPPOSE_HEADING_CORRECTION_GAIN,
+    VELOPPOSE_HEADING_MAX_CORRECTION_DEG,
     VELOPPOSE_INVALID_POSE_PENALTY,
     VELOPPOSE_POSE_WEIGHT,
     VELOPPOSE_VELOCITY_WEIGHT,
@@ -70,6 +73,7 @@ class PPOConfig:
     hard_start_probability: float
     training_start_seeds: tuple[int, ...]
     training_start_poses: tuple[TrainingPose, ...]
+    evaluation_start_poses: tuple[TrainingPose, ...]
     eval_interval_rollouts: int
     eval_steps: int
     eval_seeds: tuple[int, ...]
@@ -100,6 +104,7 @@ class PPOConfig:
     simulator_max_steps: int | None
     camera_width: int
     camera_height: int
+    render_training: bool
     log_level: str
     debug_initial_action: bool
     seed: int
@@ -183,15 +188,15 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "JSON config containing training_seeds, optional training_poses, and evaluation_seeds. "
-            "Its evaluation seeds replace --eval-seeds."
+            "JSON config containing training_seeds/training_poses and "
+            "evaluation_seeds/evaluation_poses. Its evaluation scenarios replace --eval-seeds."
         ),
     )
     parser.add_argument(
         "--hard-start-probability",
         type=parse_probability,
         default=0.5,
-        help="Probability of selecting a training seed from --start-seeds-config at each episode reset.",
+        help="Probability of selecting a configured training seed or pose at each episode reset.",
     )
     parser.add_argument("--eval-interval-rollouts", type=int, default=10)
     parser.add_argument(
@@ -243,6 +248,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
+    parser.add_argument(
+        "--render-training",
+        action="store_true",
+        help="Open gym-duckietown's human-view window and update it after every training step.",
+    )
     parser.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
@@ -495,6 +505,19 @@ def step_raw(env, action: np.ndarray):
     return observation, reward, terminated, truncated, info
 
 
+def render_training_environment(env) -> None:
+    raw_env = getattr(env, "unwrapped", env)
+    window = getattr(raw_env, "window", None)
+    if window is not None:
+        from pyglet import gl
+
+        window.switch_to()
+        gl.glDisable(gl.GL_LIGHTING)
+        gl.glDisable(gl.GL_LIGHT0)
+        gl.glColor4ub(255, 255, 255, 255)
+    env.render(mode="human")
+
+
 def sample_random_action(env, rng: np.random.Generator, action_scale: float) -> np.ndarray:
     low = np.asarray(env.action_space.low, dtype=np.float32)
     high = np.asarray(env.action_space.high, dtype=np.float32)
@@ -552,8 +575,7 @@ def apply_training_start(env, training_start: TrainingStart, defaults: Environme
         raw_env.start_pose = deepcopy(defaults.start_pose)
         return
 
-    raw_env.user_tile_start = tuple(training_start.pose.tile)
-    raw_env.start_pose = [list(training_start.pose.position), training_start.pose.angle]
+    apply_env_start_pose(env, training_start.pose)
 
 
 def reset_training_environment(
@@ -631,6 +653,8 @@ def evaluate_policy(
     policy: TanhGaussianPolicy,
     reward_calculator: GymDuckietownRewardCalculator,
     args: argparse.Namespace,
+    evaluation_poses: tuple[TrainingPose, ...],
+    start_defaults: EnvironmentStartDefaults,
     transform: transforms.Compose,
     device: torch.device,
 ) -> dict[str, Any]:
@@ -643,8 +667,25 @@ def evaluate_policy(
     scenario_components: list[RewardComponentAccumulator] = []
     aggregate_components = RewardComponentAccumulator()
 
+    evaluation_starts = [
+        TrainingStart(kind="eval_seed", seed=seed)
+        for seed in args.eval_seeds
+    ]
+    evaluation_starts.extend(
+        TrainingStart(
+            kind="eval_pose",
+            seed=args.seed + 100_000 + pose_index,
+            pose=pose,
+        )
+        for pose_index, pose in enumerate(evaluation_poses)
+    )
+
     policy.eval()
-    for scenario_index, scenario_seed in enumerate(args.eval_seeds, start=1):
+    for scenario_index, evaluation_start in enumerate(evaluation_starts, start=1):
+        apply_training_start(env, evaluation_start, start_defaults)
+        scenario_seed = evaluation_start.seed
+        if scenario_seed is None:
+            raise RuntimeError("Evaluation scenarios must have a deterministic reset seed")
         scenario_rng = np.random.default_rng(scenario_seed)
         observation, info = reset_environment(
             env,
@@ -655,6 +696,15 @@ def evaluate_policy(
             use_random_warmup=False,
         )
         raw_env = getattr(env, "unwrapped", env)
+        if evaluation_start.pose is not None and not raw_env._valid_pose(
+            raw_env.cur_pos,
+            raw_env.cur_angle,
+        ):
+            pose_label = evaluation_start.name or "unnamed"
+            raise ValueError(
+                f"Evaluation pose {pose_label!r} from {args.start_seeds_config} is not valid "
+                f"on map {args.map_name!r}"
+            )
         start_position = np.asarray(raw_env.cur_pos, dtype=np.float64).copy()
         start_angle = float(raw_env.cur_angle)
         scenario_return = 0.0
@@ -696,7 +746,9 @@ def evaluate_policy(
         scenario_components.append(components)
         scenario_results.append({
             "scenario_index": scenario_index,
+            "scenario_type": evaluation_start.kind,
             "scenario_seed": scenario_seed,
+            "scenario_name": evaluation_start.name,
             "start_x": float(start_position[0]),
             "start_y": float(start_position[1]),
             "start_z": float(start_position[2]),
@@ -805,6 +857,9 @@ def main() -> None:
     config_values["training_start_poses"] = (
         start_config.training_poses if start_config is not None else ()
     )
+    config_values["evaluation_start_poses"] = (
+        start_config.evaluation_poses if start_config is not None else ()
+    )
     config = PPOConfig(**config_values, device=str(device))
     config_json = {
         **asdict(config),
@@ -828,6 +883,16 @@ def main() -> None:
                 if args.reward_function == "velopose"
                 else None
             ),
+            "heading_max_correction_deg": (
+                VELOPPOSE_HEADING_MAX_CORRECTION_DEG
+                if args.reward_function == "velopose"
+                else None
+            ),
+            "heading_correction_gain": (
+                VELOPPOSE_HEADING_CORRECTION_GAIN
+                if args.reward_function == "velopose"
+                else None
+            ),
         },
         "curated_start_oversampling": {
             "enabled": start_config is not None,
@@ -845,6 +910,11 @@ def main() -> None:
                 else []
             ),
             "evaluation_seeds": list(args.eval_seeds),
+            "evaluation_poses": (
+                [pose.as_json() for pose in start_config.evaluation_poses]
+                if start_config is not None
+                else []
+            ),
         },
     }
     (run_dir / "config.json").write_text(json.dumps(config_json, indent=2) + "\n")
@@ -994,7 +1064,9 @@ def main() -> None:
         "train_rollout",
         "eval_index",
         "scenario_index",
+        "scenario_type",
         "scenario_seed",
+        "scenario_name",
         "start_x",
         "start_y",
         "start_z",
@@ -1012,13 +1084,16 @@ def main() -> None:
 
     env = None
     eval_env = None
+    eval_start_defaults = None
     reward_calculator = GymDuckietownRewardCalculator(args.reward_function)
     eval_reward_calculator = GymDuckietownRewardCalculator(args.reward_function)
     try:
         env = make_env(args, seed=args.seed)
         training_start_defaults = capture_environment_start_defaults(env)
         if args.eval_interval_rollouts > 0 and args.eval_steps > 0:
-            eval_env = make_env(args, seed=args.eval_seeds[0])
+            initial_eval_seed = args.eval_seeds[0] if args.eval_seeds else args.seed + 100_000
+            eval_env = make_env(args, seed=initial_eval_seed)
+            eval_start_defaults = capture_environment_start_defaults(eval_env)
         print(f"Environment: gym-duckietown map={args.map_name}", flush=True)
         print(f"Reward function: {args.reward_function}", flush=True)
         if start_config is not None:
@@ -1029,7 +1104,14 @@ def main() -> None:
                 f"config={start_config.source_path}",
                 flush=True,
             )
-        print(f"Evaluation seeds: {','.join(str(seed) for seed in args.eval_seeds)}", flush=True)
+        evaluation_pose_count = (
+            len(start_config.evaluation_poses) if start_config is not None else 0
+        )
+        print(
+            f"Evaluation scenarios: seeds={len(args.eval_seeds)} "
+            f"poses={evaluation_pose_count}",
+            flush=True,
+        )
         if start_config is None:
             training_start = TrainingStart(kind="random", seed=args.seed)
         else:
@@ -1046,6 +1128,8 @@ def main() -> None:
             training_start,
             training_start_defaults,
         )
+        if args.render_training:
+            render_training_environment(env)
         if args.debug_initial_action:
             with torch.no_grad():
                 obs_tensor = preprocess(
@@ -1125,6 +1209,8 @@ def main() -> None:
                 phase_started_at = perf_counter()
                 next_observation, reward, terminated, truncated, info = step_raw(env, action)
                 env_step_seconds += perf_counter() - phase_started_at
+                if args.render_training:
+                    render_training_environment(env)
 
                 phase_started_at = perf_counter()
                 done_code = gym_duckietown_done_code(bool(terminated or truncated), info)
@@ -1182,6 +1268,8 @@ def main() -> None:
                         training_start,
                         training_start_defaults,
                     )
+                    if args.render_training:
+                        render_training_environment(env)
                     reward_and_reset_seconds += perf_counter() - phase_started_at
                     episode += 1
                     episode_return = 0.0
@@ -1391,11 +1479,15 @@ def main() -> None:
             if should_eval:
                 if eval_env is None:
                     raise RuntimeError("Evaluation environment was not initialized")
+                if eval_start_defaults is None:
+                    raise RuntimeError("Evaluation environment defaults were not captured")
                 eval_result = evaluate_policy(
                     eval_env,
                     policy,
                     eval_reward_calculator,
                     args,
+                    start_config.evaluation_poses if start_config is not None else (),
+                    eval_start_defaults,
                     transform,
                     device,
                 )

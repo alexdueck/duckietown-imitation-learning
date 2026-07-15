@@ -36,6 +36,7 @@ class StartConfig:
     training_seeds: tuple[int, ...]
     evaluation_seeds: tuple[int, ...]
     training_poses: tuple[TrainingPose, ...]
+    evaluation_poses: tuple[TrainingPose, ...]
 
 
 @dataclass(frozen=True)
@@ -49,10 +50,16 @@ class TrainingStart:
         return self.pose.name if self.pose is not None else None
 
 
-def _parse_seed_list(data: Any, key: str, path: Path) -> tuple[int, ...]:
+def _parse_seed_list(
+    data: Any,
+    key: str,
+    path: Path,
+    *,
+    allow_empty: bool = False,
+) -> tuple[int, ...]:
     if not isinstance(data, list):
         raise ValueError(f"{path}: {key!r} must be a JSON list")
-    if not data:
+    if not data and not allow_empty:
         raise ValueError(f"{path}: {key!r} must contain at least one seed")
     if any(isinstance(seed, bool) or not isinstance(seed, int) or seed < 0 for seed in data):
         raise ValueError(f"{path}: {key!r} must contain non-negative integers only")
@@ -71,8 +78,7 @@ def _parse_number(value: Any, label: str, path: Path) -> float:
     return number
 
 
-def _parse_training_pose(data: Any, index: int, path: Path) -> TrainingPose:
-    label = f"training_poses[{index}]"
+def _parse_pose(data: Any, label: str, path: Path) -> TrainingPose:
     if not isinstance(data, dict):
         raise ValueError(f"{path}: {label} must be a JSON object")
     required_keys = {"tile", "position", "angle"}
@@ -112,6 +118,21 @@ def _parse_training_pose(data: Any, index: int, path: Path) -> TrainingPose:
     )
 
 
+def load_pose_file(path: Path) -> TrainingPose:
+    resolved_path = path.expanduser().resolve()
+    try:
+        data = json.loads(resolved_path.read_text())
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Invalid JSON in pose file {resolved_path}: {error}") from error
+    return _parse_pose(data, "pose", resolved_path)
+
+
+def apply_env_start_pose(env, pose: TrainingPose) -> None:
+    raw_env = getattr(env, "unwrapped", env)
+    raw_env.user_tile_start = tuple(pose.tile)
+    raw_env.start_pose = [list(pose.position), pose.angle]
+
+
 def load_start_config(path: Path, expected_map_name: str) -> StartConfig:
     resolved_path = path.expanduser().resolve()
     try:
@@ -122,7 +143,7 @@ def load_start_config(path: Path, expected_map_name: str) -> StartConfig:
         raise ValueError(f"{resolved_path}: top-level JSON value must be an object")
 
     required_keys = {"map_name", "training_seeds", "evaluation_seeds"}
-    allowed_keys = required_keys | {"training_poses"}
+    allowed_keys = required_keys | {"training_poses", "evaluation_poses"}
     missing_keys = required_keys - data.keys()
     unexpected_keys = data.keys() - allowed_keys
     if missing_keys:
@@ -138,8 +159,18 @@ def load_start_config(path: Path, expected_map_name: str) -> StartConfig:
             f"{resolved_path}: map_name is {map_name!r}, but the environment uses {expected_map_name!r}"
         )
 
-    training_seeds = _parse_seed_list(data["training_seeds"], "training_seeds", resolved_path)
-    evaluation_seeds = _parse_seed_list(data["evaluation_seeds"], "evaluation_seeds", resolved_path)
+    training_seeds = _parse_seed_list(
+        data["training_seeds"],
+        "training_seeds",
+        resolved_path,
+        allow_empty=True,
+    )
+    evaluation_seeds = _parse_seed_list(
+        data["evaluation_seeds"],
+        "evaluation_seeds",
+        resolved_path,
+        allow_empty=True,
+    )
     overlap = set(training_seeds) & set(evaluation_seeds)
     if overlap:
         raise ValueError(
@@ -151,15 +182,31 @@ def load_start_config(path: Path, expected_map_name: str) -> StartConfig:
     if not isinstance(training_poses_data, list):
         raise ValueError(f"{resolved_path}: 'training_poses' must be a JSON list")
     training_poses = tuple(
-        _parse_training_pose(pose, index, resolved_path)
+        _parse_pose(pose, f"training_poses[{index}]", resolved_path)
         for index, pose in enumerate(training_poses_data)
     )
+    evaluation_poses_data = data.get("evaluation_poses", [])
+    if not isinstance(evaluation_poses_data, list):
+        raise ValueError(f"{resolved_path}: 'evaluation_poses' must be a JSON list")
+    evaluation_poses = tuple(
+        _parse_pose(pose, f"evaluation_poses[{index}]", resolved_path)
+        for index, pose in enumerate(evaluation_poses_data)
+    )
+    if not training_seeds and not training_poses:
+        raise ValueError(
+            f"{resolved_path}: configure at least one training seed or training pose"
+        )
+    if not evaluation_seeds and not evaluation_poses:
+        raise ValueError(
+            f"{resolved_path}: configure at least one evaluation seed or evaluation pose"
+        )
     return StartConfig(
         source_path=resolved_path,
         map_name=map_name,
         training_seeds=training_seeds,
         evaluation_seeds=evaluation_seeds,
         training_poses=training_poses,
+        evaluation_poses=evaluation_poses,
     )
 
 
@@ -169,6 +216,7 @@ def write_start_config(config: StartConfig) -> None:
         "training_seeds": list(config.training_seeds),
         "evaluation_seeds": list(config.evaluation_seeds),
         "training_poses": [pose.as_json() for pose in config.training_poses],
+        "evaluation_poses": [pose.as_json() for pose in config.evaluation_poses],
     }
     temporary_path = config.source_path.with_name(f".{config.source_path.name}.tmp")
     temporary_path.write_text(json.dumps(payload, indent=2) + "\n")
@@ -183,6 +231,7 @@ def append_training_pose(path: Path, expected_map_name: str, pose: TrainingPose)
         training_seeds=config.training_seeds,
         evaluation_seeds=config.evaluation_seeds,
         training_poses=(*config.training_poses, pose),
+        evaluation_poses=config.evaluation_poses,
     )
     write_start_config(updated_config)
     return len(updated_config.training_poses)

@@ -18,6 +18,8 @@ VELOPPOSE_POSE_WEIGHT = 1.0
 VELOPPOSE_INVALID_POSE_PENALTY = -20.0
 # Duckietown's right-lane centerline sits 0.2 tile widths from either boundary.
 VELOPPOSE_LANE_HALF_WIDTH_FACTOR = 0.2
+VELOPPOSE_HEADING_MAX_CORRECTION_DEG = 45.0
+VELOPPOSE_HEADING_CORRECTION_GAIN = 1.25
 
 
 @dataclass(frozen=True)
@@ -122,8 +124,26 @@ def compute_velopose_breakdown(
         np.clip(forward_speed / reference_speed, -1.0, 1.0)
     )
 
-    heading_quality = float(np.clip(np.dot(robot_forward, tangent), -1.0, 1.0))
-    scaled_abs_lane_distance = abs(float(lane_distance)) / lane_half_width
+    right = np.cross(tangent, np.array([0.0, 1.0, 0.0]))
+    right_norm = float(np.linalg.norm(right))
+    if right_norm <= 1e-12:
+        raise ValueError("lane_tangent must not be parallel to the up axis")
+    right /= right_norm
+
+    signed_scaled_lane_distance = float(lane_distance) / lane_half_width
+    target_heading_offset_rad = -math.radians(
+        VELOPPOSE_HEADING_MAX_CORRECTION_DEG
+    ) * math.tanh(VELOPPOSE_HEADING_CORRECTION_GAIN * signed_scaled_lane_distance)
+    target_heading = (
+        math.cos(target_heading_offset_rad) * tangent
+        + math.sin(target_heading_offset_rad) * right
+    )
+    target_heading /= np.linalg.norm(target_heading)
+    heading_quality = float(
+        np.clip(np.dot(robot_forward, target_heading), -1.0, 1.0)
+    )
+
+    scaled_abs_lane_distance = abs(signed_scaled_lane_distance)
     lane_distance_penalty = -2.0 * scaled_abs_lane_distance
     pose_quality = heading_quality + lane_distance_penalty
 
@@ -149,6 +169,8 @@ def compute_velopose_breakdown(
                 "total": float(pose_contribution),
                 "components": {
                     "HeadingQuality": heading_quality,
+                    "TargetHeadingOffsetDeg": math.degrees(target_heading_offset_rad),
+                    "SignedScaledLaneDistance": signed_scaled_lane_distance,
                     "ScaledAbsLaneDistance": scaled_abs_lane_distance,
                     "LaneDistancePenalty": lane_distance_penalty,
                     "PoseQuality": float(pose_quality),

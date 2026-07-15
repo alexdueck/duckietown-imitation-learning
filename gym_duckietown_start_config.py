@@ -133,7 +133,13 @@ def apply_env_start_pose(env, pose: TrainingPose) -> None:
     raw_env.start_pose = [list(pose.position), pose.angle]
 
 
-def load_start_config(path: Path, expected_map_name: str) -> StartConfig:
+def load_start_config(
+    path: Path,
+    expected_map_name: str,
+    *,
+    require_training_starts: bool = True,
+    require_evaluation_scenarios: bool = True,
+) -> StartConfig:
     resolved_path = path.expanduser().resolve()
     try:
         data = json.loads(resolved_path.read_text())
@@ -192,11 +198,11 @@ def load_start_config(path: Path, expected_map_name: str) -> StartConfig:
         _parse_pose(pose, f"evaluation_poses[{index}]", resolved_path)
         for index, pose in enumerate(evaluation_poses_data)
     )
-    if not training_seeds and not training_poses:
+    if require_training_starts and not training_seeds and not training_poses:
         raise ValueError(
             f"{resolved_path}: configure at least one training seed or training pose"
         )
-    if not evaluation_seeds and not evaluation_poses:
+    if require_evaluation_scenarios and not evaluation_seeds and not evaluation_poses:
         raise ValueError(
             f"{resolved_path}: configure at least one evaluation seed or evaluation pose"
         )
@@ -224,7 +230,12 @@ def write_start_config(config: StartConfig) -> None:
 
 
 def append_training_pose(path: Path, expected_map_name: str, pose: TrainingPose) -> int:
-    config = load_start_config(path, expected_map_name)
+    config = load_start_config(
+        path,
+        expected_map_name,
+        require_training_starts=False,
+        require_evaluation_scenarios=False,
+    )
     updated_config = StartConfig(
         source_path=config.source_path,
         map_name=config.map_name,

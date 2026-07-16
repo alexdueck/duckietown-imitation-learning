@@ -3,8 +3,8 @@
 """Train a PPO policy from camera images in gym-duckietown.
 
 This trainer intentionally lives beside the Duckiematrix trainer instead of
-adding another backend to it. The policy still outputs direct continuous
-left/right wheel commands in [-1, 1], matching gym-duckietown's Simulator API.
+adding another backend to it. Policies can emit direct wheel commands or
+semantic throttle/steering controls that are converted to wheel commands.
 """
 
 from __future__ import annotations
@@ -36,6 +36,10 @@ from duckietown_rewards import (
     reward_source,
 )
 from cli_completion import parse_args_with_completion
+from duckietown_action_control import (
+    ACTION_MODE_CHOICES,
+    DuckietownActionControl,
+)
 from duckietown_paths import RL_PPO_GYM_DUCKIETOWN_CHECKPOINT_DIR
 from gym_duckietown_start_config import (
     StartConfig,
@@ -64,6 +68,10 @@ class PPOConfig:
     model: str
     imitation_checkpoint: str | None
     resume_checkpoint: str | None
+    action_mode: str
+    fixed_throttle: float | None
+    max_throttle: float
+    max_steering: float
     total_steps: int
     max_episode_steps: int
     reset_random_warmup_steps: int
@@ -172,6 +180,36 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Resume PPO training from an RL checkpoint such as last.pt, best_return.pt, or best_safe.pt.",
+    )
+    parser.add_argument(
+        "--action-mode",
+        choices=ACTION_MODE_CHOICES,
+        default="wheel",
+        help=(
+            "Policy controls: direct left/right wheel commands (wheel), or "
+            "non-negative throttle plus symmetric steering (throttle_steering)."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-throttle",
+        type=float,
+        default=None,
+        help=(
+            "Fix throttle to this wheel-command value in [0, 1]. With "
+            "throttle_steering, the policy then learns steering only."
+        ),
+    )
+    parser.add_argument(
+        "--max-throttle",
+        type=float,
+        default=1.0,
+        help="Maximum learned throttle in throttle_steering mode.",
+    )
+    parser.add_argument(
+        "--max-steering",
+        type=float,
+        default=0.5,
+        help="Maximum wheel differential contributed by steering.",
     )
     parser.add_argument("--total-steps", type=int, default=100_000)
     parser.add_argument(
@@ -651,6 +689,7 @@ def write_training_episode(
 def evaluate_policy(
     env,
     policy: TanhGaussianPolicy,
+    action_control: DuckietownActionControl,
     reward_calculator: GymDuckietownRewardCalculator,
     args: argparse.Namespace,
     evaluation_poses: tuple[TrainingPose, ...],
@@ -723,8 +762,14 @@ def evaluate_policy(
                 transform,
             ).unsqueeze(0).to(device)
             with torch.no_grad():
-                action_tensor = policy.act(obs_tensor, deterministic=args.eval_deterministic)
-                action = format_wheel_action(action_tensor.squeeze(0).cpu().numpy())
+                policy_controls = policy.act(
+                    obs_tensor,
+                    deterministic=args.eval_deterministic,
+                )
+                wheel_action = action_control.to_wheels_tensor(policy_controls)
+                action = format_wheel_action(
+                    wheel_action.squeeze(0).cpu().numpy()
+                )
                 observation, env_reward, terminated, truncated, last_info = step_raw(env, action)
             done_code = gym_duckietown_done_code(bool(terminated or truncated), last_info)
             breakdown = reward_calculator.compute_breakdown(env, float(env_reward), done_code)
@@ -790,6 +835,12 @@ def evaluate_policy(
 
 
 def save_checkpoint(path, policy, value, policy_optimizer, value_optimizer, config, step):
+    action_control = DuckietownActionControl(
+        mode=config.action_mode,
+        fixed_throttle=config.fixed_throttle,
+        max_throttle=config.max_throttle,
+        max_steering=config.max_steering,
+    )
     torch.save({
         "step": step,
         "policy_state_dict": policy.state_dict(),
@@ -798,7 +849,15 @@ def save_checkpoint(path, policy, value, policy_optimizer, value_optimizer, conf
         "value_optimizer_state_dict": value_optimizer.state_dict(),
         "config": asdict(config),
         "env_backend": "gym-duckietown",
-        "action_space": "continuous gym-duckietown left/right wheel commands in [-1, 1]",
+        "action_space": {
+            "mode": action_control.mode,
+            "policy_controls": action_control.control_names,
+            "policy_action_dim": action_control.policy_action_dim,
+            "fixed_throttle": action_control.fixed_throttle,
+            "max_throttle": action_control.max_throttle,
+            "max_steering": action_control.max_steering,
+            "environment_actions": "left/right wheel commands clipped to [-1, 1]",
+        },
         "imagenet_mean": IMAGENET_MEAN,
         "imagenet_std": IMAGENET_STD,
     }, path)
@@ -831,6 +890,27 @@ def main() -> None:
     args = parse_args()
     if args.resume_checkpoint is not None and args.imitation_checkpoint is not None:
         raise ValueError("Use either --resume-checkpoint or --imitation-checkpoint, not both.")
+    if args.resume_checkpoint is not None:
+        resume_preview = torch.load(
+            args.resume_checkpoint.expanduser(),
+            map_location="cpu",
+        )
+        resume_config = resume_preview.get("config", {})
+        args.action_mode = resume_config.get("action_mode", "wheel")
+        args.fixed_throttle = resume_config.get("fixed_throttle")
+        args.max_throttle = float(resume_config.get("max_throttle", 1.0))
+        args.max_steering = float(resume_config.get("max_steering", 0.5))
+    action_control = DuckietownActionControl(
+        mode=args.action_mode,
+        fixed_throttle=args.fixed_throttle,
+        max_throttle=args.max_throttle,
+        max_steering=args.max_steering,
+    )
+    if args.imitation_checkpoint is not None and args.action_mode != "wheel":
+        raise ValueError(
+            "--imitation-checkpoint currently requires --action-mode wheel because "
+            "the imitation head predicts left/right wheel commands."
+        )
     start_config = None
     if args.start_seeds_config is not None:
         start_config = load_start_config(args.start_seeds_config, args.map_name)
@@ -894,6 +974,14 @@ def main() -> None:
                 else None
             ),
         },
+        "action_control": {
+            "mode": action_control.mode,
+            "policy_controls": action_control.control_names,
+            "policy_action_dim": action_control.policy_action_dim,
+            "fixed_throttle": action_control.fixed_throttle,
+            "max_throttle": action_control.max_throttle,
+            "max_steering": action_control.max_steering,
+        },
         "curated_start_oversampling": {
             "enabled": start_config is not None,
             "source_path": (
@@ -920,7 +1008,11 @@ def main() -> None:
     (run_dir / "config.json").write_text(json.dumps(config_json, indent=2) + "\n")
 
     transform = make_transform()
-    policy = TanhGaussianPolicy(args.model, pretrained=args.imitation_checkpoint is None and args.resume_checkpoint is None).to(device)
+    policy = TanhGaussianPolicy(
+        args.model,
+        action_dim=action_control.policy_action_dim,
+        pretrained=args.imitation_checkpoint is None and args.resume_checkpoint is None,
+    ).to(device)
     if args.imitation_checkpoint is not None:
         load_imitation_actor(policy, args.imitation_checkpoint)
         policy.to(device)
@@ -1008,6 +1100,9 @@ def main() -> None:
     ppo_diagnostics_fields = [
         "step",
         "rollout",
+        "action_mode",
+        "policy_control_0_name",
+        "policy_control_1_name",
         "pre_update_mean_abs_log_ratio",
         "pre_update_max_abs_log_ratio",
         "approx_kl",
@@ -1019,6 +1114,14 @@ def main() -> None:
         "log_std_right",
         "std_left",
         "std_right",
+        "sampled_policy_control_0_mean",
+        "sampled_policy_control_1_mean",
+        "sampled_policy_control_0_std",
+        "sampled_policy_control_1_std",
+        "deterministic_policy_control_0_mean",
+        "deterministic_policy_control_1_mean",
+        "policy_control_noise_0_std",
+        "policy_control_noise_1_std",
         "sampled_action_left_mean",
         "sampled_action_right_mean",
         "sampled_action_left_std",
@@ -1031,6 +1134,7 @@ def main() -> None:
         "sampled_steering_std",
         "sampled_action_saturation_fraction",
         "deterministic_action_saturation_fraction",
+        "sampled_policy_control_saturation_fraction",
         "squashed_entropy_estimate",
     ]
     with ppo_diagnostics_file.open("w", newline="") as file:
@@ -1096,6 +1200,14 @@ def main() -> None:
             eval_start_defaults = capture_environment_start_defaults(eval_env)
         print(f"Environment: gym-duckietown map={args.map_name}", flush=True)
         print(f"Reward function: {args.reward_function}", flush=True)
+        print(
+            f"Action control: mode={action_control.mode} "
+            f"policy_controls={action_control.control_names} "
+            f"fixed_throttle={action_control.fixed_throttle} "
+            f"max_throttle={action_control.max_throttle:.3f} "
+            f"max_steering={action_control.max_steering:.3f}",
+            flush=True,
+        )
         if start_config is not None:
             print(
                 f"Hard starts: seeds={len(start_config.training_seeds)} "
@@ -1140,7 +1252,16 @@ def main() -> None:
                     transform,
                 ).unsqueeze(0).to(device)
                 mean, log_std = policy(obs_tensor)
-                deterministic_action = torch.tanh(mean).squeeze(0).cpu().numpy()
+                deterministic_controls_tensor = torch.tanh(mean)
+                deterministic_controls = (
+                    deterministic_controls_tensor.squeeze(0).cpu().numpy()
+                )
+                deterministic_action = (
+                    action_control.to_wheels_tensor(deterministic_controls_tensor)
+                    .squeeze(0)
+                    .cpu()
+                    .numpy()
+                )
                 raw_mean = mean.squeeze(0).cpu().numpy()
                 std = log_std.exp().squeeze(0).cpu().numpy()
                 reference_action = None
@@ -1149,9 +1270,11 @@ def main() -> None:
                     reference_action = reference_model(obs_tensor).squeeze(0).cpu().numpy()
             print(
                 "debug_initial_action "
-                f"raw_mean_left={raw_mean[0]:+.4f} raw_mean_right={raw_mean[1]:+.4f} "
+                f"action_mode={action_control.mode} "
+                f"controls={np.array2string(deterministic_controls, precision=4)} "
+                f"raw_mean={np.array2string(raw_mean, precision=4)} "
                 f"action_left={deterministic_action[0]:+.4f} action_right={deterministic_action[1]:+.4f} "
-                f"std_left={std[0]:.4f} std_right={std[1]:.4f}",
+                f"std={np.array2string(std, precision=4)}",
                 flush=True,
             )
             if reference_action is not None:
@@ -1180,7 +1303,9 @@ def main() -> None:
             synchronize_device(device)
             rollout_started_at = perf_counter()
             obs_buf, action_buf, raw_action_buf = [], [], []
-            deterministic_action_buf, logp_buf, reward_buf, done_buf, value_buf = [], [], [], [], []
+            wheel_action_buf, deterministic_action_buf = [], []
+            deterministic_wheel_action_buf = []
+            logp_buf, reward_buf, done_buf, value_buf = [], [], [], []
             rollout_reward_components = RewardComponentAccumulator()
             preprocess_seconds = 0.0
             policy_value_inference_seconds = 0.0
@@ -1202,8 +1327,14 @@ def main() -> None:
                     action_tensor, raw_action_tensor, logp_tensor, deterministic_action_tensor = (
                         policy.sample_with_raw(obs_tensor.unsqueeze(0))
                     )
+                    wheel_action_tensor = action_control.to_wheels_tensor(action_tensor)
+                    deterministic_wheel_action_tensor = action_control.to_wheels_tensor(
+                        deterministic_action_tensor
+                    )
                     value_tensor = value(obs_tensor.unsqueeze(0))
-                action = format_wheel_action(action_tensor.squeeze(0).cpu().numpy())
+                action = format_wheel_action(
+                    wheel_action_tensor.squeeze(0).cpu().numpy()
+                )
                 policy_value_inference_seconds += perf_counter() - phase_started_at
 
                 phase_started_at = perf_counter()
@@ -1219,9 +1350,13 @@ def main() -> None:
                 reward_and_reset_seconds += perf_counter() - phase_started_at
 
                 obs_buf.append(obs_tensor.cpu())
-                action_buf.append(torch.from_numpy(action))
+                action_buf.append(action_tensor.squeeze(0).cpu())
                 raw_action_buf.append(raw_action_tensor.squeeze(0).cpu())
                 deterministic_action_buf.append(deterministic_action_tensor.squeeze(0).cpu())
+                wheel_action_buf.append(wheel_action_tensor.squeeze(0).cpu())
+                deterministic_wheel_action_buf.append(
+                    deterministic_wheel_action_tensor.squeeze(0).cpu()
+                )
                 logp_buf.append(logp_tensor.squeeze(0).cpu())
                 value_buf.append(value_tensor.squeeze(0).cpu())
                 episode_return += reward
@@ -1291,8 +1426,12 @@ def main() -> None:
 
             obs = torch.stack(obs_buf).to(device)
             actions = torch.stack(action_buf).to(device)
+            wheel_actions = torch.stack(wheel_action_buf).to(device)
             raw_actions = torch.stack(raw_action_buf).to(device)
             deterministic_actions = torch.stack(deterministic_action_buf).to(device)
+            deterministic_wheel_actions = torch.stack(
+                deterministic_wheel_action_buf
+            ).to(device)
             old_logp = torch.stack(logp_buf).to(device)
             rewards = torch.tensor(reward_buf, dtype=torch.float32, device=device)
             dones = torch.tensor(done_buf, dtype=torch.float32, device=device)
@@ -1358,12 +1497,36 @@ def main() -> None:
                 final_ratio = final_log_ratio.exp()
                 approx_kl = ((final_ratio - 1.0) - final_log_ratio).mean().item()
                 clip_fraction = ((final_ratio - 1.0).abs() > args.clip_ratio).float().mean().item()
-                action_noise = actions - deterministic_actions
-                sampled_steering = 0.5 * (actions[:, 1] - actions[:, 0])
-                action_noise_steering = 0.5 * (action_noise[:, 1] - action_noise[:, 0])
+                policy_control_noise = actions - deterministic_actions
+                action_noise = wheel_actions - deterministic_wheel_actions
+                sampled_steering = 0.5 * (
+                    wheel_actions[:, 1] - wheel_actions[:, 0]
+                )
+                action_noise_steering = 0.5 * (
+                    action_noise[:, 1] - action_noise[:, 0]
+                )
                 effective_log_std = policy.log_std.clamp(args.min_log_std, args.max_log_std)
                 effective_std = effective_log_std.exp()
+
+                def vector_item(values: torch.Tensor, index: int):
+                    return values[index].item() if values.numel() > index else None
+
+                def column_mean(values: torch.Tensor, index: int):
+                    return values[:, index].mean().item() if values.shape[1] > index else None
+
+                def column_std(values: torch.Tensor, index: int):
+                    if values.shape[1] <= index:
+                        return None
+                    return values[:, index].std(unbiased=False).item()
+
                 ppo_diagnostics = {
+                    "action_mode": action_control.mode,
+                    "policy_control_0_name": action_control.control_names[0],
+                    "policy_control_1_name": (
+                        action_control.control_names[1]
+                        if len(action_control.control_names) > 1
+                        else None
+                    ),
                     "pre_update_mean_abs_log_ratio": pre_update_mean_abs_log_ratio,
                     "pre_update_max_abs_log_ratio": pre_update_max_abs_log_ratio,
                     "approx_kl": approx_kl,
@@ -1371,23 +1534,48 @@ def main() -> None:
                     "ratio_mean": final_ratio.mean().item(),
                     "ratio_min": final_ratio.min().item(),
                     "ratio_max": final_ratio.max().item(),
-                    "log_std_left": effective_log_std[0].item(),
-                    "log_std_right": effective_log_std[1].item(),
-                    "std_left": effective_std[0].item(),
-                    "std_right": effective_std[1].item(),
-                    "sampled_action_left_mean": actions[:, 0].mean().item(),
-                    "sampled_action_right_mean": actions[:, 1].mean().item(),
-                    "sampled_action_left_std": actions[:, 0].std(unbiased=False).item(),
-                    "sampled_action_right_std": actions[:, 1].std(unbiased=False).item(),
-                    "deterministic_action_left_mean": deterministic_actions[:, 0].mean().item(),
-                    "deterministic_action_right_mean": deterministic_actions[:, 1].mean().item(),
+                    "log_std_left": vector_item(effective_log_std, 0),
+                    "log_std_right": vector_item(effective_log_std, 1),
+                    "std_left": vector_item(effective_std, 0),
+                    "std_right": vector_item(effective_std, 1),
+                    "sampled_policy_control_0_mean": column_mean(actions, 0),
+                    "sampled_policy_control_1_mean": column_mean(actions, 1),
+                    "sampled_policy_control_0_std": column_std(actions, 0),
+                    "sampled_policy_control_1_std": column_std(actions, 1),
+                    "deterministic_policy_control_0_mean": column_mean(
+                        deterministic_actions,
+                        0,
+                    ),
+                    "deterministic_policy_control_1_mean": column_mean(
+                        deterministic_actions,
+                        1,
+                    ),
+                    "policy_control_noise_0_std": column_std(
+                        policy_control_noise,
+                        0,
+                    ),
+                    "policy_control_noise_1_std": column_std(
+                        policy_control_noise,
+                        1,
+                    ),
+                    "sampled_action_left_mean": wheel_actions[:, 0].mean().item(),
+                    "sampled_action_right_mean": wheel_actions[:, 1].mean().item(),
+                    "sampled_action_left_std": wheel_actions[:, 0].std(unbiased=False).item(),
+                    "sampled_action_right_std": wheel_actions[:, 1].std(unbiased=False).item(),
+                    "deterministic_action_left_mean": deterministic_wheel_actions[:, 0].mean().item(),
+                    "deterministic_action_right_mean": deterministic_wheel_actions[:, 1].mean().item(),
                     "action_noise_left_std": action_noise[:, 0].std(unbiased=False).item(),
                     "action_noise_right_std": action_noise[:, 1].std(unbiased=False).item(),
                     "action_noise_steering_std": action_noise_steering.std(unbiased=False).item(),
                     "sampled_steering_std": sampled_steering.std(unbiased=False).item(),
-                    "sampled_action_saturation_fraction": (actions.abs() > 0.95).float().mean().item(),
+                    "sampled_action_saturation_fraction": (
+                        wheel_actions.abs() > 0.95
+                    ).float().mean().item(),
                     "deterministic_action_saturation_fraction": (
-                        deterministic_actions.abs() > 0.95
+                        deterministic_wheel_actions.abs() > 0.95
+                    ).float().mean().item(),
+                    "sampled_policy_control_saturation_fraction": (
+                        actions.abs() > 0.95
                     ).float().mean().item(),
                     "squashed_entropy_estimate": (-old_logp).mean().item(),
                 }
@@ -1484,6 +1672,7 @@ def main() -> None:
                 eval_result = evaluate_policy(
                     eval_env,
                     policy,
+                    action_control,
                     eval_reward_calculator,
                     args,
                     start_config.evaluation_poses if start_config is not None else (),

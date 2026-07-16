@@ -15,6 +15,10 @@ import pyglet
 import torch
 
 from cli_completion import parse_args_with_completion
+from duckietown_action_control import (
+    DuckietownActionControl,
+    action_control_from_config,
+)
 from duckietown_paths import (
     EVALUATION_SCREENSHOT_DIR,
     RL_GYM_DUCKIETOWN_EVALUATION_DIR,
@@ -23,6 +27,11 @@ from duckietown_rewards import (
     GymDuckietownRewardCalculator,
     REWARD_FUNCTION_CHOICES,
     format_wheel_action,
+)
+from gym_duckietown_start_config import (
+    TrainingPose,
+    apply_env_start_pose,
+    load_start_config,
 )
 from live_eval_imitation_policy_gym_duckietown import ReturnRecorder, reset_raw, step_raw
 from manual_control_gym_duckietown import (
@@ -86,6 +95,18 @@ def parse_args() -> argparse.Namespace:
         help="Defaults to the reward function stored in the checkpoint.",
     )
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--start-seeds-config",
+        type=Path,
+        default=None,
+        help="Start config containing the evaluation_poses available to this viewer.",
+    )
+    parser.add_argument(
+        "--eval-pose-index",
+        type=int,
+        default=0,
+        help="Zero-based evaluation_poses index selected from --start-seeds-config.",
+    )
     parser.add_argument(
         "--max-steps",
         type=int,
@@ -158,7 +179,7 @@ def config_value(value, config: dict[str, Any], key: str, default):
 def load_policy(
     checkpoint_path: Path,
     device: torch.device,
-) -> tuple[TanhGaussianPolicy, dict[str, Any], int]:
+) -> tuple[TanhGaussianPolicy, DuckietownActionControl, dict[str, Any], int]:
     checkpoint_path = checkpoint_path.expanduser()
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
@@ -175,15 +196,24 @@ def load_policy(
         )
 
     config = checkpoint.get("config", {})
+    action_control = action_control_from_config(config)
     model_name = config.get("model", "mobilenet_v3_small")
-    policy = TanhGaussianPolicy(model_name, pretrained=False)
+    policy = TanhGaussianPolicy(
+        model_name,
+        action_dim=action_control.policy_action_dim,
+        pretrained=False,
+    )
     policy.load_state_dict(checkpoint["policy_state_dict"])
     policy.to(device)
     policy.eval()
-    return policy, config, int(checkpoint.get("step", 0))
+    return policy, action_control, config, int(checkpoint.get("step", 0))
 
 
 def apply_checkpoint_defaults(args: argparse.Namespace, config: dict[str, Any]) -> None:
+    args.action_mode = config.get("action_mode", "wheel")
+    args.fixed_throttle = config.get("fixed_throttle")
+    args.max_throttle = float(config.get("max_throttle", 1.0))
+    args.max_steering = float(config.get("max_steering", 0.5))
     args.map_name = config_value(args.map_name, config, "map_name", "loop_empty")
     args.reward_function = config_value(
         args.reward_function,
@@ -243,9 +273,34 @@ def apply_checkpoint_defaults(args: argparse.Namespace, config: dict[str, Any]) 
     args.draw_bbox = False
 
 
+def load_evaluation_pose(args: argparse.Namespace) -> TrainingPose | None:
+    if args.start_seeds_config is None:
+        return None
+    if args.eval_pose_index < 0:
+        raise ValueError("--eval-pose-index must be non-negative")
+
+    start_config = load_start_config(
+        args.start_seeds_config,
+        args.map_name,
+        require_training_starts=False,
+    )
+    if not start_config.evaluation_poses:
+        raise ValueError(
+            f"{start_config.source_path} does not contain any evaluation_poses"
+        )
+    if args.eval_pose_index >= len(start_config.evaluation_poses):
+        raise ValueError(
+            f"--eval-pose-index {args.eval_pose_index} is out of range for "
+            f"{len(start_config.evaluation_poses)} evaluation pose(s)"
+        )
+    args.start_seeds_config = start_config.source_path
+    return start_config.evaluation_poses[args.eval_pose_index]
+
+
 @torch.no_grad()
 def predict_action(
     policy: TanhGaussianPolicy,
+    action_control: DuckietownActionControl,
     observation: np.ndarray,
     transform,
     args: argparse.Namespace,
@@ -263,9 +318,11 @@ def predict_action(
     raw_action = distribution.sample() if args.stochastic else distribution.mean
     action = torch.tanh(raw_action)
     mean_action = torch.tanh(distribution.mean)
+    wheel_action = action_control.to_wheels_tensor(action)
+    mean_wheel_action = action_control.to_wheels_tensor(mean_action)
     return (
-        mean_action.squeeze(0).cpu().numpy().astype(np.float32),
-        format_wheel_action(action.squeeze(0).cpu().numpy()),
+        mean_wheel_action.squeeze(0).cpu().numpy().astype(np.float32),
+        format_wheel_action(wheel_action.squeeze(0).cpu().numpy()),
         log_std.exp().squeeze(0).cpu().numpy().astype(np.float32),
     )
 
@@ -292,12 +349,37 @@ def draw_sidebar(
     lines = [
         ("RL policy in gym-duckietown", 18, ACCENT, True),
         (f"map {args.map_name}   {status}", 13, status_color, True),
+    ]
+    if args.start_seeds_config is not None:
+        lines.append((
+            f"eval pose {args.eval_pose_index}: {args.eval_pose_name or 'unnamed'}",
+            12,
+            MUTED,
+            False,
+        ))
+    lines.extend([
         (f"checkpoint step {checkpoint_step}   {mode}", 12, MUTED, False),
+        (
+            f"control {args.action_mode}"
+            + (
+                f"   fixed throttle {args.fixed_throttle:.3f}"
+                if args.fixed_throttle is not None
+                else ""
+            ),
+            12,
+            MUTED,
+            False,
+        ),
         (f"episode {state.episode}   step {state.episode_length}", 13, MUTED, False),
         ("", 8, MUTED, False),
         (f"left {fmt(state.action[0], 3)}   right {fmt(state.action[1], 3)}", 16, TEXT, True),
         (f"mean {fmt(state.mean_action[0], 3)}   {fmt(state.mean_action[1], 3)}", 12, MUTED, False),
-        (f"std {state.std[0]:.4f}   {state.std[1]:.4f}", 12, MUTED, False),
+        (
+            "policy std " + "   ".join(f"{value:.4f}" for value in state.std),
+            12,
+            MUTED,
+            False,
+        ),
         ("", 8, MUTED, False),
         (f"{args.reward_function} reward {fmt(state.selected_reward)}", 15, TEXT, True),
         (
@@ -311,7 +393,7 @@ def draw_sidebar(
         ("", 8, MUTED, False),
         (f"completed episodes {state.completed_episodes}", 13, MUTED, False),
         (f"mean completed return {fmt(state.mean_completed_return)}", 14, TEXT, True),
-    ]
+    ])
     if state.done:
         lines.extend(
             [
@@ -369,8 +451,13 @@ def main() -> None:
     args = parse_args()
     configure_logging(args.log_level)
     device = resolve_device(args.device)
-    policy, checkpoint_config, checkpoint_step = load_policy(args.checkpoint, device)
+    policy, action_control, checkpoint_config, checkpoint_step = load_policy(
+        args.checkpoint,
+        device,
+    )
     apply_checkpoint_defaults(args, checkpoint_config)
+    evaluation_pose = load_evaluation_pose(args)
+    args.eval_pose_name = evaluation_pose.name if evaluation_pose is not None else None
 
     if args.max_steps <= 0:
         raise ValueError("--max-steps must be positive")
@@ -386,6 +473,8 @@ def main() -> None:
     configure_logging(args.log_level)
     _, _, image_width, image_height = import_simulator()
     reward_calculator = GymDuckietownRewardCalculator(args.reward_function)
+    if evaluation_pose is not None:
+        apply_env_start_pose(env, evaluation_pose)
     observation = reset_raw(env)
     reward_calculator.reset(env)
 
@@ -417,7 +506,22 @@ def main() -> None:
     print(f"Device:           {device}", flush=True)
     print(f"Map:              {args.map_name}", flush=True)
     print(f"Reward function:  {args.reward_function}", flush=True)
+    print(
+        f"Action control:   {action_control.mode}, "
+        f"controls={action_control.control_names}, "
+        f"fixed_throttle={action_control.fixed_throttle}, "
+        f"max_throttle={action_control.max_throttle}, "
+        f"max_steering={action_control.max_steering}",
+        flush=True,
+    )
     print(f"Policy mode:      {'stochastic' if args.stochastic else 'deterministic'}", flush=True)
+    if evaluation_pose is not None:
+        print(
+            f"Evaluation pose:  index={args.eval_pose_index} "
+            f"name={evaluation_pose.name or '-'} tile={evaluation_pose.tile} "
+            f"position={evaluation_pose.position} angle={evaluation_pose.angle:.10f}",
+            flush=True,
+        )
     print(
         "Preprocess:       "
         f"channel_order={args.source_observation_channel_order}, "
@@ -451,6 +555,8 @@ def main() -> None:
     def start_next_episode() -> None:
         nonlocal observation, episode, episode_length, selected_return, env_return
         nonlocal current_episode_recorded, state
+        if evaluation_pose is not None:
+            apply_env_start_pose(env, evaluation_pose)
         observation = reset_raw(env)
         reward_calculator.reset(env)
         episode += 1
@@ -500,6 +606,7 @@ def main() -> None:
 
         mean_action, action, std = predict_action(
             policy,
+            action_control,
             observation,
             transform,
             args,

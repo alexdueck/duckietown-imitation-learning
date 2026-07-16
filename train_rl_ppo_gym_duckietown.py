@@ -52,6 +52,7 @@ from gym_duckietown_start_config import (
 from rl_models import TanhGaussianPolicy, load_imitation_actor, tanh_normal_log_prob
 from train_imitation_learning import IMAGENET_MEAN, IMAGENET_STD, build_model, resolve_device, set_seed
 from velopose_reward import (
+    POSEPOT_SHAPING_WEIGHT,
     VELOPPOSE_HEADING_CORRECTION_GAIN,
     VELOPPOSE_HEADING_MAX_CORRECTION_DEG,
     VELOPPOSE_INVALID_POSE_PENALTY,
@@ -753,7 +754,7 @@ def evaluate_policy(
         last_info = info
         components = RewardComponentAccumulator()
 
-        for _ in range(args.eval_steps):
+        for eval_step in range(args.eval_steps):
             obs_tensor = preprocess(
                 observation,
                 args.crop_y_start,
@@ -771,7 +772,17 @@ def evaluate_policy(
                     wheel_action.squeeze(0).cpu().numpy()
                 )
                 observation, env_reward, terminated, truncated, last_info = step_raw(env, action)
-            done_code = gym_duckietown_done_code(bool(terminated or truncated), last_info)
+            reached_eval_limit = (
+                eval_step + 1 >= args.eval_steps
+                and not terminated
+                and not truncated
+            )
+            done_code = gym_duckietown_done_code(
+                bool(terminated or truncated),
+                last_info,
+            )
+            if reached_eval_limit:
+                done_code = "eval_time_limit"
             breakdown = reward_calculator.compute_breakdown(env, float(env_reward), done_code)
             reward = components.add(breakdown)
             total_return += reward
@@ -950,12 +961,12 @@ def main() -> None:
             "supported": REWARD_FUNCTION_CHOICES,
             "invalid_pose_penalty": (
                 VELOPPOSE_INVALID_POSE_PENALTY
-                if args.reward_function == "velopose"
+                if args.reward_function in ("velopose", "posepot")
                 else 0.0
             ),
             "velocity_weight": (
                 VELOPPOSE_VELOCITY_WEIGHT
-                if args.reward_function == "velopose"
+                if args.reward_function in ("velopose", "posepot")
                 else None
             ),
             "pose_weight": (
@@ -963,14 +974,22 @@ def main() -> None:
                 if args.reward_function == "velopose"
                 else None
             ),
+            "potential_shaping_weight": (
+                POSEPOT_SHAPING_WEIGHT
+                if args.reward_function == "posepot"
+                else None
+            ),
+            "potential_discount": (
+                args.gamma if args.reward_function == "posepot" else None
+            ),
             "heading_max_correction_deg": (
                 VELOPPOSE_HEADING_MAX_CORRECTION_DEG
-                if args.reward_function == "velopose"
+                if args.reward_function in ("velopose", "posepot")
                 else None
             ),
             "heading_correction_gain": (
                 VELOPPOSE_HEADING_CORRECTION_GAIN
-                if args.reward_function == "velopose"
+                if args.reward_function in ("velopose", "posepot")
                 else None
             ),
         },
@@ -1189,8 +1208,14 @@ def main() -> None:
     env = None
     eval_env = None
     eval_start_defaults = None
-    reward_calculator = GymDuckietownRewardCalculator(args.reward_function)
-    eval_reward_calculator = GymDuckietownRewardCalculator(args.reward_function)
+    reward_calculator = GymDuckietownRewardCalculator(
+        args.reward_function,
+        gamma=args.gamma,
+    )
+    eval_reward_calculator = GymDuckietownRewardCalculator(
+        args.reward_function,
+        gamma=args.gamma,
+    )
     try:
         env = make_env(args, seed=args.seed)
         training_start_defaults = capture_environment_start_defaults(env)
@@ -1344,7 +1369,14 @@ def main() -> None:
                     render_training_environment(env)
 
                 phase_started_at = perf_counter()
+                next_episode_length = episode_length + 1
+                time_limit_done = (
+                    args.max_episode_steps > 0
+                    and next_episode_length >= args.max_episode_steps
+                )
                 done_code = gym_duckietown_done_code(bool(terminated or truncated), info)
+                if time_limit_done and not terminated and not truncated:
+                    done_code = "time_limit"
                 reward_breakdown = reward_calculator.compute_breakdown(env, float(reward), done_code)
                 reward = rollout_reward_components.add(reward_breakdown)
                 reward_and_reset_seconds += perf_counter() - phase_started_at
@@ -1363,7 +1395,6 @@ def main() -> None:
                 episode_length += 1
                 global_step += 1
                 env_done = bool(terminated or truncated)
-                time_limit_done = args.max_episode_steps > 0 and episode_length >= args.max_episode_steps
                 done = env_done or time_limit_done
                 reward_buf.append(reward)
                 done_buf.append(float(done))

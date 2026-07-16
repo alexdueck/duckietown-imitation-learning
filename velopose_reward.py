@@ -20,6 +20,8 @@ VELOPPOSE_INVALID_POSE_PENALTY = -20.0
 VELOPPOSE_LANE_HALF_WIDTH_FACTOR = 0.2
 VELOPPOSE_HEADING_MAX_CORRECTION_DEG = 45.0
 VELOPPOSE_HEADING_CORRECTION_GAIN = 1.25
+POSEPOT_DEFAULT_GAMMA = 0.99
+POSEPOT_SHAPING_WEIGHT = 1.0
 
 
 @dataclass(frozen=True)
@@ -200,6 +202,57 @@ def invalid_velopose_breakdown() -> dict[str, Any]:
                     "PoseQuality": pose_quality,
                     "LaneValid": 0.0,
                     "Weight": VELOPPOSE_POSE_WEIGHT,
+                },
+            },
+        },
+    }
+
+
+def compute_posepot_breakdown(
+    velopose_breakdown: dict[str, Any],
+    *,
+    previous_pose_quality: float | None,
+    gamma: float = POSEPOT_DEFAULT_GAMMA,
+    terminal: bool = False,
+) -> dict[str, Any]:
+    """Replace velopose's state reward with potential-based pose shaping."""
+    gamma = float(gamma)
+    if not 0.0 <= gamma <= 1.0:
+        raise ValueError("posepot gamma must be between 0 and 1")
+
+    components = velopose_breakdown["components"]
+    velocity = components["Velocity"]
+    current_pose = components["Pose"]
+    current_pose_quality = float(
+        current_pose.get("components", {}).get(
+            "PoseQuality",
+            current_pose.get("total", -1.0),
+        )
+    )
+    if previous_pose_quality is None:
+        previous_pose_quality = current_pose_quality
+    previous_pose_quality = float(previous_pose_quality)
+    next_potential = 0.0 if terminal else current_pose_quality
+    discounted_next_potential = gamma * next_potential
+    potential_difference = discounted_next_potential - previous_pose_quality
+    shaping_contribution = POSEPOT_SHAPING_WEIGHT * potential_difference
+    velocity_contribution = float(velocity["total"])
+
+    return {
+        "total": velocity_contribution + shaping_contribution,
+        "components": {
+            "Velocity": velocity,
+            "PosePotential": {
+                "total": shaping_contribution,
+                "components": {
+                    "PreviousPoseQuality": previous_pose_quality,
+                    "CurrentPoseQuality": current_pose_quality,
+                    "NextPotential": next_potential,
+                    "Gamma": gamma,
+                    "DiscountedNextPotential": discounted_next_potential,
+                    "PotentialDifference": potential_difference,
+                    "Weight": POSEPOT_SHAPING_WEIGHT,
+                    "CurrentPose": current_pose,
                 },
             },
         },

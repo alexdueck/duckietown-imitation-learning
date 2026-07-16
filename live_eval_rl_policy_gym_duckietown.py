@@ -472,7 +472,10 @@ def main() -> None:
     env = make_env(args)
     configure_logging(args.log_level)
     _, _, image_width, image_height = import_simulator()
-    reward_calculator = GymDuckietownRewardCalculator(args.reward_function)
+    reward_calculator = GymDuckietownRewardCalculator(
+        args.reward_function,
+        gamma=float(checkpoint_config.get("gamma", 0.99)),
+    )
     if evaluation_pose is not None:
         apply_env_start_pose(env, evaluation_pose)
     observation = reset_raw(env)

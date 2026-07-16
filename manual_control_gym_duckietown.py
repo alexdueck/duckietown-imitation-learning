@@ -155,6 +155,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auto-center-rate", type=float, default=0.55)
     parser.add_argument("--boost-multiplier", type=float, default=1.35)
     parser.add_argument(
+        "--posepot-gamma",
+        type=float,
+        default=0.99,
+        help="Discount used by the displayed potential-based pose reward.",
+    )
+    parser.add_argument(
         "--screenshot-path",
         type=Path,
         default=EVALUATION_SCREENSHOT_DIR / "gym_duckietown_manual.png",
@@ -599,7 +605,10 @@ def main() -> None:
     _, _, image_width, image_height = import_simulator()
     viewer_height = max(image_height, MIN_VIEWER_HEIGHT)
     image_y = (viewer_height - image_height) // 2
-    calculators = create_reward_calculators(DISPLAY_REWARD_FUNCTIONS)
+    calculators = create_reward_calculators(
+        DISPLAY_REWARD_FUNCTIONS,
+        posepot_gamma=args.posepot_gamma,
+    )
     state = reset_env(env, calculators, seed=args.seed, start_pose=start_pose)
     action_controller = ManualActionController()
     paused_due_to_done = False

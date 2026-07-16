@@ -7,8 +7,10 @@ import numpy as np
 
 from velopose_reward import (
     DirectedLaneTracker,
+    POSEPOT_DEFAULT_GAMMA,
     VELOPPOSE_INVALID_POSE_PENALTY,
     VELOPPOSE_LANE_HALF_WIDTH_FACTOR,
+    compute_posepot_breakdown,
     compute_velopose_breakdown,
     invalid_velopose_breakdown,
 )
@@ -21,6 +23,7 @@ REWARD_FUNCTION_CHOICES = (
     "target_orientation",
     "distance_travelled",
     "velopose",
+    "posepot",
 )
 
 DISPLAY_REWARD_FUNCTIONS = (
@@ -29,6 +32,7 @@ DISPLAY_REWARD_FUNCTIONS = (
     "target_orientation",
     "distance_travelled",
     "velopose",
+    "posepot",
 )
 
 INVALID_POSE_DONE_CODE = "invalid-pose"
@@ -38,6 +42,8 @@ MAX_STEPS_DONE_CODE = "max-steps-reached"
 def reward_source(name: str) -> str:
     if name == "velopose":
         return "Custom signed forward-velocity and lane-pose reward"
+    if name == "posepot":
+        return "Custom signed forward-velocity reward with potential-based lane-pose shaping"
     return "kaland313/Duckietown-RL reward_wrappers.py on gym-duckietown Simulator"
 
 
@@ -123,12 +129,21 @@ def patch_duckietown_world_dynamics() -> None:
 class GymDuckietownRewardCalculator:
     """Project reward functions on top of gym-duckietown Simulator state."""
 
-    def __init__(self, name: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        gamma: float = POSEPOT_DEFAULT_GAMMA,
+    ) -> None:
         if name not in REWARD_FUNCTION_CHOICES:
             raise ValueError(f"Unknown reward function {name!r}")
+        if not 0.0 <= float(gamma) <= 1.0:
+            raise ValueError("gamma must be between 0 and 1")
         self.name = name
+        self.gamma = float(gamma)
         self.prev_pos: np.ndarray | None = None
         self.prev_timestamp: float | None = None
+        self.previous_pose_potential: float | None = None
         self.velopose_lane_tracker = DirectedLaneTracker()
         self.orientation_reward = 0.0
         self.velocity_reward = 0.0
@@ -136,19 +151,38 @@ class GymDuckietownRewardCalculator:
     def reset(self, env=None) -> None:
         self.prev_pos = None
         self.prev_timestamp = None
+        self.previous_pose_potential = None
         self.velopose_lane_tracker.reset()
         self.orientation_reward = 0.0
         self.velocity_reward = 0.0
-        if env is not None and self.name == "velopose":
+        if env is not None and self.name in ("velopose", "posepot"):
             raw_env = unwrapped_env(env)
             self.prev_pos = np.asarray(raw_env.cur_pos, dtype=np.float64).copy()
             self.prev_timestamp = float(raw_env.timestamp)
             try:
-                self.velopose_lane_tracker.update(
+                lane_reference = self.velopose_lane_tracker.update(
                     position=self.prev_pos,
                     robot_yaw=float(raw_env.cur_angle),
                     closest_curve_point=raw_env.closest_curve_point,
                 )
+                if self.name == "posepot" and lane_reference is not None:
+                    initial_breakdown = compute_velopose_breakdown(
+                        current_position=self.prev_pos,
+                        previous_position=self.prev_pos,
+                        lane_tangent=lane_reference.tangent,
+                        robot_forward=lane_reference.robot_forward,
+                        delta_time=0.0,
+                        lane_distance=lane_reference.lane_distance,
+                        lane_half_width=(
+                            VELOPPOSE_LANE_HALF_WIDTH_FACTOR
+                            * float(raw_env.road_tile_size)
+                        ),
+                    )
+                    self.previous_pose_potential = float(
+                        initial_breakdown["components"]["Pose"]["components"][
+                            "PoseQuality"
+                        ]
+                    )
             except Exception:
                 pass
 
@@ -181,6 +215,31 @@ class GymDuckietownRewardCalculator:
                 components["InvalidPosePenalty"] = VELOPPOSE_INVALID_POSE_PENALTY
                 return {
                     "total": float(breakdown["total"]) + VELOPPOSE_INVALID_POSE_PENALTY,
+                    "components": components,
+                }
+            return breakdown
+        if self.name == "posepot":
+            terminal = done_code not in (None, "in-progress")
+            velopose_breakdown = self._velopose_breakdown(env)
+            current_pose_quality = float(
+                velopose_breakdown["components"]["Pose"]["components"].get(
+                    "PoseQuality",
+                    velopose_breakdown["components"]["Pose"]["total"],
+                )
+            )
+            breakdown = compute_posepot_breakdown(
+                velopose_breakdown,
+                previous_pose_quality=self.previous_pose_potential,
+                gamma=self.gamma,
+                terminal=terminal,
+            )
+            self.previous_pose_potential = current_pose_quality
+            if done_code == INVALID_POSE_DONE_CODE:
+                components = dict(breakdown["components"])
+                components["InvalidPosePenalty"] = VELOPPOSE_INVALID_POSE_PENALTY
+                return {
+                    "total": float(breakdown["total"])
+                    + VELOPPOSE_INVALID_POSE_PENALTY,
                     "components": components,
                 }
             return breakdown
@@ -313,8 +372,13 @@ class GymDuckietownRewardCalculator:
 
 def create_reward_calculators(
     names: tuple[str, ...] = DISPLAY_REWARD_FUNCTIONS,
+    *,
+    posepot_gamma: float = POSEPOT_DEFAULT_GAMMA,
 ) -> dict[str, GymDuckietownRewardCalculator]:
-    return {name: GymDuckietownRewardCalculator(name) for name in names}
+    return {
+        name: GymDuckietownRewardCalculator(name, gamma=posepot_gamma)
+        for name in names
+    }
 
 
 def reset_reward_calculators(

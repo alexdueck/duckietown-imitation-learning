@@ -126,6 +126,12 @@ def parse_args() -> argparse.Namespace:
         default="posangle",
         help="Reward accumulated as selected_return; the original simulator return is tracked too.",
     )
+    parser.add_argument(
+        "--posepot-gamma",
+        type=float,
+        default=0.99,
+        help="Discount used when --reward-function posepot is selected.",
+    )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=1024)
     parser.add_argument(
@@ -353,7 +359,10 @@ def main() -> None:
     env = make_env(args)
     configure_logging(args.log_level)
     _, _, image_width, image_height = import_simulator()
-    reward_calculator = GymDuckietownRewardCalculator(args.reward_function)
+    reward_calculator = GymDuckietownRewardCalculator(
+        args.reward_function,
+        gamma=args.posepot_gamma,
+    )
     observation = reset_raw(env)
     reward_calculator.reset(env)
 

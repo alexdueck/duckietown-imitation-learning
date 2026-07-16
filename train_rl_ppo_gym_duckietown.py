@@ -13,6 +13,7 @@ import argparse
 import csv
 import json
 import logging
+import re
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -64,6 +65,7 @@ from velopose_reward import (
 @dataclass
 class PPOConfig:
     output_dir: str
+    exp_name: str | None
     map_name: str
     reward_function: str
     model: str
@@ -160,12 +162,27 @@ def parse_probability(value: str) -> float:
     return probability
 
 
+def parse_experiment_name(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
+        raise argparse.ArgumentTypeError(
+            "experiment name must start with a letter or digit and contain only "
+            "letters, digits, dots, underscores, or hyphens"
+        )
+    return value
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO in gym-duckietown.")
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=RL_PPO_GYM_DUCKIETOWN_CHECKPOINT_DIR,
+    )
+    parser.add_argument(
+        "--exp-name",
+        type=parse_experiment_name,
+        default=None,
+        help="Optional experiment name appended to the timestamped run directory.",
     )
     parser.add_argument("--map-name", default="loop_empty")
     parser.add_argument(
@@ -935,7 +952,10 @@ def main() -> None:
     reset_rng = np.random.default_rng(args.seed + 1)
     start_rng = np.random.default_rng(args.seed + 2)
     device = resolve_device(args.device)
-    run_dir = args.output_dir.expanduser() / datetime.now().strftime("%Y%m%d_%H%M%S_ppo_gym_duckietown")
+    run_name = datetime.now().strftime("%Y%m%d_%H%M%S_ppo_gym_duckietown")
+    if args.exp_name is not None:
+        run_name = f"{run_name}_{args.exp_name}"
+    run_dir = args.output_dir.expanduser() / run_name
     run_dir.mkdir(parents=True, exist_ok=False)
     config_values = {
         k: str(v) if isinstance(v, Path) else v

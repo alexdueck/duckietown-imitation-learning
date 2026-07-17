@@ -54,7 +54,7 @@ class DuckietownActionControl:
         controls = np.asarray(controls, dtype=np.float32)
         self._check_last_dimension(controls.shape[-1])
         if self.mode == "wheel":
-            return np.clip(controls, -1.0, 1.0).astype(np.float32, copy=False)
+            return self._scale_wheels_numpy(controls)
 
         if self.fixed_throttle is None:
             throttle = 0.5 * (controls[..., 0] + 1.0) * self.max_throttle
@@ -68,12 +68,12 @@ class DuckietownActionControl:
             steering_control = controls[..., 0]
         steering = steering_control * self.max_steering
         wheels = np.stack((throttle - steering, throttle + steering), axis=-1)
-        return np.clip(wheels, -1.0, 1.0).astype(np.float32, copy=False)
+        return self._scale_wheels_numpy(wheels)
 
     def to_wheels_tensor(self, controls: torch.Tensor) -> torch.Tensor:
         self._check_last_dimension(controls.shape[-1])
         if self.mode == "wheel":
-            return controls.clamp(-1.0, 1.0)
+            return self._scale_wheels_tensor(controls)
 
         if self.fixed_throttle is None:
             throttle = 0.5 * (controls[..., 0] + 1.0) * self.max_throttle
@@ -82,10 +82,24 @@ class DuckietownActionControl:
             throttle = torch.full_like(controls[..., 0], self.fixed_throttle)
             steering_control = controls[..., 0]
         steering = steering_control * self.max_steering
-        return torch.stack((throttle - steering, throttle + steering), dim=-1).clamp(
-            -1.0,
+        wheels = torch.stack((throttle - steering, throttle + steering), dim=-1)
+        return self._scale_wheels_tensor(wheels)
+
+    @staticmethod
+    def _scale_wheels_numpy(wheels: np.ndarray) -> np.ndarray:
+        scale = np.maximum(
             1.0,
+            np.max(np.abs(wheels), axis=-1, keepdims=True),
         )
+        return (wheels / scale).astype(np.float32, copy=False)
+
+    @staticmethod
+    def _scale_wheels_tensor(wheels: torch.Tensor) -> torch.Tensor:
+        scale = torch.maximum(
+            torch.ones_like(wheels[..., :1]),
+            wheels.abs().amax(dim=-1, keepdim=True),
+        )
+        return wheels / scale
 
     def _check_last_dimension(self, actual: int) -> None:
         if actual != self.policy_action_dim:

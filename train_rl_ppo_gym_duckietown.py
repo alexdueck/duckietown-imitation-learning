@@ -884,7 +884,10 @@ def save_checkpoint(path, policy, value, policy_optimizer, value_optimizer, conf
             "fixed_throttle": action_control.fixed_throttle,
             "max_throttle": action_control.max_throttle,
             "max_steering": action_control.max_steering,
-            "environment_actions": "left/right wheel commands clipped to [-1, 1]",
+            "environment_actions": (
+                "left/right wheel commands uniformly scaled to [-1, 1] "
+                "while preserving their ratio"
+            ),
         },
         "imagenet_mean": IMAGENET_MEAN,
         "imagenet_std": IMAGENET_STD,

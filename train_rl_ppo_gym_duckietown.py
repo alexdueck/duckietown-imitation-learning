@@ -54,6 +54,7 @@ from rl_models import TanhGaussianPolicy, load_imitation_actor, tanh_normal_log_
 from train_imitation_learning import IMAGENET_MEAN, IMAGENET_STD, build_model, resolve_device, set_seed
 from velopose_reward import (
     POSEPOT_SHAPING_WEIGHT,
+    VD2PP_DISTANCE_SQUARED_WEIGHT,
     VELOPPOSE_HEADING_CORRECTION_GAIN,
     VELOPPOSE_HEADING_MAX_CORRECTION_DEG,
     VELOPPOSE_INVALID_POSE_PENALTY,
@@ -68,6 +69,7 @@ class PPOConfig:
     exp_name: str | None
     map_name: str
     reward_function: str
+    vd2pp_distance_weight: float
     model: str
     imitation_checkpoint: str | None
     resume_checkpoint: str | None
@@ -189,7 +191,13 @@ def parse_args() -> argparse.Namespace:
         "--reward-function",
         choices=REWARD_FUNCTION_CHOICES,
         default="posangle",
-        help="Reward seen by PPO. Non-default options follow kaland313/Duckietown-RL reward wrappers.",
+        help="Reward function optimized by PPO.",
+    )
+    parser.add_argument(
+        "--vd2pp-distance-weight",
+        type=float,
+        default=VD2PP_DISTANCE_SQUARED_WEIGHT,
+        help="Beta in vd2pp's direct -beta * scaled_lane_distance^2 term.",
     )
     parser.add_argument("--model", choices=("mobilenet_v3_small", "resnet18"), default="mobilenet_v3_small")
     parser.add_argument("--imitation-checkpoint", type=Path, default=None)
@@ -919,6 +927,8 @@ def load_reference_imitation_model(checkpoint_path: Path, device: torch.device):
 
 def main() -> None:
     args = parse_args()
+    if args.vd2pp_distance_weight < 0.0:
+        raise ValueError("--vd2pp-distance-weight must be non-negative")
     if args.resume_checkpoint is not None and args.imitation_checkpoint is not None:
         raise ValueError("Use either --resume-checkpoint or --imitation-checkpoint, not both.")
     if args.resume_checkpoint is not None:
@@ -984,12 +994,12 @@ def main() -> None:
             "supported": REWARD_FUNCTION_CHOICES,
             "invalid_pose_penalty": (
                 VELOPPOSE_INVALID_POSE_PENALTY
-                if args.reward_function in ("velopose", "posepot")
+                if args.reward_function in ("velopose", "posepot", "vd2pp")
                 else 0.0
             ),
             "velocity_weight": (
                 VELOPPOSE_VELOCITY_WEIGHT
-                if args.reward_function in ("velopose", "posepot")
+                if args.reward_function in ("velopose", "posepot", "vd2pp")
                 else None
             ),
             "pose_weight": (
@@ -999,20 +1009,27 @@ def main() -> None:
             ),
             "potential_shaping_weight": (
                 POSEPOT_SHAPING_WEIGHT
-                if args.reward_function == "posepot"
+                if args.reward_function in ("posepot", "vd2pp")
                 else None
             ),
             "potential_discount": (
-                args.gamma if args.reward_function == "posepot" else None
+                args.gamma
+                if args.reward_function in ("posepot", "vd2pp")
+                else None
+            ),
+            "distance_squared_weight": (
+                args.vd2pp_distance_weight
+                if args.reward_function == "vd2pp"
+                else None
             ),
             "heading_max_correction_deg": (
                 VELOPPOSE_HEADING_MAX_CORRECTION_DEG
-                if args.reward_function in ("velopose", "posepot")
+                if args.reward_function in ("velopose", "posepot", "vd2pp")
                 else None
             ),
             "heading_correction_gain": (
                 VELOPPOSE_HEADING_CORRECTION_GAIN
-                if args.reward_function in ("velopose", "posepot")
+                if args.reward_function in ("velopose", "posepot", "vd2pp")
                 else None
             ),
         },
@@ -1234,10 +1251,12 @@ def main() -> None:
     reward_calculator = GymDuckietownRewardCalculator(
         args.reward_function,
         gamma=args.gamma,
+        vd2pp_distance_weight=args.vd2pp_distance_weight,
     )
     eval_reward_calculator = GymDuckietownRewardCalculator(
         args.reward_function,
         gamma=args.gamma,
+        vd2pp_distance_weight=args.vd2pp_distance_weight,
     )
     try:
         env = make_env(args, seed=args.seed)
@@ -1248,6 +1267,11 @@ def main() -> None:
             eval_start_defaults = capture_environment_start_defaults(eval_env)
         print(f"Environment: gym-duckietown map={args.map_name}", flush=True)
         print(f"Reward function: {args.reward_function}", flush=True)
+        if args.reward_function == "vd2pp":
+            print(
+                f"vd2pp distance-squared weight: {args.vd2pp_distance_weight:.4f}",
+                flush=True,
+            )
         print(
             f"Action control: mode={action_control.mode} "
             f"policy_controls={action_control.control_names} "

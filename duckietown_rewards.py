@@ -8,9 +8,11 @@ import numpy as np
 from velopose_reward import (
     DirectedLaneTracker,
     POSEPOT_DEFAULT_GAMMA,
+    VD2PP_DISTANCE_SQUARED_WEIGHT,
     VELOPPOSE_INVALID_POSE_PENALTY,
     VELOPPOSE_LANE_HALF_WIDTH_FACTOR,
     compute_posepot_breakdown,
+    compute_vd2pp_breakdown,
     compute_velopose_breakdown,
     invalid_velopose_breakdown,
 )
@@ -24,6 +26,7 @@ REWARD_FUNCTION_CHOICES = (
     "distance_travelled",
     "velopose",
     "posepot",
+    "vd2pp",
 )
 
 DISPLAY_REWARD_FUNCTIONS = (
@@ -33,6 +36,7 @@ DISPLAY_REWARD_FUNCTIONS = (
     "distance_travelled",
     "velopose",
     "posepot",
+    "vd2pp",
 )
 
 INVALID_POSE_DONE_CODE = "invalid-pose"
@@ -44,6 +48,11 @@ def reward_source(name: str) -> str:
         return "Custom signed forward-velocity and lane-pose reward"
     if name == "posepot":
         return "Custom signed forward-velocity reward with potential-based lane-pose shaping"
+    if name == "vd2pp":
+        return (
+            "Custom signed forward-velocity reward with direct squared lane-distance "
+            "cost and potential-based lane-pose shaping"
+        )
     return "kaland313/Duckietown-RL reward_wrappers.py on gym-duckietown Simulator"
 
 
@@ -134,13 +143,17 @@ class GymDuckietownRewardCalculator:
         name: str,
         *,
         gamma: float = POSEPOT_DEFAULT_GAMMA,
+        vd2pp_distance_weight: float = VD2PP_DISTANCE_SQUARED_WEIGHT,
     ) -> None:
         if name not in REWARD_FUNCTION_CHOICES:
             raise ValueError(f"Unknown reward function {name!r}")
         if not 0.0 <= float(gamma) <= 1.0:
             raise ValueError("gamma must be between 0 and 1")
+        if float(vd2pp_distance_weight) < 0.0:
+            raise ValueError("vd2pp distance weight must be non-negative")
         self.name = name
         self.gamma = float(gamma)
+        self.vd2pp_distance_weight = float(vd2pp_distance_weight)
         self.prev_pos: np.ndarray | None = None
         self.prev_timestamp: float | None = None
         self.previous_pose_potential: float | None = None
@@ -155,7 +168,7 @@ class GymDuckietownRewardCalculator:
         self.velopose_lane_tracker.reset()
         self.orientation_reward = 0.0
         self.velocity_reward = 0.0
-        if env is not None and self.name in ("velopose", "posepot"):
+        if env is not None and self.name in ("velopose", "posepot", "vd2pp"):
             raw_env = unwrapped_env(env)
             self.prev_pos = np.asarray(raw_env.cur_pos, dtype=np.float64).copy()
             self.prev_timestamp = float(raw_env.timestamp)
@@ -165,7 +178,7 @@ class GymDuckietownRewardCalculator:
                     robot_yaw=float(raw_env.cur_angle),
                     closest_curve_point=raw_env.closest_curve_point,
                 )
-                if self.name == "posepot" and lane_reference is not None:
+                if self.name in ("posepot", "vd2pp") and lane_reference is not None:
                     initial_breakdown = compute_velopose_breakdown(
                         current_position=self.prev_pos,
                         previous_position=self.prev_pos,
@@ -218,7 +231,7 @@ class GymDuckietownRewardCalculator:
                     "components": components,
                 }
             return breakdown
-        if self.name == "posepot":
+        if self.name in ("posepot", "vd2pp"):
             terminal = done_code not in (None, "in-progress")
             velopose_breakdown = self._velopose_breakdown(env)
             current_pose_quality = float(
@@ -227,12 +240,21 @@ class GymDuckietownRewardCalculator:
                     velopose_breakdown["components"]["Pose"]["total"],
                 )
             )
-            breakdown = compute_posepot_breakdown(
-                velopose_breakdown,
-                previous_pose_quality=self.previous_pose_potential,
-                gamma=self.gamma,
-                terminal=terminal,
-            )
+            if self.name == "posepot":
+                breakdown = compute_posepot_breakdown(
+                    velopose_breakdown,
+                    previous_pose_quality=self.previous_pose_potential,
+                    gamma=self.gamma,
+                    terminal=terminal,
+                )
+            else:
+                breakdown = compute_vd2pp_breakdown(
+                    velopose_breakdown,
+                    previous_pose_quality=self.previous_pose_potential,
+                    gamma=self.gamma,
+                    terminal=terminal,
+                    distance_squared_weight=self.vd2pp_distance_weight,
+                )
             self.previous_pose_potential = current_pose_quality
             if done_code == INVALID_POSE_DONE_CODE:
                 components = dict(breakdown["components"])
@@ -374,9 +396,14 @@ def create_reward_calculators(
     names: tuple[str, ...] = DISPLAY_REWARD_FUNCTIONS,
     *,
     posepot_gamma: float = POSEPOT_DEFAULT_GAMMA,
+    vd2pp_distance_weight: float = VD2PP_DISTANCE_SQUARED_WEIGHT,
 ) -> dict[str, GymDuckietownRewardCalculator]:
     return {
-        name: GymDuckietownRewardCalculator(name, gamma=posepot_gamma)
+        name: GymDuckietownRewardCalculator(
+            name,
+            gamma=posepot_gamma,
+            vd2pp_distance_weight=vd2pp_distance_weight,
+        )
         for name in names
     }
 

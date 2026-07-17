@@ -25,7 +25,7 @@ from gym_duckietown_start_config import (
     load_pose_file,
 )
 from duckietown_rewards import (
-    DISPLAY_REWARD_FUNCTIONS,
+    REWARD_FUNCTION_CHOICES,
     compute_reward_breakdowns,
     create_reward_calculators,
     format_wheel_action,
@@ -34,10 +34,12 @@ from duckietown_rewards import (
     patch_duckietown_world_dynamics,
     reset_reward_calculators,
 )
+from velopose_reward import VD2PP_DISTANCE_SQUARED_WEIGHT
 
 
 SIDEBAR_WIDTH = 500
 MIN_VIEWER_HEIGHT = 860
+MANUAL_REWARD_FUNCTIONS = ("velopose", "posepot")
 BACKGROUND = (18, 22, 26)
 SIDEBAR_BG = (27, 31, 36)
 TEXT = (238, 241, 245, 255)
@@ -117,6 +119,18 @@ class ManualActionController:
         return format_wheel_action(action)
 
 
+def parse_reward_functions(value: str) -> tuple[str, ...]:
+    names = tuple(name.strip() for name in value.split(",") if name.strip())
+    if not names:
+        raise argparse.ArgumentTypeError("provide at least one reward function")
+    unknown = [name for name in names if name not in REWARD_FUNCTION_CHOICES]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown reward function(s): {', '.join(unknown)}"
+        )
+    return names
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Manual gym-duckietown control with reward diagnostics.")
     parser.add_argument("--map-name", default="loop_empty")
@@ -159,6 +173,21 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.99,
         help="Discount used by the displayed potential-based pose reward.",
+    )
+    parser.add_argument(
+        "--reward-functions",
+        type=parse_reward_functions,
+        default=MANUAL_REWARD_FUNCTIONS,
+        help=(
+            "Comma-separated rewards shown in the sidebar; "
+            "use vd2pp to inspect the new reward alone."
+        ),
+    )
+    parser.add_argument(
+        "--vd2pp-distance-weight",
+        type=float,
+        default=VD2PP_DISTANCE_SQUARED_WEIGHT,
+        help="Beta in vd2pp's direct -beta * scaled_lane_distance^2 term.",
     )
     parser.add_argument(
         "--screenshot-path",
@@ -546,8 +575,7 @@ def sidebar_lines(
         lines.append((f"done {state.done_reason}", 15, BAD, True))
         lines.append(("", 8, MUTED, False))
 
-    for name in DISPLAY_REWARD_FUNCTIONS:
-        breakdown = state.reward_breakdowns.get(name, {"total": 0.0, "components": {}})
+    for name, breakdown in state.reward_breakdowns.items():
         total = float(breakdown["total"])
         color = GOOD if total >= 0.0 else BAD
         reward_return = state.reward_returns.get(name, 0.0)
@@ -606,8 +634,9 @@ def main() -> None:
     viewer_height = max(image_height, MIN_VIEWER_HEIGHT)
     image_y = (viewer_height - image_height) // 2
     calculators = create_reward_calculators(
-        DISPLAY_REWARD_FUNCTIONS,
+        args.reward_functions,
         posepot_gamma=args.posepot_gamma,
+        vd2pp_distance_weight=args.vd2pp_distance_weight,
     )
     state = reset_env(env, calculators, seed=args.seed, start_pose=start_pose)
     action_controller = ManualActionController()

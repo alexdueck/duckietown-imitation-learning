@@ -22,6 +22,7 @@ VELOPPOSE_HEADING_MAX_CORRECTION_DEG = 45.0
 VELOPPOSE_HEADING_CORRECTION_GAIN = 1.25
 POSEPOT_DEFAULT_GAMMA = 0.99
 POSEPOT_SHAPING_WEIGHT = 1.0
+VD2PP_DISTANCE_SQUARED_WEIGHT = 1.0
 
 
 @dataclass(frozen=True)
@@ -255,5 +256,54 @@ def compute_posepot_breakdown(
                     "CurrentPose": current_pose,
                 },
             },
+        },
+    }
+
+
+def compute_vd2pp_breakdown(
+    velopose_breakdown: dict[str, Any],
+    *,
+    previous_pose_quality: float | None,
+    gamma: float = POSEPOT_DEFAULT_GAMMA,
+    terminal: bool = False,
+    distance_squared_weight: float = VD2PP_DISTANCE_SQUARED_WEIGHT,
+) -> dict[str, Any]:
+    """Add a direct squared lane-distance cost to the posepot reward."""
+    distance_squared_weight = float(distance_squared_weight)
+    if distance_squared_weight < 0.0:
+        raise ValueError("vd2pp distance squared weight must be non-negative")
+
+    posepot_breakdown = compute_posepot_breakdown(
+        velopose_breakdown,
+        previous_pose_quality=previous_pose_quality,
+        gamma=gamma,
+        terminal=terminal,
+    )
+    pose_components = velopose_breakdown["components"]["Pose"].get(
+        "components",
+        {},
+    )
+    scaled_abs_lane_distance = float(
+        pose_components.get("ScaledAbsLaneDistance", 0.0)
+    )
+    squared_scaled_lane_distance = scaled_abs_lane_distance**2
+    distance_squared_penalty = (
+        -distance_squared_weight * squared_scaled_lane_distance
+    )
+    posepot_components = posepot_breakdown["components"]
+
+    return {
+        "total": float(posepot_breakdown["total"]) + distance_squared_penalty,
+        "components": {
+            "Velocity": posepot_components["Velocity"],
+            "DistanceSquaredLanePenalty": {
+                "total": distance_squared_penalty,
+                "components": {
+                    "ScaledAbsLaneDistance": scaled_abs_lane_distance,
+                    "SquaredScaledLaneDistance": squared_scaled_lane_distance,
+                    "Weight": distance_squared_weight,
+                },
+            },
+            "PosePotential": posepot_components["PosePotential"],
         },
     }

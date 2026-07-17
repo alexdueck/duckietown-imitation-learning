@@ -42,6 +42,7 @@ from manual_control_gym_duckietown import (
     MUTED,
     SIDEBAR_BG,
     TEXT,
+    append_component_lines,
     configure_logging,
     done_reason,
     draw_label,
@@ -58,6 +59,7 @@ from train_rl_ppo_gym_duckietown import make_transform, preprocess
 
 
 SIDEBAR_WIDTH = 480
+MIN_VIEWER_HEIGHT = 900
 
 
 @dataclass
@@ -67,6 +69,7 @@ class ViewerState:
     std: np.ndarray
     env_reward: float
     selected_reward: float
+    reward_breakdown: dict[str, Any]
     env_return: float
     selected_return: float
     episode: int
@@ -93,6 +96,12 @@ def parse_args() -> argparse.Namespace:
         choices=REWARD_FUNCTION_CHOICES,
         default=None,
         help="Defaults to the reward function stored in the checkpoint.",
+    )
+    parser.add_argument(
+        "--vd2pp-distance-weight",
+        type=float,
+        default=None,
+        help="Defaults to the vd2pp distance-squared weight stored in the checkpoint.",
     )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
@@ -221,6 +230,14 @@ def apply_checkpoint_defaults(args: argparse.Namespace, config: dict[str, Any]) 
         "reward_function",
         "posangle",
     )
+    args.vd2pp_distance_weight = float(
+        config_value(
+            args.vd2pp_distance_weight,
+            config,
+            "vd2pp_distance_weight",
+            1.0,
+        )
+    )
     args.seed = int(config_value(args.seed, config, "seed", 42))
     args.frame_rate = int(config_value(args.frame_rate, config, "frame_rate", 30))
     args.frame_skip = int(config_value(args.frame_skip, config, "frame_skip", 1))
@@ -345,7 +362,6 @@ def draw_sidebar(
     mode = "stochastic" if args.stochastic else "deterministic"
     status_color = BAD if state.paused else GOOD
     selected_return_color = GOOD if state.selected_return >= 0.0 else BAD
-    env_return_color = GOOD if state.env_return >= 0.0 else BAD
     lines = [
         ("RL policy in gym-duckietown", 18, ACCENT, True),
         (f"map {args.map_name}   {status}", 13, status_color, True),
@@ -388,11 +404,20 @@ def draw_sidebar(
             selected_return_color,
             True,
         ),
-        (f"default reward {fmt(state.env_reward)}", 13, MUTED, False),
-        (f"default return {fmt(state.env_return)}", 15, env_return_color, True),
+    ])
+    components = state.reward_breakdown.get("components", {})
+    if isinstance(components, dict):
+        append_component_lines(lines, components)
+    lines.extend([
         ("", 8, MUTED, False),
         (f"completed episodes {state.completed_episodes}", 13, MUTED, False),
-        (f"mean completed return {fmt(state.mean_completed_return)}", 14, TEXT, True),
+        (
+            f"mean completed {args.reward_function} return "
+            f"{fmt(state.mean_completed_return)}",
+            14,
+            TEXT,
+            True,
+        ),
     ])
     if state.done:
         lines.extend(
@@ -433,6 +458,7 @@ def empty_state(
         std=std.copy(),
         env_reward=0.0,
         selected_reward=0.0,
+        reward_breakdown={"total": 0.0, "components": {}},
         env_return=0.0,
         selected_return=0.0,
         episode=episode,
@@ -472,9 +498,12 @@ def main() -> None:
     env = make_env(args)
     configure_logging(args.log_level)
     _, _, image_width, image_height = import_simulator()
+    viewer_height = max(image_height, MIN_VIEWER_HEIGHT)
+    image_y = (viewer_height - image_height) // 2
     reward_calculator = GymDuckietownRewardCalculator(
         args.reward_function,
         gamma=float(checkpoint_config.get("gamma", 0.99)),
+        vd2pp_distance_weight=args.vd2pp_distance_weight,
     )
     if evaluation_pose is not None:
         apply_env_start_pose(env, evaluation_pose)
@@ -498,7 +527,7 @@ def main() -> None:
 
     window = pyglet_window.Window(
         width=image_width + SIDEBAR_WIDTH,
-        height=image_height,
+        height=viewer_height,
         resizable=False,
         caption="gym-duckietown RL policy evaluation",
     )
@@ -594,11 +623,11 @@ def main() -> None:
     @window.event
     def on_draw():
         rgb = env.render(mode="rgb_array")
-        prepare_window_2d(window, image_width + SIDEBAR_WIDTH, image_height)
+        prepare_window_2d(window, image_width + SIDEBAR_WIDTH, viewer_height)
         window.clear()
-        draw_rect(0, 0, image_width + SIDEBAR_WIDTH, image_height, BACKGROUND)
-        draw_rgb(rgb, 0, 0, image_width, image_height)
-        draw_sidebar(state, args, checkpoint_step, image_width, image_height)
+        draw_rect(0, 0, image_width + SIDEBAR_WIDTH, viewer_height, BACKGROUND)
+        draw_rgb(rgb, 0, image_y, image_width, image_height)
+        draw_sidebar(state, args, checkpoint_step, image_width, viewer_height)
 
     def update(dt):
         del dt
@@ -617,11 +646,12 @@ def main() -> None:
         )
         observation, step_env_reward, done, info = step_raw(env, action)
         reason = done_reason(done, info)
-        step_selected_reward = reward_calculator.compute(
+        reward_breakdown = reward_calculator.compute_breakdown(
             env,
             step_env_reward,
             done_code=reason,
         )
+        step_selected_reward = float(reward_breakdown["total"])
         episode_length += 1
         env_return += step_env_reward
         selected_return += step_selected_reward
@@ -632,6 +662,7 @@ def main() -> None:
             std=std,
             env_reward=step_env_reward,
             selected_reward=step_selected_reward,
+            reward_breakdown=reward_breakdown,
             env_return=env_return,
             selected_return=selected_return,
             episode=episode,

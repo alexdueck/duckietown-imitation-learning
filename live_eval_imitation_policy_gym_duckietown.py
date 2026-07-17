@@ -52,6 +52,7 @@ from train_imitation_learning import (
     build_model,
     resolve_device,
 )
+from velopose_reward import VD2PP_DISTANCE_SQUARED_WEIGHT
 
 
 SIDEBAR_WIDTH = 460
@@ -130,7 +131,13 @@ def parse_args() -> argparse.Namespace:
         "--posepot-gamma",
         type=float,
         default=0.99,
-        help="Discount used when --reward-function posepot is selected.",
+        help="Discount used by posepot and vd2pp.",
+    )
+    parser.add_argument(
+        "--vd2pp-distance-weight",
+        type=float,
+        default=VD2PP_DISTANCE_SQUARED_WEIGHT,
+        help="Beta in vd2pp's direct -beta * scaled_lane_distance^2 term.",
     )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=1024)
@@ -362,6 +369,7 @@ def main() -> None:
     reward_calculator = GymDuckietownRewardCalculator(
         args.reward_function,
         gamma=args.posepot_gamma,
+        vd2pp_distance_weight=args.vd2pp_distance_weight,
     )
     observation = reset_raw(env)
     reward_calculator.reset(env)

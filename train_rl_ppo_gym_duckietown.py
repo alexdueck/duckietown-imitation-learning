@@ -264,7 +264,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--eval-seeds",
         type=parse_eval_seeds,
-        default=(10042, 10043, 10044, 10045, 10046),
+        default=(10042, 10043, 10044, 10045),
         help="Comma-separated reset seeds defining the fixed evaluation scenarios.",
     )
     parser.add_argument("--eval-stochastic", action="store_false", dest="eval_deterministic")

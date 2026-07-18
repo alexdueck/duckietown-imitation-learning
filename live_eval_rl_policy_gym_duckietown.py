@@ -33,7 +33,7 @@ from gym_duckietown_start_config import (
     apply_env_start_pose,
     load_start_config,
 )
-from live_eval_imitation_policy_gym_duckietown import ReturnRecorder, reset_raw, step_raw
+from live_eval_imitation_policy_gym_duckietown import ReturnRecorder, step_raw
 from manual_control_gym_duckietown import (
     ACCENT,
     BACKGROUND,
@@ -55,7 +55,7 @@ from manual_control_gym_duckietown import (
 )
 from rl_models import TanhGaussianPolicy
 from train_imitation_learning import resolve_device
-from train_rl_ppo_gym_duckietown import make_transform, preprocess
+from train_rl_ppo_gym_duckietown import make_transform, preprocess, reset_raw
 
 
 SIDEBAR_WIDTH = 480
@@ -507,7 +507,7 @@ def main() -> None:
     )
     if evaluation_pose is not None:
         apply_env_start_pose(env, evaluation_pose)
-    observation = reset_raw(env)
+    observation, _ = reset_raw(env, seed=args.seed)
     reward_calculator.reset(env)
 
     with torch.no_grad():
@@ -589,7 +589,7 @@ def main() -> None:
         nonlocal current_episode_recorded, state
         if evaluation_pose is not None:
             apply_env_start_pose(env, evaluation_pose)
-        observation = reset_raw(env)
+        observation, _ = reset_raw(env, seed=args.seed)
         reward_calculator.reset(env)
         episode += 1
         episode_length = 0

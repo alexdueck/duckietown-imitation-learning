@@ -27,6 +27,7 @@ This page describes responsibilities and common use, not every flag.
 | `live_eval_imitation_policy_gym_duckietown.py` | Visually evaluate a Duckiematrix-trained IL policy in gym-duckietown |
 | `train_rl_ppo_gym_duckietown.py` | Main gym-duckietown PPO trainer |
 | `live_eval_rl_policy_gym_duckietown.py` | Visually evaluate an RL checkpoint using its stored configuration |
+| `analyze_rl_training_run.py` | Generate a standalone HTML report from a PPO run's CSV files |
 | `ppo_control_tests.py` | PPO invariant, Pendulum, and synthetic image-control tests |
 
 ## Supporting Modules

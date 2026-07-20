@@ -199,6 +199,24 @@ Seeded resets explicitly reseed immediately before `env.reset()`. This matters
 because gym-duckietown already performs a reset in the `Simulator`
 constructor.
 
+## Generate a Training Report
+
+Create a standalone HTML report from the CSV files in a PPO run directory:
+
+```bash
+RUN_DIR="$HOME/duckietown/checkpoints/rl_ppo_gym_duckietown/YOUR_RUN"
+python analyze_rl_training_run.py "$RUN_DIR"
+```
+
+The script writes `training_report.html` into the run directory. It contains
+evaluation trends, per-scenario returns, training-start frequencies and
+failure rates, PPO diagnostics, reward components, and runtime measurements.
+Charts are embedded as SVG, so the report needs neither a server nor an
+internet connection. The report opens in the default browser after generation;
+pass `--no-open` when running over SSH or on another headless system. Use
+`--eval-window`, `--episode-window`, and `--diagnostic-window` to change the
+first/last comparison periods.
+
 ## Evaluate an IL Policy in gym-duckietown
 
 ```bash

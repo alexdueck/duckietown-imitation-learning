@@ -38,6 +38,7 @@ still optimization but not the kind we were hoping for.
 - Deterministic evaluation seeds and exact saved start poses
 - Per-evaluation checkpoints, safety-aware checkpoint selection, and detailed
   CSV diagnostics
+- Standalone HTML reports for completed or running PPO experiments
 - Manual reward inspection and visual policy evaluation tools
 
 ## Quick Start

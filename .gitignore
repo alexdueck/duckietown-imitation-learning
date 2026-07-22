@@ -5,3 +5,4 @@ configs/*.json
 .python-version
 venv39_gymdt/
 duckiebot_captures/
+.DS_Store

@@ -11,9 +11,11 @@ mostly create two places for facts to become outdated.
    - [gym-duckietown on Ubuntu over SSH](getting-started/gym-duckietown-ubuntu.md)
    - [Duckiematrix](getting-started/duckiematrix.md)
 2. Follow [Common workflows](getting-started/workflows.md).
-3. Read the [evaluation protocol](methodology/evaluation.md) before comparing
+3. For initial hardware experiments, run the
+   [physical camera input check](getting-started/physical-duckiebot-camera.md).
+4. Read the [evaluation protocol](methodology/evaluation.md) before comparing
    returns.
-4. Use [Troubleshooting](troubleshooting.md) when OpenGL remembers that it has
+5. Use [Troubleshooting](troubleshooting.md) when OpenGL remembers that it has
    opinions.
 
 ## I Want to Understand the Research

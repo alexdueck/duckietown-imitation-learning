@@ -4,4 +4,4 @@ __pycache__/
 configs/*.json
 .python-version
 venv39_gymdt/
-
+duckiebot_captures/

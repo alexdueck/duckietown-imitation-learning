@@ -30,6 +30,15 @@ This page describes responsibilities and common use, not every flag.
 | `analyze_rl_training_run.py` | Generate a standalone HTML report from a PPO run's CSV files |
 | `ppo_control_tests.py` | PPO invariant, Pendulum, and synthetic image-control tests |
 
+## Physical Duckiebot
+
+| Script | Purpose |
+| --- | --- |
+| `capture_duckiebot_camera.py` | Capture one physical Duckiebot camera frame and optional policy-input preview through ROS |
+
+See [Physical camera input check](../getting-started/physical-duckiebot-camera.md)
+for the ROS-container invocation and the input-interface checklist.
+
 ## Supporting Modules
 
 | Module | Purpose |

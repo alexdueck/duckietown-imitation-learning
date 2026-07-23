@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from cli_completion import parse_args_with_completion
 
@@ -48,6 +51,22 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Override the camera topic. The default is "
             "/ROBOT_NAME/camera_node/image/compressed."
+        ),
+    )
+    parser.add_argument(
+        "--robot-ip",
+        default=None,
+        help=(
+            "Explicit robot IP used to resolve ROBOT_NAME.local inside the "
+            "container. Defaults to the numeric host in ROS_MASTER_URI."
+        ),
+    )
+    parser.add_argument(
+        "--no-hosts-fix",
+        action="store_true",
+        help=(
+            "Do not update /etc/hosts when ROBOT_NAME.local is unresolved or "
+            "points to an address different from ROS_MASTER_URI."
         ),
     )
     parser.add_argument(
@@ -111,7 +130,7 @@ def normalize_robot_name(value: str | None) -> str:
     robot_name = value.strip()
     if robot_name.endswith(".local"):
         robot_name = robot_name[: -len(".local")]
-    if not robot_name or "/" in robot_name:
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", robot_name):
         raise ValueError(f"Invalid Duckiebot hostname: {value!r}")
     return robot_name
 
@@ -127,6 +146,124 @@ def camera_topic(robot_name: str, override: str | None) -> str:
 
 def metadata_path_for(output_path: Path) -> Path:
     return output_path.with_suffix(".json")
+
+
+def numeric_robot_ip(
+    explicit_ip: str | None,
+    ros_master_uri: str | None,
+) -> str:
+    candidate = explicit_ip
+    source = "--robot-ip"
+    if candidate is None:
+        source = "ROS_MASTER_URI"
+        if not ros_master_uri:
+            raise ValueError(
+                "ROS_MASTER_URI is not set; provide the current address with --robot-ip"
+            )
+        candidate = urlparse(ros_master_uri).hostname
+    if not candidate:
+        raise ValueError(f"Could not extract a robot address from {source}")
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError as error:
+        raise ValueError(
+            f"{source} does not contain a numeric robot IP: {candidate!r}; "
+            "start GUI tools with --ip or pass --robot-ip"
+        ) from error
+
+
+def _remove_aliases_from_hosts_line(line: str, aliases: set[str]) -> str | None:
+    content, separator, comment = line.partition("#")
+    fields = content.split()
+    if len(fields) < 2:
+        return line
+    remaining_aliases = [alias for alias in fields[1:] if alias not in aliases]
+    if len(remaining_aliases) == len(fields) - 1:
+        return line
+    if not remaining_aliases:
+        return None
+    rebuilt = f"{fields[0]} {' '.join(remaining_aliases)}"
+    if separator:
+        rebuilt += f"  # {comment.strip()}"
+    return rebuilt
+
+
+def _hosts_alias_addresses(
+    lines: list[str],
+    aliases: set[str],
+) -> dict[str, set[str]]:
+    addresses = {alias: set() for alias in aliases}
+    for line in lines:
+        content = line.partition("#")[0]
+        fields = content.split()
+        if len(fields) < 2:
+            continue
+        for alias in aliases.intersection(fields[1:]):
+            addresses[alias].add(fields[0])
+    return addresses
+
+
+def update_hosts_mapping(
+    robot_name: str,
+    robot_ip: str,
+    hosts_path: Path = Path("/etc/hosts"),
+) -> bool:
+    """Map the robot's ROS-advertised hostname to its current IP.
+
+    Returns ``True`` when the hosts file changed. Docker supplies /etc/hosts as
+    a special mounted file, so it must be rewritten in place rather than via an
+    atomic rename.
+    """
+
+    aliases = {robot_name, f"{robot_name}.local"}
+    try:
+        original_lines = hosts_path.read_text().splitlines()
+    except OSError as error:
+        raise RuntimeError(f"Could not read {hosts_path}: {error}") from error
+
+    hosts_addresses = _hosts_alias_addresses(original_lines, aliases)
+    if all(addresses == {robot_ip} for addresses in hosts_addresses.values()):
+        return False
+
+    updated_lines: list[str] = []
+    for line in original_lines:
+        updated_line = _remove_aliases_from_hosts_line(line, aliases)
+        if updated_line is not None:
+            updated_lines.append(updated_line)
+    updated_lines.append(f"{robot_ip} {robot_name}.local {robot_name}")
+
+    try:
+        with hosts_path.open("w") as file:
+            file.write("\n".join(updated_lines) + "\n")
+    except OSError as error:
+        raise RuntimeError(
+            f"Could not update {hosts_path} with {robot_name}.local -> {robot_ip}. "
+            "Run the GUI-tools container as root or use --no-hosts-fix after "
+            "configuring name resolution yourself."
+        ) from error
+    return True
+
+
+def configure_robot_hostname(
+    robot_name: str,
+    *,
+    explicit_ip: str | None,
+    enabled: bool,
+    ros_master_uri: str | None = None,
+    hosts_path: Path = Path("/etc/hosts"),
+) -> tuple[str | None, bool]:
+    if not enabled:
+        return None, False
+    robot_ip = numeric_robot_ip(
+        explicit_ip=explicit_ip,
+        ros_master_uri=(
+            os.environ.get("ROS_MASTER_URI")
+            if ros_master_uri is None
+            else ros_master_uri
+        ),
+    )
+    changed = update_hosts_mapping(robot_name, robot_ip, hosts_path=hosts_path)
+    return robot_ip, changed
 
 
 def ensure_output_paths_available(paths: list[Path], overwrite: bool) -> None:
@@ -286,6 +423,7 @@ def save_capture(
     policy_input_path: Path | None,
     crop_y_start: int,
     image_size: int,
+    robot_ip: str | None = None,
 ) -> dict[str, Any]:
     payload = bytes(message.data)
     if not payload:
@@ -303,6 +441,7 @@ def save_capture(
     channel_means = image_rgb.mean(axis=(0, 1))
     metadata: dict[str, Any] = {
         "robot_name": robot_name,
+        "robot_ip": robot_ip,
         "topic": topic,
         "received_at_utc": datetime.now(timezone.utc).isoformat(),
         "message_format": message_format,
@@ -348,6 +487,11 @@ def main() -> int:
     try:
         robot_name = normalize_robot_name(args.robot_name)
         topic = camera_topic(robot_name, args.topic)
+        robot_ip, hosts_changed = configure_robot_hostname(
+            robot_name,
+            explicit_ip=args.robot_ip,
+            enabled=not args.no_hosts_fix,
+        )
         output_path = args.output.expanduser().resolve()
         metadata_path = (
             args.metadata_output.expanduser().resolve()
@@ -364,6 +508,9 @@ def main() -> int:
             output_paths.append(policy_input_path)
         ensure_output_paths_available(output_paths, overwrite=args.overwrite)
 
+        if robot_ip is not None:
+            status = "updated" if hosts_changed else "already pinned"
+            print(f"Robot hostname: {robot_name}.local -> {robot_ip} ({status})")
         print(f"Waiting for one frame on {topic} ...", flush=True)
         message = capture_message(topic, timeout=args.timeout)
         metadata = save_capture(
@@ -375,6 +522,7 @@ def main() -> int:
             policy_input_path=policy_input_path,
             crop_y_start=args.crop_y_start,
             image_size=args.image_size,
+            robot_ip=robot_ip,
         )
     except (FileExistsError, OSError, RuntimeError, TimeoutError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)

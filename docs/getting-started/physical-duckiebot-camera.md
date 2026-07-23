@@ -13,6 +13,16 @@ The default topic is:
 
 The script does not publish to any robot topic and cannot command the wheels.
 
+On macOS, Docker Desktop usually cannot resolve the Duckiebot's `.local`
+hostname through mDNS. When GUI tools were started with `--ip`, the script
+automatically reads the current numeric robot address from `ROS_MASTER_URI`
+and pins both robot hostnames to that address in `/etc/hosts` inside the
+ephemeral container before subscribing. The explicit mapping is installed even
+if Docker DNS happens to resolve the name, because mixed or slow DNS/mDNS
+resolution can otherwise make direct ROS node connections unreliable.
+No hard-coded robot IP is required. Use `--no-hosts-fix` to disable this or
+`--robot-ip ADDRESS` to override the detected address.
+
 ## Capture a raw frame
 
 First confirm that the robot is visible:
@@ -27,6 +37,7 @@ Duckietown GUI-tools container with the repository mounted into it:
 ```bash
 mkdir -p duckiebot_captures
 dts start_gui_tools \
+  --ip \
   --mount "$(pwd):/workspace" \
   ROBOT_NAME
 ```

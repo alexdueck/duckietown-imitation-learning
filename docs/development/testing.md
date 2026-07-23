@@ -80,13 +80,6 @@ conversion, forward-only operation, acceleration limiting, stale frames,
 invalid policy values, watchdog timeout, and the latched emergency-stop state.
 They do not publish ROS messages or move a Duckiebot.
 
-The dependency-free camera capture helper checks include dynamic robot
-hostname mapping for Docker Desktop:
-
-```bash
-python capture_duckiebot_camera_tests.py
-```
-
 ## Behavioral Checks
 
 Before trusting a reward change, inspect it in

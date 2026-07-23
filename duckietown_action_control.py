@@ -122,6 +122,8 @@ class DuckietownActionControl:
 
     @staticmethod
     def _scale_wheels_numpy(wheels: np.ndarray) -> np.ndarray:
+        import numpy as np
+
         scale = np.maximum(
             1.0,
             np.max(np.abs(wheels), axis=-1, keepdims=True),
@@ -130,6 +132,8 @@ class DuckietownActionControl:
 
     @staticmethod
     def _scale_wheels_tensor(wheels: torch.Tensor) -> torch.Tensor:
+        import torch
+
         scale = torch.maximum(
             torch.ones_like(wheels[..., :1]),
             wheels.abs().amax(dim=-1, keepdim=True),

@@ -98,6 +98,26 @@ Use the JSON `rgb_channel_mean_0_255` values as a diagnostic rather than a
 pass/fail criterion. Channel means depend strongly on the scene. A visual red
 object appearing blue is a more reliable indication of a channel-order error.
 
+## Inspect checkpoint actions on captured images
+
+The offline inspector detects IL checkpoints through `model_state_dict` and
+PPO checkpoints through `policy_state_dict`. It shows the deterministic wheel
+commands that would be sent to gym-duckietown, together with a qualitative
+direction arrow:
+
+```bash
+python view_model_actions_on_images.py \
+  duckiebot_captures \
+  ~/duckietown/checkpoints/PATH/TO/best.pt
+```
+
+Use `D` for the next image, `A` for the previous image, and `Escape` or `Q` to
+exit. PPO preprocessing and action mapping are read from the checkpoint. Older
+IL checkpoints trained on `images_processed` do not store the legacy crop
+explicitly; the inspector infers `crop_y_start=200` and a JPEG round trip for
+those checkpoints. Override the inference with `--crop-y-start` or
+`--jpeg-stage` when the training preprocessing differed.
+
 ## Troubleshooting
 
 If the script reports that ROS Python packages are unavailable, it was started

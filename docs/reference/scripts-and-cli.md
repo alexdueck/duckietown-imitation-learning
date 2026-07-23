@@ -35,6 +35,7 @@ This page describes responsibilities and common use, not every flag.
 | Script | Purpose |
 | --- | --- |
 | `capture_duckiebot_camera.py` | Capture one physical Duckiebot camera frame and optional policy-input preview through ROS |
+| `view_model_actions_on_images.py` | View deterministic IL/PPO wheel commands on a directory of physical camera images |
 
 See [Physical camera input check](../getting-started/physical-duckiebot-camera.md)
 for the ROS-container invocation and the input-interface checklist.

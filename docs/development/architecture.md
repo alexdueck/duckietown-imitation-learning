@@ -29,6 +29,7 @@ must remain consistent across tools.
 | `duckietown_rewards.py` | Reward selection, state tracking, breakdowns, and compatibility patch |
 | `velopose_reward.py` | Pure custom reward equations |
 | `duckietown_action_control.py` | Policy-control to wheel-action mapping |
+| `duckiebot_hardware_control.py` | Fail-closed wheel-action to physical chassis-command mapping |
 | `gym_duckietown_start_config.py` | Seed/pose configuration, validation, and sampling |
 
 ## Shared Modules
@@ -77,6 +78,13 @@ The actor always produces normalized policy controls. Only
 `DuckietownActionControl` knows how controls map to wheel commands. The same
 mapping is used in rollout collection, deterministic evaluation, diagnostics,
 checkpoint metadata, and live evaluation.
+
+Physical deployment adds a second boundary after this mapping.
+`PhysicalDuckiebotControl` maps normalized wheels to bounded chassis
+velocities, tracks arming and emergency-stop state, limits acceleration, and
+fails closed on invalid or stale inputs and watchdog timeout. It deliberately
+does not import ROS or publish commands; transport belongs to the physical
+runtime.
 
 ## Configuration Boundary
 

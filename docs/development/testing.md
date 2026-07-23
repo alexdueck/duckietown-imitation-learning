@@ -69,6 +69,24 @@ xvfb-run -a \
   python -c "from gym_duckietown.simulator import Simulator; env=Simulator(map_name='loop_empty', domain_rand=False); obs=env.reset(); print(obs.shape); env.close()"
 ```
 
+## Physical Control Safety Tests
+
+```bash
+python duckiebot_hardware_control_tests.py
+```
+
+These checks cover scalar checkpoint action mapping, physical `v`/`omega`
+conversion, forward-only operation, acceleration limiting, stale frames,
+invalid policy values, watchdog timeout, and the latched emergency-stop state.
+They do not publish ROS messages or move a Duckiebot.
+
+The dependency-free camera capture helper checks include dynamic robot
+hostname mapping for Docker Desktop:
+
+```bash
+python capture_duckiebot_camera_tests.py
+```
+
 ## Behavioral Checks
 
 Before trusting a reward change, inspect it in

@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+from typing import TYPE_CHECKING, Sequence
 
-import numpy as np
-import torch
+if TYPE_CHECKING:
+    import numpy as np
+    import torch
 
 
 ACTION_MODE_CHOICES = ("wheel", "throttle_steering")
@@ -51,6 +54,8 @@ class DuckietownActionControl:
         return ("throttle", "steering")
 
     def to_wheels_numpy(self, controls: np.ndarray) -> np.ndarray:
+        import numpy as np
+
         controls = np.asarray(controls, dtype=np.float32)
         self._check_last_dimension(controls.shape[-1])
         if self.mode == "wheel":
@@ -71,6 +76,8 @@ class DuckietownActionControl:
         return self._scale_wheels_numpy(wheels)
 
     def to_wheels_tensor(self, controls: torch.Tensor) -> torch.Tensor:
+        import torch
+
         self._check_last_dimension(controls.shape[-1])
         if self.mode == "wheel":
             return self._scale_wheels_tensor(controls)
@@ -84,6 +91,34 @@ class DuckietownActionControl:
         steering = steering_control * self.max_steering
         wheels = torch.stack((throttle - steering, throttle + steering), dim=-1)
         return self._scale_wheels_tensor(wheels)
+
+    def to_wheels_pair(self, controls: Sequence[float]) -> tuple[float, float]:
+        """Map one policy-control sample to normalized wheel commands.
+
+        This scalar variant has no NumPy or PyTorch dependency and is intended
+        for deployment adapters, safety checks, and lightweight tests.
+        """
+
+        values = tuple(float(value) for value in controls)
+        self._check_last_dimension(len(values))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("Policy controls must contain finite values only")
+
+        if self.mode == "wheel":
+            left, right = values
+        else:
+            if self.fixed_throttle is None:
+                throttle = 0.5 * (values[0] + 1.0) * self.max_throttle
+                steering_control = values[1]
+            else:
+                throttle = self.fixed_throttle
+                steering_control = values[0]
+            steering = steering_control * self.max_steering
+            left = throttle - steering
+            right = throttle + steering
+
+        scale = max(1.0, abs(left), abs(right))
+        return left / scale, right / scale
 
     @staticmethod
     def _scale_wheels_numpy(wheels: np.ndarray) -> np.ndarray:

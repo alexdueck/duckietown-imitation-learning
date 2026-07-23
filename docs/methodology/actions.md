@@ -90,3 +90,82 @@ learn speed and steering through two coupled motors.
 Throttle/steering control adds a useful inductive bias. Fixed throttle goes
 further and removes longitudinal control entirely. These are different
 research conditions and must be recorded with every result.
+
+## Physical Duckiebot Chassis Adapter
+
+Simulator wheel commands are not sent directly to physical motors. The
+physical adapter composes the checkpoint's `DuckietownActionControl` with
+`PhysicalDuckiebotControl`:
+
+```text
+policy controls
+    -> checkpoint action mapping
+    -> normalized left/right wheels
+    -> normalized linear/angular motion
+    -> physical v/omega limits
+    -> acceleration and coupled-command limits
+    -> ChassisCommand
+```
+
+For normalized wheel commands `l` and `r`, the chassis coordinates are:
+
+```text
+linear_normalized  = (l + r) / 2
+angular_normalized = (r - l) / 2
+v     = linear_normalized  * max_linear_velocity
+omega = angular_normalized * max_angular_velocity
+```
+
+Positive `omega` therefore corresponds to the right wheel moving faster than
+the left wheel. The adapter also enforces the coupled envelope:
+
+```text
+abs(v / v_max) + abs(omega / omega_max) <= 1
+```
+
+The initial defaults are deliberately conservative and are not robot
+identification results:
+
+| Limit | Default |
+| --- | ---: |
+| Maximum linear velocity | `0.10 m/s` |
+| Maximum angular velocity | `1.50 rad/s` |
+| Maximum linear acceleration | `0.25 m/s^2` |
+| Maximum angular acceleration | `3.00 rad/s^2` |
+| Command timeout | `0.50 s` |
+| Maximum frame age | `0.50 s` |
+| Nominal control period | `0.10 s` |
+| Reverse motion | disabled |
+
+Minimal integration after loading a checkpoint:
+
+```python
+from duckiebot_hardware_control import (
+    PhysicalControlLimits,
+    hardware_control_from_checkpoint_config,
+)
+
+hardware = hardware_control_from_checkpoint_config(
+    checkpoint["config"],
+    PhysicalControlLimits(max_linear_velocity=0.10),
+)
+hardware.arm()
+
+command = hardware.update(
+    deterministic_policy_controls,
+    frame_age=measured_frame_age_seconds,
+)
+# Publish command.linear_velocity and command.angular_velocity only through
+# the physical runtime's supported chassis-command topic.
+```
+
+The adapter starts disarmed. Movement requires an explicit `arm()`. Invalid
+policy controls, stale frames, watchdog timeout, disarming, and emergency stop
+all produce an immediate zero command. Input and watchdog faults also disarm
+the adapter, so movement cannot resume without an explicit `arm()`. Emergency
+stop is latched: clearing it does not arm the controller again.
+
+The module is ROS-independent. A physical runtime must publish accepted
+`linear_velocity` and `angular_velocity` values, continuously call the
+watchdog, and publish zero whenever the returned command is stopped. A
+watchdog that is not scheduled by the runtime cannot stop hardware by itself.

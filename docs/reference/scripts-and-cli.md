@@ -46,12 +46,19 @@ for the ROS-container invocation and the input-interface checklist.
 | `duckietown_paths.py` | Shared data/checkpoint paths |
 | `rl_models.py` | CNN policies, tanh log probability, and IL actor loading |
 | `duckietown_action_control.py` | Policy-control to wheel mapping |
+| `duckiebot_hardware_control.py` | Physical `v`/`omega` mapping, arming, slew limits, watchdog, and E-stop |
 | `velopose_reward.py` | Custom reward mathematics |
 | `duckietown_rewards.py` | Simulator reward adapter and compatibility patch |
 | `gym_duckietown_start_config.py` | Seed and pose configuration |
 | `duckiematrix_telemetry.py` | Duckiematrix state telemetry |
 | `rl_rewards.py` | Duckiematrix reward adapters |
 | `cli_completion.py` | Optional argcomplete hook |
+
+The physical-control checks run without ROS:
+
+```bash
+python duckiebot_hardware_control_tests.py
+```
 
 ## CLI Completion
 

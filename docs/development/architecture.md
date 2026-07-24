@@ -42,6 +42,17 @@ must remain consistent across tools.
 | `ppo_control_tests.py` | PPO invariant, Pendulum, and image-control tests |
 | `preprocess.py` | Legacy optional offline image preprocessing |
 
+## Physical Duckiebot Entry Points
+
+| File | Responsibility |
+| --- | --- |
+| `host_ps4_controller_bridge.py` | Read the macOS SDL GameController and serve normalized input states over TCP |
+| `physical_duckiebot_teleop.py` | Arming, emergency stop, input mixing, physical limits, camera subscription, rosbridge command transport, and recording |
+| `run_physical_duckiebot_teleop.sh` | Load ROS Noetic and the Duckietown catkin workspace before starting teleop in GUI tools |
+| `duckiebot_teleop_input.py` | Device adapters, bridge protocol, deadzone, and keyboard-only ramps |
+| `duckiebot_dataset_recorder.py` | Stream aligned compressed camera frames and effective wheel-equivalent actions |
+| `duckiebot_hardware_control.py` | ROS-independent fail-closed conversion from normalized wheels to bounded `v`/`omega` |
+
 ## PPO Trainer Structure
 
 The main gym-duckietown trainer currently owns:
@@ -85,6 +96,165 @@ velocities, tracks arming and emergency-stop state, limits acceleration, and
 fails closed on invalid or stale inputs and watchdog timeout. It deliberately
 does not import ROS or publish commands; transport belongs to the physical
 runtime.
+
+## Physical Duckiebot Control Architecture
+
+The physical runtime spans the macOS host, a GUI-tools container, and the
+onboard Duckietown stack. This repository does not install or replace code on
+the robot.
+
+| Component | Location | Ownership |
+| --- | --- | --- |
+| PS4 controller and `host_ps4_controller_bridge.py` | macOS host | This repository |
+| `physical_duckiebot_teleop.py` | GUI-tools container | This repository |
+| `rosbridge_websocket` | Physical Duckiebot | ROS/Duckietown |
+| `car_cmd_switch_node` | Physical Duckiebot | Duckietown `dt-core` |
+| `kinematics_node` | Physical Duckiebot | Duckietown `dt-core` |
+| `wheels_driver_node` | Physical Duckiebot | Duckietown hardware stack |
+
+The control path is:
+
+```text
+PS4 over Bluetooth
+    |
+    v
+host_ps4_controller_bridge.py on macOS
+    |
+    | TCP input-state stream to container port 8765
+    v
+physical_duckiebot_teleop.py in GUI tools
+    |
+    | deadzone, arming, emergency stop, wheel mixing, physical limits
+    | outbound WebSocket connection to ROBOT_IP:9001
+    v
+rosbridge_websocket on the Duckiebot
+    |
+    | local ROS publication: Twist2DStamped
+    v
+/ROBOT_NAME/joy_mapper_node/car_cmd
+    |
+    v
+car_cmd_switch_node
+    |
+    | /ROBOT_NAME/car_cmd_switch_node/cmd
+    v
+kinematics_node
+    |
+    | calibrated WheelsCmdStamped
+    v
+wheels_driver_node
+    |
+    v
+motor hardware
+```
+
+The camera and recording path is independent:
+
+```text
+camera_node on the Duckiebot
+    |
+    | ROS CompressedImage; subscriber connection initiated by GUI tools
+    v
+LatestCamera in physical_duckiebot_teleop.py
+    |
+    | newest unique frame + effective command sent for that control tick
+    v
+duckiebot_dataset_recorder.py
+    |
+    +-- images/*
+    +-- actions.csv
+    +-- meta.json
+```
+
+### Why commands use rosbridge on Docker Desktop
+
+ROS 1 uses its master for discovery, but topic data is peer-to-peer. After
+discovering a publisher, the subscriber connects back to the publisher's
+advertised TCPROS address. A `rospy.Publisher` inside Docker Desktop advertised
+an address such as:
+
+```text
+http://docker-desktop:RANDOM_PORT/
+```
+
+The physical robot could register the subscriber through the shared ROS
+master, but could not resolve or reach that container-internal callback. This
+failure is directional: camera subscription works because the container
+connects to a publisher on the robot.
+
+For commands, the container therefore opens an outbound connection to the
+fixed rosbridge server on the robot:
+
+```text
+GUI-tools container --> ws://ROBOT_IP:9001
+```
+
+From the robot's perspective this is an incoming WebSocket connection. Over
+the established bidirectional socket, teleop sends rosbridge `advertise` and
+`publish` operations. `rosbridge_websocket` then acts as a ROS publisher
+onboard the robot, where `car_cmd_switch_node` can reach it locally. Native
+Linux deployments with a robot-reachable ROS host may opt into direct TCPROS
+with `--command-transport ros`.
+
+### Command-source selection
+
+`car_cmd_switch_node` starts with `current_src_name = "joystick"`. Its default
+configuration also maps the FSM state `NORMAL_JOYSTICK_CONTROL` to the
+`joystick` source:
+
+```text
+joystick source --> joy_mapper_node/car_cmd
+lane source     --> lane_controller_node/car_cmd
+stop source     --> simple_stop_controller_node/car_cmd
+```
+
+The current teleop runtime does not publish an FSM state or explicitly switch
+the robot into joystick mode. It relies on the onboard switch starting in
+`joystick`. If an FSM later selects lane following or stop, PS4 messages remain
+published but are not forwarded to kinematics.
+
+`speed_gain` and `steer_gain` belong to `joy_mapper_node`'s conversion from
+`sensor_msgs/Joy` to `Twist2DStamped`. Our runtime already publishes
+`Twist2DStamped` on the mapper's output topic, so those gains are reference
+values rather than downstream multipliers. `kinematics_node` still applies
+`v_max`, `omega_max`, geometry, gain, trim, motor constant, and output limits.
+
+### DTPS alternative used by Duckietown keyboard control
+
+The official command:
+
+```text
+dts duckiebot keyboard_control ROBOT_NAME
+```
+
+uses a different architecture. Its Duckietown Viewer backend connects to the
+robot's fixed DTPS switchboard endpoint:
+
+```text
+viewer backend --> http://ROBOT_IP:11911/
+```
+
+It reads the active kinematics calibration from the Duckietown KV store,
+computes differential PWM in the viewer backend, and publishes
+`DifferentialPWM` directly to:
+
+```text
+/ROBOT_NAME/actuator/wheels/base/pwm
+```
+
+This avoids ROS 1 discovery, rosbridge, `car_cmd_switch_node`, and the ROS
+`kinematics_node`. It does not ignore calibration: it reproduces the inverse
+kinematics calculation using `baseline`, `radius`, `k`, `gain`, `trim`, and
+`limit`.
+
+DTPS is a viable alternative transport for this repository's PS4 control,
+especially if matching the current official Duckietown viewer architecture is
+more important than retaining the ROS command-selection pipeline. The current
+implementation deliberately keeps rosbridge plus `Twist2DStamped` so the
+onboard `car_cmd_switch_node` and `kinematics_node` remain authoritative. A
+future DTPS backend should be a separate command transport and must preserve
+arming, emergency-stop behavior, calibration handling, and the exact action
+labels written to imitation-learning datasets.
 
 ## Configuration Boundary
 

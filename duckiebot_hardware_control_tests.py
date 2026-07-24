@@ -106,6 +106,24 @@ class PhysicalDuckiebotControlTests(unittest.TestCase):
         self.assertAlmostEqual(command.linear_velocity, 0.02)
         self.assertTrue(command.linear_rate_limited)
 
+    def test_rate_limiting_can_be_disabled_for_analog_control(self) -> None:
+        limits = PhysicalControlLimits(
+            max_linear_velocity=0.41,
+            max_angular_velocity=8.0,
+            max_linear_acceleration=0.01,
+            max_angular_acceleration=0.01,
+            command_timeout=0.50,
+            max_frame_age=0.25,
+            nominal_control_period=0.10,
+            forward_only=False,
+            rate_limit_commands=False,
+        )
+        control = self.make_control(limits)
+        control.arm(timestamp=0.0)
+        command = control.update((1.0, 1.0), timestamp=0.1, frame_age=0.0)
+        self.assertAlmostEqual(command.linear_velocity, 0.41)
+        self.assertFalse(command.linear_rate_limited)
+
     def test_stale_frame_stops_immediately(self) -> None:
         control = self.make_control()
         control.arm(timestamp=0.0)

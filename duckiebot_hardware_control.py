@@ -31,6 +31,7 @@ class PhysicalControlLimits:
     max_frame_age: float = 0.50
     nominal_control_period: float = 0.10
     forward_only: bool = True
+    rate_limit_commands: bool = True
 
     def __post_init__(self) -> None:
         positive_fields = (
@@ -194,17 +195,21 @@ class PhysicalDuckiebotControl:
 
         target_linear = normalized_linear * self.limits.max_linear_velocity
         target_angular = normalized_angular * self.limits.max_angular_velocity
-        delta_time = self._delta_time(now)
-        linear, linear_limited = self._move_towards(
-            self._current_linear_velocity,
-            target_linear,
-            self.limits.max_linear_acceleration * delta_time,
-        )
-        angular, angular_limited = self._move_towards(
-            self._current_angular_velocity,
-            target_angular,
-            self.limits.max_angular_acceleration * delta_time,
-        )
+        if self.limits.rate_limit_commands:
+            delta_time = self._delta_time(now)
+            linear, linear_limited = self._move_towards(
+                self._current_linear_velocity,
+                target_linear,
+                self.limits.max_linear_acceleration * delta_time,
+            )
+            angular, angular_limited = self._move_towards(
+                self._current_angular_velocity,
+                target_angular,
+                self.limits.max_angular_acceleration * delta_time,
+            )
+        else:
+            linear, angular = target_linear, target_angular
+            linear_limited = angular_limited = False
         linear, angular, coupled_limited = self._enforce_coupled_limit(
             linear,
             angular,

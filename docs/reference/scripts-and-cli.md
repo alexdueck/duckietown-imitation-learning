@@ -13,6 +13,8 @@ This page describes responsibilities and common use, not every flag.
 | Script | Purpose |
 | --- | --- |
 | `imitation_learning.py` | Drive through gym-duckiematrix, display telemetry/rewards, and collect image/action datasets |
+| `physical_duckiebot_teleop.py` | Drive a physical Duckiebot with keyboard or PS4 controller and record aligned camera/action datasets |
+| `host_ps4_controller_bridge.py` | Forward a macOS Bluetooth controller safely into the ROS container |
 | `data_viewer.py` | Inspect collected images and the associated action, reward, and lane values |
 | `preprocess.py` | Legacy optional crop/resize/JPEG preprocessing |
 | `train_imitation_learning.py` | Train MobileNetV3-Small or ResNet-18 wheel-action regression |

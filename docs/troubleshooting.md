@@ -1,5 +1,61 @@
 # Troubleshooting
 
+## `dts start_gui_tools` cannot find `xhost` on macOS
+
+The Duckietown shell invokes XQuartz's `xhost` before it starts the GUI-tools
+container. A traceback ending in `FileNotFoundError: ... 'xhost'` means
+XQuartz is missing or `/opt/X11/bin` is absent from `PATH`; it is unrelated to
+the active Python virtual environment.
+
+```bash
+brew install --cask xquartz
+```
+
+Log out of macOS and back in after the first installation, start XQuartz, and
+verify:
+
+```bash
+open -a XQuartz
+command -v xhost
+```
+
+The expected path is `/opt/X11/bin/xhost`. For the current terminal, a missing
+path entry can be repaired with:
+
+```bash
+export PATH="/opt/X11/bin:$PATH"
+```
+
+An adjacent warning about a missing Avahi socket is a separate mDNS issue.
+Use `dts start_gui_tools --ip ...` when connecting to the robot by address.
+
+## `No module named 'rospy'` with `docker exec`
+
+`docker exec ... python3` does not run the Duckietown launcher's interactive
+shell initialization. Use the repository wrapper, which sources both ROS
+Noetic and the Duckietown catkin workspace before starting Python:
+
+```bash
+docker exec -it duckiebot-camera-tools \
+  bash /workspace/run_physical_duckiebot_teleop.sh \
+  realbot \
+  --input ps4-bridge \
+  --output-dir /workspace/duckiebot_recordings
+```
+
+## Inputs arrive but the physical Duckiebot does not move
+
+With Docker Desktop, a normal `rospy.Publisher` advertises a callback such as
+`http://docker-desktop:RANDOM_PORT/`. The physical robot cannot resolve or
+reach that container-internal TCPROS endpoint. Camera subscription still
+works because that connection is initiated in the opposite direction.
+
+`physical_duckiebot_teleop.py` therefore publishes commands through the
+robot's outbound-reachable rosbridge WebSocket by default. The current
+Duckiebot image exposes it on port 9001. `--command-transport ros` remains
+available for native Linux networking where the robot can reach the ROS node
+directly.
+
 ## `pip show gym-duckietown` Says Not Found
 
 The distribution is named `duckietown-gym-daffy`; the import package is

@@ -26,11 +26,11 @@ from torchvision import transforms
 from duckietown.sdk.middleware.dtps.base import DTPS
 from gym_duckiematrix.DB21J import DuckiematrixDB21JEnv
 
-from cli_completion import parse_args_with_completion
-from duckietown_paths import RL_PPO_DUCKIEMATRIX_CHECKPOINT_DIR
+from dt_utils.cli_completion import parse_args_with_completion
+from dt_utils.duckietown_paths import RL_PPO_DUCKIEMATRIX_CHECKPOINT_DIR
 from live_eval_imitation_policy import observation_to_rgb, shutdown_dtps
-from rl_models import TanhGaussianPolicy, load_imitation_actor
-from rl_rewards import (
+from dt_utils.rl_models import TanhGaussianPolicy, load_imitation_actor
+from dt_utils.rl_rewards import (
     KalaposRewardCalculator,
     REWARD_FUNCTION_CHOICES,
     RewardMetadata,
@@ -80,7 +80,7 @@ class PPOConfig:
 class ValueNetwork(nn.Module):
     def __init__(self, model_name: str, pretrained: bool = False) -> None:
         super().__init__()
-        from rl_models import build_encoder
+        from dt_utils.rl_models import build_encoder
 
         self.encoder, features_dim = build_encoder(model_name, pretrained=pretrained)
         self.value = nn.Linear(features_dim, 1)

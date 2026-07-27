@@ -17,12 +17,12 @@ import torch
 from PIL import Image
 from torchvision import transforms
 
-from cli_completion import parse_args_with_completion
-from duckietown_paths import (
+from dt_utils.cli_completion import parse_args_with_completion
+from dt_utils.duckietown_paths import (
     EVALUATION_SCREENSHOT_DIR,
     IL_GYM_DUCKIETOWN_EVALUATION_DIR,
 )
-from duckietown_rewards import (
+from dt_utils.duckietown_rewards import (
     GymDuckietownRewardCalculator,
     REWARD_FUNCTION_CHOICES,
     format_wheel_action,
@@ -52,7 +52,7 @@ from train_imitation_learning import (
     build_model,
     resolve_device,
 )
-from velopose_reward import VD2PP_DISTANCE_SQUARED_WEIGHT
+from dt_utils.velopose_reward import VD2PP_DISTANCE_SQUARED_WEIGHT
 
 
 SIDEBAR_WIDTH = 460
@@ -191,7 +191,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--screenshot-path",
         type=Path,
-        default=EVALUATION_SCREENSHOT_DIR / "gym_duckietown_il_eval.png",
+        default=EVALUATION_SCREENSHOT_DIR / "gym_dt_utils_eval.png",
     )
     parser.add_argument(
         "--log-level",

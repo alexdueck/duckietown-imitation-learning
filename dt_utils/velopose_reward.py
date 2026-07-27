@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Shared velocity-and-pose reward calculation."""
 
 from __future__ import annotations

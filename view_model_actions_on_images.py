@@ -18,12 +18,12 @@ import torch
 from PIL import Image, ImageOps
 from torchvision import transforms
 
-from cli_completion import parse_args_with_completion
-from duckietown_action_control import (
+from dt_utils.cli_completion import parse_args_with_completion
+from dt_utils.duckietown_action_control import (
     DuckietownActionControl,
     action_control_from_config,
 )
-from rl_models import TanhGaussianPolicy
+from dt_utils.rl_models import TanhGaussianPolicy
 from train_imitation_learning import (
     IMAGENET_MEAN,
     IMAGENET_STD,

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Optional argcomplete integration shared by command-line scripts."""
 
 import argparse

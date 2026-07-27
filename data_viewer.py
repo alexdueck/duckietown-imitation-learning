@@ -11,9 +11,9 @@ from typing import Any
 import numpy as np
 import pygame
 
-from cli_completion import parse_args_with_completion
-from duckietown_paths import IMITATION_LEARNING_TRAIN_DATA_DIR
-from duckiematrix_telemetry import TELEMETRY_COLUMNS
+from dt_utils.cli_completion import parse_args_with_completion
+from dt_utils.duckietown_paths import IMITATION_LEARNING_TRAIN_DATA_DIR
+from dt_utils.duckiematrix_telemetry import TELEMETRY_COLUMNS
 
 
 DEFAULT_DATA_DIR = IMITATION_LEARNING_TRAIN_DATA_DIR

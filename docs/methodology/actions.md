@@ -140,7 +140,7 @@ identification results:
 Minimal integration after loading a checkpoint:
 
 ```python
-from duckiebot_hardware_control import (
+from dt_utils.duckiebot_hardware_control import (
     PhysicalControlLimits,
     hardware_control_from_checkpoint_config,
 )

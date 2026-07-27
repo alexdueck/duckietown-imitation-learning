@@ -24,8 +24,8 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import models, transforms
 
-from cli_completion import parse_args_with_completion
-from duckietown_paths import (
+from dt_utils.cli_completion import parse_args_with_completion
+from dt_utils.duckietown_paths import (
     IMITATION_LEARNING_CHECKPOINT_DIR,
     IMITATION_LEARNING_DATA_DIR,
 )

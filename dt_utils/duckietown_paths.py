@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Shared filesystem locations for Duckietown experiments."""
 
 from pathlib import Path
@@ -20,3 +19,4 @@ EVALUATION_DATA_DIR = DATA_ROOT / "evaluations"
 IL_GYM_DUCKIETOWN_EVALUATION_DIR = EVALUATION_DATA_DIR / "il_gym_duckietown"
 RL_GYM_DUCKIETOWN_EVALUATION_DIR = EVALUATION_DATA_DIR / "rl_gym_duckietown"
 EVALUATION_SCREENSHOT_DIR = EVALUATION_DATA_DIR / "screenshots"
+PHYSICAL_MODEL_CONTROL_DATA_DIR = DATA_ROOT / "physical_model_control"

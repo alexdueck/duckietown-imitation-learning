@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Small continuous-control checks for the PPO math used by the trainers."""
 
 from __future__ import annotations
@@ -10,7 +9,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from rl_models import TanhGaussianPolicy, tanh_normal_log_prob
+from dt_utils.rl_models import TanhGaussianPolicy, tanh_normal_log_prob
 from train_rl_ppo_gym_duckietown import compute_gae
 
 

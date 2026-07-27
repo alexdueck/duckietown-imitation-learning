@@ -8,7 +8,7 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
-from cli_completion import parse_args_with_completion
+from dt_utils.cli_completion import parse_args_with_completion
 
 
 def preprocess_image(

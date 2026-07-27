@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Unit tests for physical Duckiebot action adaptation and safety state."""
 
 from __future__ import annotations
@@ -6,8 +5,8 @@ from __future__ import annotations
 import math
 import unittest
 
-from duckietown_action_control import DuckietownActionControl
-from duckiebot_hardware_control import (
+from dt_utils.duckietown_action_control import DuckietownActionControl
+from dt_utils.duckiebot_hardware_control import (
     PhysicalControlLimits,
     PhysicalDuckiebotControl,
     hardware_control_from_checkpoint_config,

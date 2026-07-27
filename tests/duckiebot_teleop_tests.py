@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Unit tests for device-neutral teleop and physical dataset recording."""
 
 from __future__ import annotations
@@ -9,8 +8,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from duckiebot_dataset_recorder import PhysicalDatasetRecorder
-from duckiebot_teleop_input import (
+from dt_utils.duckiebot_dataset_recorder import PhysicalDatasetRecorder
+from dt_utils.duckiebot_teleop_input import (
     ActionMixer,
     DriveProfile,
     InputState,
@@ -18,7 +17,10 @@ from duckiebot_teleop_input import (
     input_state_from_json,
 )
 from physical_duckiebot_teleop import _effective_wheels
-from duckiebot_hardware_control import ChassisCommand, PhysicalControlLimits
+from dt_utils.duckiebot_hardware_control import (
+    ChassisCommand,
+    PhysicalControlLimits,
+)
 
 
 class ActionMixerTests(unittest.TestCase):
@@ -92,7 +94,7 @@ class ActionMixerTests(unittest.TestCase):
             def get_axis(self, index):
                 return 0.0
 
-        from duckiebot_teleop_input import PS4Input
+        from dt_utils.duckiebot_teleop_input import PS4Input
 
         joystick = FakeJoystick()
         controller = PS4Input(FakePygame(), joystick)

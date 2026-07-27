@@ -22,10 +22,10 @@ except ImportError:
 
 from gym_duckiematrix.DB21J import DuckiematrixDB21JEnv
 from duckietown.sdk.middleware.dtps.base import DTPS
-from cli_completion import parse_args_with_completion
-from duckietown_paths import IMITATION_LEARNING_TRAIN_DATA_DIR
-from duckiematrix_telemetry import TELEMETRY_COLUMNS, collect_state_telemetry, format_telemetry_value
-from rl_rewards import DISPLAY_REWARD_FUNCTIONS, KalaposRewardCalculator, compute_reward_breakdowns
+from dt_utils.cli_completion import parse_args_with_completion
+from dt_utils.duckietown_paths import IMITATION_LEARNING_TRAIN_DATA_DIR
+from dt_utils.duckiematrix_telemetry import TELEMETRY_COLUMNS, collect_state_telemetry, format_telemetry_value
+from dt_utils.rl_rewards import DISPLAY_REWARD_FUNCTIONS, KalaposRewardCalculator, compute_reward_breakdowns
 
 
 # ----------------------------

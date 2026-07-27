@@ -16,15 +16,15 @@ from typing import Any
 import numpy as np
 import pyglet
 
-from cli_completion import parse_args_with_completion
-from duckietown_paths import EVALUATION_SCREENSHOT_DIR
-from gym_duckietown_start_config import (
+from dt_utils.cli_completion import parse_args_with_completion
+from dt_utils.duckietown_paths import EVALUATION_SCREENSHOT_DIR
+from dt_utils.gym_duckietown_start_config import (
     TrainingPose,
     append_training_pose,
     apply_env_start_pose,
     load_pose_file,
 )
-from duckietown_rewards import (
+from dt_utils.duckietown_rewards import (
     REWARD_FUNCTION_CHOICES,
     compute_reward_breakdowns,
     create_reward_calculators,
@@ -34,7 +34,7 @@ from duckietown_rewards import (
     patch_duckietown_world_dynamics,
     reset_reward_calculators,
 )
-from velopose_reward import VD2PP_DISTANCE_SQUARED_WEIGHT
+from dt_utils.velopose_reward import VD2PP_DISTANCE_SQUARED_WEIGHT
 
 
 SIDEBAR_WIDTH = 500

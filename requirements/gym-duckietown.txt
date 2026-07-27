@@ -21,3 +21,4 @@ PyGeometry-z6
 zuper-commons-z6
 torch
 torchvision
+websocket-client

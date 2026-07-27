@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from cli_completion import parse_args_with_completion
+from dt_utils.cli_completion import parse_args_with_completion
 
 
 DEFAULT_TIMEOUT_SECONDS = 15.0

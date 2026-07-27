@@ -8,7 +8,7 @@ smoke tests and visual validation.
 Run after changing Python files:
 
 ```bash
-python -m py_compile *.py
+python -m compileall -q . -x '/(checkpoints|duckiebot_captures|venv)/'
 ```
 
 This catches syntax and import-independent compilation errors.
@@ -16,7 +16,7 @@ This catches syntax and import-independent compilation errors.
 ## PPO Invariant Test
 
 ```bash
-python ppo_control_tests.py --test invariant
+python -m tests.ppo_control_tests --test invariant
 ```
 
 This verifies:
@@ -29,7 +29,7 @@ This verifies:
 ## Image-Control Test
 
 ```bash
-python ppo_control_tests.py --test image
+python -m tests.ppo_control_tests --test image
 ```
 
 This constructs a simple image-based continuous-control problem and checks that
@@ -40,7 +40,7 @@ Use `--image-rollouts` to change test length.
 ## Pendulum Test
 
 ```bash
-python ppo_control_tests.py --test pendulum
+python -m tests.ppo_control_tests --test pendulum
 ```
 
 This checks the same PPO update logic on Gym's `Pendulum-v1`. The default
@@ -49,7 +49,7 @@ This checks the same PPO update logic on Gym's `Pendulum-v1`. The default
 Run all checks with:
 
 ```bash
-python ppo_control_tests.py --test all
+python -m tests.ppo_control_tests --test all
 ```
 
 ## gym-duckietown Smoke Test
@@ -72,7 +72,7 @@ xvfb-run -a \
 ## Physical Control Safety Tests
 
 ```bash
-python duckiebot_hardware_control_tests.py
+python -m unittest discover -s tests -t . -p '*_tests.py'
 ```
 
 These checks cover scalar checkpoint action mapping, physical `v`/`omega`

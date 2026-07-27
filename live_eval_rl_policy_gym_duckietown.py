@@ -14,21 +14,21 @@ import numpy as np
 import pyglet
 import torch
 
-from cli_completion import parse_args_with_completion
-from duckietown_action_control import (
+from dt_utils.cli_completion import parse_args_with_completion
+from dt_utils.duckietown_action_control import (
     DuckietownActionControl,
     action_control_from_config,
 )
-from duckietown_paths import (
+from dt_utils.duckietown_paths import (
     EVALUATION_SCREENSHOT_DIR,
     RL_GYM_DUCKIETOWN_EVALUATION_DIR,
 )
-from duckietown_rewards import (
+from dt_utils.duckietown_rewards import (
     GymDuckietownRewardCalculator,
     REWARD_FUNCTION_CHOICES,
     format_wheel_action,
 )
-from gym_duckietown_start_config import (
+from dt_utils.gym_duckietown_start_config import (
     TrainingPose,
     apply_env_start_pose,
     load_start_config,
@@ -53,7 +53,7 @@ from manual_control_gym_duckietown import (
     prepare_window_2d,
     save_screenshot,
 )
-from rl_models import TanhGaussianPolicy
+from dt_utils.rl_models import TanhGaussianPolicy
 from train_imitation_learning import resolve_device
 from train_rl_ppo_gym_duckietown import make_transform, preprocess, reset_raw
 

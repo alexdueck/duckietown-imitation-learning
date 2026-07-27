@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Shared image policies for Duckietown reinforcement learning experiments."""
 
 from __future__ import annotations

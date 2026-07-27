@@ -6,16 +6,18 @@ mostly create two places for facts to become outdated.
 
 ## I Want to Run an Experiment
 
-1. Install the selected backend:
+1. Find the appropriate entry point in the
+   [executable script reference](reference/scripts-and-cli.md).
+2. Install the selected backend:
    - [gym-duckietown on macOS](getting-started/gym-duckietown-macos.md)
    - [gym-duckietown on Ubuntu over SSH](getting-started/gym-duckietown-ubuntu.md)
    - [Duckiematrix](getting-started/duckiematrix.md)
-2. Follow [Common workflows](getting-started/workflows.md).
-3. For initial hardware experiments, run the
+3. Follow [Common workflows](getting-started/workflows.md).
+4. For initial hardware experiments, run the
    [physical camera input check](getting-started/physical-duckiebot-camera.md).
-4. Read the [evaluation protocol](methodology/evaluation.md) before comparing
+5. Read the [evaluation protocol](methodology/evaluation.md) before comparing
    returns.
-5. Use [Troubleshooting](troubleshooting.md) when OpenGL remembers that it has
+6. Use [Troubleshooting](troubleshooting.md) when OpenGL remembers that it has
    opinions.
 
 ## I Want to Understand the Research
@@ -36,7 +38,6 @@ mostly create two places for facts to become outdated.
 - [Extending the project](development/extending-the-project.md)
 - [Compatibility patches](development/compatibility-patches.md)
 - [Testing](development/testing.md)
-- [Scripts and CLI](reference/scripts-and-cli.md)
 - [Configurations](reference/configurations.md)
 - [Outputs and checkpoints](reference/outputs-and-checkpoints.md)
 

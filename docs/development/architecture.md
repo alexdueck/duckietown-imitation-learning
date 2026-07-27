@@ -2,9 +2,23 @@
 
 ## Repository Shape
 
-The repository is intentionally script-oriented. Training and interactive tools
-can be run directly, while shared behavior is extracted into modules when it
-must remain consistent across tools.
+The repository is intentionally script-oriented. User-facing training,
+evaluation, and hardware tools remain executable directly from the repository
+root. Reusable implementation modules live in the flat `dt_utils/`
+package, and test modules live in `tests/`. This keeps the existing
+`python SCRIPT.py` and `/workspace/SCRIPT.py` workflows independent of an
+editable package installation.
+
+```text
+repository root/
+|-- *.py                         user-facing entry points
+|-- run_physical_duckiebot_teleop.sh
+|-- dt_utils/               reusable importable modules
+|-- tests/                       test modules
+|-- configs/
+|-- docs/
+`-- requirements/
+```
 
 ## Duckiematrix Entry Points
 
@@ -15,8 +29,8 @@ must remain consistent across tools.
 | `train_imitation_learning.py` | Supervised image-to-wheel training |
 | `live_eval_imitation_policy.py` | Execute an IL policy in Duckiematrix |
 | `train_rl_ppo_duckiematrix.py` | Experimental Duckiematrix PPO trainer |
-| `duckiematrix_telemetry.py` | Read pose/lane telemetry from Duckiematrix |
-| `rl_rewards.py` | Duckiematrix reward adapters |
+| `dt_utils/duckiematrix_telemetry.py` | Read pose/lane telemetry from Duckiematrix |
+| `dt_utils/rl_rewards.py` | Duckiematrix reward adapters |
 
 ## gym-duckietown Entry Points
 
@@ -26,20 +40,20 @@ must remain consistent across tools.
 | `live_eval_imitation_policy_gym_duckietown.py` | Visual IL transfer evaluation |
 | `train_rl_ppo_gym_duckietown.py` | Main PPO trainer and deterministic evaluation |
 | `live_eval_rl_policy_gym_duckietown.py` | Visual PPO checkpoint evaluation |
-| `duckietown_rewards.py` | Reward selection, state tracking, breakdowns, and compatibility patch |
-| `velopose_reward.py` | Pure custom reward equations |
-| `duckietown_action_control.py` | Policy-control to wheel-action mapping |
-| `duckiebot_hardware_control.py` | Fail-closed wheel-action to physical chassis-command mapping |
-| `gym_duckietown_start_config.py` | Seed/pose configuration, validation, and sampling |
+| `dt_utils/duckietown_rewards.py` | Reward selection, state tracking, breakdowns, and compatibility patch |
+| `dt_utils/velopose_reward.py` | Pure custom reward equations |
+| `dt_utils/duckietown_action_control.py` | Policy-control to wheel-action mapping |
+| `dt_utils/duckiebot_hardware_control.py` | Fail-closed wheel-action to physical chassis-command mapping |
+| `dt_utils/gym_duckietown_start_config.py` | Seed/pose configuration, validation, and sampling |
 
 ## Shared Modules
 
 | File | Responsibility |
 | --- | --- |
-| `rl_models.py` | CNN actor, Q-network scaffold, tanh log probability, and IL actor loading |
-| `duckietown_paths.py` | Artifact locations below `~/duckietown` |
-| `cli_completion.py` | Optional argcomplete integration |
-| `ppo_control_tests.py` | PPO invariant, Pendulum, and image-control tests |
+| `dt_utils/rl_models.py` | CNN actor, Q-network scaffold, tanh log probability, and IL actor loading |
+| `dt_utils/duckietown_paths.py` | Artifact locations below `~/duckietown` |
+| `dt_utils/cli_completion.py` | Optional argcomplete integration |
+| `tests/ppo_control_tests.py` | PPO invariant, Pendulum, and image-control tests |
 | `preprocess.py` | Legacy optional offline image preprocessing |
 
 ## Physical Duckiebot Entry Points
@@ -48,10 +62,11 @@ must remain consistent across tools.
 | --- | --- |
 | `host_ps4_controller_bridge.py` | Read the macOS SDL GameController and serve normalized input states over TCP |
 | `physical_duckiebot_teleop.py` | Arming, emergency stop, input mixing, physical limits, camera subscription, rosbridge command transport, and recording |
+| `physical_duckiebot_model_control.py` | Host-side rosbridge camera input, deterministic IL/PPO inference, bounded command publication, and aligned recording |
 | `run_physical_duckiebot_teleop.sh` | Load ROS Noetic and the Duckietown catkin workspace before starting teleop in GUI tools |
-| `duckiebot_teleop_input.py` | Device adapters, bridge protocol, deadzone, and keyboard-only ramps |
-| `duckiebot_dataset_recorder.py` | Stream aligned compressed camera frames and effective wheel-equivalent actions |
-| `duckiebot_hardware_control.py` | ROS-independent fail-closed conversion from normalized wheels to bounded `v`/`omega` |
+| `dt_utils/duckiebot_teleop_input.py` | Device adapters, bridge protocol, deadzone, and keyboard-only ramps |
+| `dt_utils/duckiebot_dataset_recorder.py` | Stream aligned compressed camera frames and effective wheel-equivalent actions |
+| `dt_utils/duckiebot_hardware_control.py` | ROS-independent fail-closed conversion from normalized wheels to bounded `v`/`omega` |
 
 ## PPO Trainer Structure
 
@@ -73,12 +88,12 @@ contracts before pursuing smaller files for their own sake.
 
 ## Reward Boundary
 
-`velopose_reward.py` contains equations over NumPy values and has no direct
-simulator dependency.
+`dt_utils/velopose_reward.py` contains equations over NumPy values and
+has no direct simulator dependency.
 
-`duckietown_rewards.py` adapts simulator state into those equations, tracks
-previous position/potential, recognizes done reasons, and returns nested
-breakdowns.
+`dt_utils/duckietown_rewards.py` adapts simulator state into those
+equations, tracks previous position/potential, recognizes done reasons, and
+returns nested breakdowns.
 
 This boundary makes reward mathematics testable independently from OpenGL and
 Pyglet.
@@ -99,13 +114,15 @@ runtime.
 
 ## Physical Duckiebot Control Architecture
 
-The physical runtime spans the macOS host, a GUI-tools container, and the
-onboard Duckietown stack. This repository does not install or replace code on
-the robot.
+Manual teleoperation spans the macOS host, a GUI-tools container, and the
+onboard Duckietown stack. Model control instead runs wholly in the Mac
+`gymdt39_venv` and uses rosbridge for both camera input and command output.
+Neither runtime installs or replaces code on the robot.
 
 | Component | Location | Ownership |
 | --- | --- | --- |
 | PS4 controller and `host_ps4_controller_bridge.py` | macOS host | This repository |
+| `physical_duckiebot_model_control.py` | macOS host | This repository |
 | `physical_duckiebot_teleop.py` | GUI-tools container | This repository |
 | `rosbridge_websocket` | Physical Duckiebot | ROS/Duckietown |
 | `car_cmd_switch_node` | Physical Duckiebot | Duckietown `dt-core` |
@@ -159,12 +176,38 @@ LatestCamera in physical_duckiebot_teleop.py
     |
     | newest unique frame + effective command sent for that control tick
     v
-duckiebot_dataset_recorder.py
+dt_utils/duckiebot_dataset_recorder.py
     |
     +-- images/*
     +-- actions.csv
     +-- meta.json
 ```
+
+The model-control runtime uses a separate camera and command WebSocket so a
+slow subscriber receive cannot block a command send:
+
+```text
+/ROBOT_NAME/camera_node/image/compressed
+    |
+    | rosbridge WebSocket; newest frame replaces any waiting older frame
+    v
+physical_duckiebot_model_control.py on macOS
+    |
+    | checkpoint preprocessing and deterministic IL/PPO inference
+    | checkpoint action mapping -> common wheel scale
+    | PhysicalDuckiebotControl -> bounded v/omega
+    v
+command rosbridge WebSocket
+    |
+    v
+/ROBOT_NAME/joy_mapper_node/car_cmd
+```
+
+Inference normally reacts to every unique camera frame it can process; an
+optional maximum inference rate can reduce this frequency. Arming and E-stop
+changes increment an inference generation, so a result started in an earlier
+generation cannot publish afterward. Successfully published results are paired
+with the exact raw frame in `actions.csv` and `images/`.
 
 ### Why commands use rosbridge on Docker Desktop
 
@@ -196,6 +239,10 @@ onboard the robot, where `car_cmd_switch_node` can reach it locally. Native
 Linux deployments with a robot-reachable ROS host may opt into direct TCPROS
 with `--command-transport ros`.
 
+The host-side model runtime uses the same outbound approach for commands and
+also subscribes to the camera through rosbridge. It therefore needs neither a
+ROS installation nor a Docker callback address.
+
 ### Command-source selection
 
 `car_cmd_switch_node` starts with `current_src_name = "joystick"`. Its default
@@ -208,10 +255,10 @@ lane source     --> lane_controller_node/car_cmd
 stop source     --> simple_stop_controller_node/car_cmd
 ```
 
-The current teleop runtime does not publish an FSM state or explicitly switch
-the robot into joystick mode. It relies on the onboard switch starting in
-`joystick`. If an FSM later selects lane following or stop, PS4 messages remain
-published but are not forwarded to kinematics.
+The current teleop and model-control runtimes do not publish an FSM state or
+explicitly switch the robot into joystick mode. They rely on the onboard switch
+starting in `joystick`. If an FSM later selects lane following or stop,
+commands remain published but are not forwarded to kinematics.
 
 `speed_gain` and `steer_gain` belong to `joy_mapper_node`'s conversion from
 `sensor_msgs/Joy` to `Twist2DStamped`. Our runtime already publishes

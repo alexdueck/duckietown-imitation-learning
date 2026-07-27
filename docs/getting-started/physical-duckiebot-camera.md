@@ -236,10 +236,100 @@ explicitly; the inspector infers `crop_y_start=200` and a JPEG round trip for
 those checkpoints. Override the inference with `--crop-y-start` or
 `--jpeg-stage` when the training preprocessing differed.
 
+## Let a checkpoint drive the physical Duckiebot
+
+`physical_duckiebot_model_control.py` runs directly in the macOS
+`gymdt39_venv`; do not start it in GUI tools. It auto-detects IL and PPO
+checkpoints, receives compressed camera frames, and publishes
+`Twist2DStamped` commands through two outbound connections to
+`ws://ROBOT_IP:9001`. Install the current gym-duckietown requirements first so
+the host environment contains `websocket-client`:
+
+```bash
+source ~/virtualenvs/gymdt39_venv/bin/activate
+python -m pip install -r requirements/gym-duckietown.txt
+python physical_duckiebot_model_control.py \
+  ROBOT_NAME \
+  ~/duckietown/checkpoints/PATH/TO/best.pt
+```
+
+The Duckietown bridge listens at the WebSocket root: `rosbridge` is the
+service/protocol name here, not an additional `/rosbridge` URL suffix.
+
+The script uses `--robot-ip` or the `ROBOT_IP` environment variable when
+provided; otherwise it resolves `ROBOT_NAME.local` on the Mac. The default
+topics are:
+
+```text
+/ROBOT_NAME/camera_node/image/compressed
+/ROBOT_NAME/joy_mapper_node/car_cmd
+```
+
+This direct connection does not use `ROS_MASTER_URI` or a GUI-tools
+`/etc/hosts` entry.
+
+The window must have keyboard focus. Controls match the keyboard teleop:
+
+- Enter arms or disarms the controller.
+- Space latches the emergency stop, publishes zero, disables inference, and
+  invalidates any inference already in progress.
+- C clears the emergency stop but leaves the controller disarmed.
+- Escape publishes zero and exits.
+
+The window shows the latest image actually processed by the model. Its panel
+separates the raw model output, the normalized wheel actions that would be
+passed to gym-duckietown, and the wheel-equivalent action represented by the
+published `v`/`omega` command. Bars and a direction arrow visualize the latter;
+after an E-stop the header shows the current zero command while the last
+image/action pair remains visible for inspection.
+
+The controller starts disarmed. Default limits are
+`max_linear_velocity=0.10 m/s` and
+`max_angular_velocity=1.50 rad/s`; reverse motion is not blocked. Model
+inference is deterministic. The checkpoint-specific action mapping first
+produces normalized left/right wheel commands. `--wheel-action-scale` then
+multiplies both wheels by the same value, preserving their ratio; its default
+is `1.0`, for an allowed post-scale range of `[-1, 1]`. A camera frame older
+than 0.5 s or, normally, 0.5 s without a new command stops and disarms the
+controller; adjust these thresholds with `--max-frame-age` and
+`--command-timeout`. For a deliberately low `--max-inference-rate`, the
+command timeout automatically grows to 1.25 times the selected period unless
+you set it explicitly.
+
+Every new unique frame is submitted by default, with no fixed frequency cap.
+If inference is slower than the camera, only the newest waiting frame is kept
+rather than building a stale queue. Use `--max-inference-rate 10` to impose a
+lower rate. Independent `v`/`omega` slew limiting is off by default because it
+can temporarily alter the wheel ratio; enable it with
+`--rate-limit-commands` and configure the acceleration limits when desired.
+For example:
+
+```bash
+python physical_duckiebot_model_control.py ROBOT_NAME CHECKPOINT \
+  --wheel-action-scale 0.5 \
+  --max-linear-velocity 0.05 \
+  --max-angular-velocity 1.0 \
+  --max-inference-rate 10
+```
+
+Processed frames and their actions are recorded automatically below
+`~/duckietown/data/physical_model_control/run_*`. Each run contains:
+
+```text
+images/       raw compressed camera payloads
+actions.csv   policy controls, model/scaled wheels, published v/omega, timing
+meta.json     checkpoint, preprocessing, topics, limits, and sample count
+```
+
+While armed, an image is recorded only with the command produced from that
+image. Pass `--no-recording` to disable collection or `--output-dir PATH` to
+select another root.
+
 ## Troubleshooting
 
-If the script reports that ROS Python packages are unavailable, it was started
-on the host rather than in the ROS-enabled GUI-tools container.
+If `capture_duckiebot_camera.py` reports that ROS Python packages are
+unavailable, it was started on the host rather than in the ROS-enabled
+GUI-tools container.
 
 If no message arrives, inspect the active topic and publication rate inside the
 container:

@@ -76,6 +76,7 @@ evaluation.
 
 Start with the [documentation index](docs/index.md), or go directly to:
 
+- [Executable scripts and CLI parameters](docs/reference/scripts-and-cli.md)
 - [System overview](docs/methodology/system-overview.md)
 - [Observation and model pipeline](docs/methodology/observations-and-models.md)
 - [Action mappings](docs/methodology/actions.md)

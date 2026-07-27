@@ -1,3 +1,5 @@
+"""gym-duckietown reward adapters and diagnostics."""
+
 from __future__ import annotations
 
 import math
@@ -5,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from velopose_reward import (
+from .velopose_reward import (
     DirectedLaneTracker,
     POSEPOT_DEFAULT_GAMMA,
     VD2PP_DISTANCE_SQUARED_WEIGHT,

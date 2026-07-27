@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Streaming, simulator-compatible camera/action recording."""
 
 from __future__ import annotations

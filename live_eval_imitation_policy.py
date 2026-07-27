@@ -19,8 +19,8 @@ from torchvision import transforms
 from duckietown.sdk.middleware.dtps.base import DTPS
 from gym_duckiematrix.DB21J import DuckiematrixDB21JEnv
 
-from cli_completion import parse_args_with_completion
-from duckietown_paths import IMITATION_LEARNING_CHECKPOINT_DIR
+from dt_utils.cli_completion import parse_args_with_completion
+from dt_utils.duckietown_paths import IMITATION_LEARNING_CHECKPOINT_DIR
 from train_imitation_learning import (
     IMAGENET_MEAN,
     IMAGENET_STD,

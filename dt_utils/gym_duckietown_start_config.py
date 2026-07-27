@@ -1,4 +1,4 @@
-"""Shared curated start configuration for gym-duckietown tools."""
+"""Curated start configuration shared by gym-duckietown tools."""
 
 from __future__ import annotations
 

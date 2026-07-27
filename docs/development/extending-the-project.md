@@ -2,10 +2,11 @@
 
 ## Add a gym-duckietown Reward
 
-1. Implement the numerical equation in `velopose_reward.py` when possible.
+1. Implement the numerical equation in
+   `dt_utils/velopose_reward.py` when possible.
 2. Return a nested structure with `total` and `components`.
 3. Add the public name to `REWARD_FUNCTION_CHOICES` in
-   `duckietown_rewards.py`.
+   `dt_utils/duckietown_rewards.py`.
 4. Add state initialization and reset behavior to
    `GymDuckietownRewardCalculator`.
 5. Handle invalid and terminal transitions explicitly.
@@ -36,7 +37,8 @@ steering.
 
 ## Add a Start Strategy
 
-Start selection belongs in `gym_duckietown_start_config.py`. Keep these
+Start selection belongs in
+`dt_utils/gym_duckietown_start_config.py`. Keep these
 properties:
 
 - evaluation scenarios are deterministic

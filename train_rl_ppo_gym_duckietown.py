@@ -27,7 +27,7 @@ from PIL import Image
 from torch import nn
 from torchvision import transforms
 
-from duckietown_rewards import (
+from dt_utils.duckietown_rewards import (
     GymDuckietownRewardCalculator,
     MAX_STEPS_DONE_CODE,
     REWARD_FUNCTION_CHOICES,
@@ -36,13 +36,13 @@ from duckietown_rewards import (
     patch_duckietown_world_dynamics,
     reward_source,
 )
-from cli_completion import parse_args_with_completion
-from duckietown_action_control import (
+from dt_utils.cli_completion import parse_args_with_completion
+from dt_utils.duckietown_action_control import (
     ACTION_MODE_CHOICES,
     DuckietownActionControl,
 )
-from duckietown_paths import RL_PPO_GYM_DUCKIETOWN_CHECKPOINT_DIR
-from gym_duckietown_start_config import (
+from dt_utils.duckietown_paths import RL_PPO_GYM_DUCKIETOWN_CHECKPOINT_DIR
+from dt_utils.gym_duckietown_start_config import (
     StartConfig,
     TrainingPose,
     TrainingStart,
@@ -50,9 +50,9 @@ from gym_duckietown_start_config import (
     choose_training_start,
     load_start_config,
 )
-from rl_models import TanhGaussianPolicy, load_imitation_actor, tanh_normal_log_prob
+from dt_utils.rl_models import TanhGaussianPolicy, load_imitation_actor, tanh_normal_log_prob
 from train_imitation_learning import IMAGENET_MEAN, IMAGENET_STD, build_model, resolve_device, set_seed
-from velopose_reward import (
+from dt_utils.velopose_reward import (
     POSEPOT_SHAPING_WEIGHT,
     VD2PP_DISTANCE_SQUARED_WEIGHT,
     VELOPPOSE_HEADING_CORRECTION_GAIN,
@@ -133,7 +133,7 @@ class EnvironmentStartDefaults:
 class ValueNetwork(nn.Module):
     def __init__(self, model_name: str, pretrained: bool = False) -> None:
         super().__init__()
-        from rl_models import build_encoder
+        from dt_utils.rl_models import build_encoder
 
         self.encoder, features_dim = build_encoder(model_name, pretrained=pretrained)
         self.value = nn.Linear(features_dim, 1)

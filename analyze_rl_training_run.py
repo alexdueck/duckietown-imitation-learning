@@ -14,7 +14,7 @@ from pathlib import Path
 from statistics import fmean
 from typing import Iterable, Sequence
 
-from cli_completion import parse_args_with_completion
+from dt_utils.cli_completion import parse_args_with_completion
 
 
 REQUIRED_FILES = (

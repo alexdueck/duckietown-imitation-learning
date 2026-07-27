@@ -14,23 +14,23 @@ from threading import Lock
 from time import monotonic, time
 from typing import Any
 
-from cli_completion import parse_args_with_completion
+from dt_utils.cli_completion import parse_args_with_completion
 from capture_duckiebot_camera import (
     compressed_format,
     configure_robot_hostname,
     normalize_robot_name,
 )
-from duckiebot_dataset_recorder import PhysicalDatasetRecorder
-from duckiebot_hardware_control import PhysicalControlLimits, PhysicalDuckiebotControl
-from duckiebot_teleop_input import (
+from dt_utils.duckiebot_dataset_recorder import PhysicalDatasetRecorder
+from dt_utils.duckiebot_hardware_control import PhysicalControlLimits, PhysicalDuckiebotControl
+from dt_utils.duckiebot_teleop_input import (
     ActionMixer,
     DriveProfile,
     KeyboardInput,
     PS4Input,
     RemoteInput,
 )
-from duckietown_action_control import DuckietownActionControl
-from duckietown_paths import IMITATION_LEARNING_TRAIN_DATA_DIR
+from dt_utils.duckietown_action_control import DuckietownActionControl
+from dt_utils.duckietown_paths import IMITATION_LEARNING_TRAIN_DATA_DIR
 
 
 @dataclass(frozen=True)

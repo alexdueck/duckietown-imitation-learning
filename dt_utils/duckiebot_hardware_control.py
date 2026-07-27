@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Safe policy-action to physical Duckiebot chassis-command adaptation.
 
 This module deliberately has no ROS dependency.  A runtime can turn the
@@ -13,7 +12,7 @@ import math
 from time import monotonic
 from typing import Any, Sequence
 
-from duckietown_action_control import (
+from .duckietown_action_control import (
     DuckietownActionControl,
     action_control_from_config,
 )

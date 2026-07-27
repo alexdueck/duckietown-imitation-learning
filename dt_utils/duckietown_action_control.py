@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Policy-control to wheel-command mappings for gym-duckietown."""
 
 from __future__ import annotations

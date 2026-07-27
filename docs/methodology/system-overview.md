@@ -94,12 +94,13 @@ The project keeps backend-specific training and evaluation scripts separate:
 
 Shared concepts live in focused modules:
 
-- image policies in `rl_models.py`
-- gym-duckietown action mapping in `duckietown_action_control.py`
-- gym-duckietown rewards in `velopose_reward.py` and
-  `duckietown_rewards.py`
-- start scenarios in `gym_duckietown_start_config.py`
-- artifact paths in `duckietown_paths.py`
+- image policies in `dt_utils/rl_models.py`
+- gym-duckietown action mapping in
+  `dt_utils/duckietown_action_control.py`
+- gym-duckietown rewards in `dt_utils/velopose_reward.py` and
+  `dt_utils/duckietown_rewards.py`
+- start scenarios in `dt_utils/gym_duckietown_start_config.py`
+- artifact paths in `dt_utils/duckietown_paths.py`
 
 This duplication boundary is intentional. The two simulators differ enough in
 dependencies, reset semantics, rendering, and reward ground truth that one

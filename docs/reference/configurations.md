@@ -2,7 +2,7 @@
 
 ## Artifact Root
 
-`duckietown_paths.py` defines:
+`dt_utils/duckietown_paths.py` defines:
 
 ```text
 ~/duckietown/
@@ -10,6 +10,7 @@
 |   |-- imitation_learning/
 |   |   |-- train/
 |   |   `-- val/
+|   |-- physical_model_control/
 |   `-- evaluations/
 |       |-- il_gym_duckietown/
 |       |-- rl_gym_duckietown/

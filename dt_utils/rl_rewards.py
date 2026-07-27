@@ -1,3 +1,5 @@
+"""Duckiematrix reinforcement-learning reward adapters."""
+
 from __future__ import annotations
 
 import math
@@ -6,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from velopose_reward import (
+from .velopose_reward import (
     DirectedLaneTracker,
     VELOPPOSE_LANE_HALF_WIDTH_FACTOR,
     compute_velopose_breakdown,

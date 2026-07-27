@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Input-device-independent controls for physical Duckiebot teleoperation."""
 
 from __future__ import annotations

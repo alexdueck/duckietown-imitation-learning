@@ -11,8 +11,8 @@ import socket
 import sys
 from time import monotonic, sleep
 
-from cli_completion import parse_args_with_completion
-from duckiebot_teleop_input import SDLControllerInput
+from dt_utils.cli_completion import parse_args_with_completion
+from dt_utils.duckiebot_teleop_input import SDLControllerInput
 
 
 def parse_args() -> argparse.Namespace:

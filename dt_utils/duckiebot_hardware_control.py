@@ -1,8 +1,8 @@
-"""Safe policy-action to physical Duckiebot chassis-command adaptation.
+"""Policy-action to physical Duckiebot chassis-command adaptation.
 
 This module deliberately has no ROS dependency.  A runtime can turn the
 returned ``linear_velocity`` and ``angular_velocity`` values into a
-``duckietown_msgs/Twist2DStamped`` only after all checks in this layer pass.
+``duckietown_msgs/Twist2DStamped`` after the state and freshness checks pass.
 """
 
 from __future__ import annotations
@@ -19,28 +19,20 @@ from .duckietown_action_control import (
 
 
 @dataclass(frozen=True)
-class PhysicalControlLimits:
-    """Physical command limits; conservative defaults for initial testing."""
+class PhysicalControlConfig:
+    """Geometry and freshness configuration for physical control."""
 
-    max_linear_velocity: float = 0.10
-    max_angular_velocity: float = 1.50
-    max_linear_acceleration: float = 0.25
-    max_angular_acceleration: float = 3.00
+    wheel_speed_scale: float = 0.10
+    wheel_baseline: float = 0.102
     command_timeout: float = 0.50
     max_frame_age: float = 0.50
-    nominal_control_period: float = 0.10
-    forward_only: bool = True
-    rate_limit_commands: bool = True
 
     def __post_init__(self) -> None:
         positive_fields = (
-            "max_linear_velocity",
-            "max_angular_velocity",
-            "max_linear_acceleration",
-            "max_angular_acceleration",
+            "wheel_speed_scale",
+            "wheel_baseline",
             "command_timeout",
             "max_frame_age",
-            "nominal_control_period",
         )
         for field_name in positive_fields:
             value = float(getattr(self, field_name))
@@ -50,12 +42,12 @@ class PhysicalControlLimits:
 
 @dataclass(frozen=True)
 class ChassisCommand:
-    """Auditable output of the physical-control safety layer."""
+    """Auditable output of the physical-control adapter."""
 
     linear_velocity: float
     angular_velocity: float
-    target_linear_velocity: float
-    target_angular_velocity: float
+    wheel_speed_left: float
+    wheel_speed_right: float
     normalized_left_wheel: float
     normalized_right_wheel: float
     policy_controls: tuple[float, ...]
@@ -64,9 +56,6 @@ class ChassisCommand:
     reason: str
     armed: bool
     emergency_stop_latched: bool
-    linear_rate_limited: bool = False
-    angular_rate_limited: bool = False
-    coupled_limit_applied: bool = False
 
     @property
     def stopped(self) -> bool:
@@ -82,15 +71,13 @@ class PhysicalDuckiebotControl:
     def __init__(
         self,
         action_control: DuckietownActionControl,
-        limits: PhysicalControlLimits | None = None,
+        config: PhysicalControlConfig | None = None,
     ) -> None:
         self.action_control = action_control
-        self.limits = limits or PhysicalControlLimits()
+        self.config = config or PhysicalControlConfig()
         self._armed = False
         self._emergency_stop_latched = False
         self._last_update_at: float | None = None
-        self._current_linear_velocity = 0.0
-        self._current_angular_velocity = 0.0
         self._last_command = self._stop_command(
             timestamp=monotonic(),
             reason="disarmed",
@@ -149,7 +136,7 @@ class PhysicalDuckiebotControl:
         timestamp: float | None = None,
         frame_age: float | None = None,
     ) -> ChassisCommand:
-        """Map one policy output to a bounded chassis command.
+        """Map normalized wheel actions to a geometric chassis command.
 
         ``timestamp`` must use a monotonic clock. ``frame_age`` must already be
         computed by the runtime because ROS wall-clock stamps and monotonic
@@ -174,7 +161,7 @@ class PhysicalDuckiebotControl:
                     "invalid_frame_age",
                     frame_age=frame_age,
                 )
-            if frame_age > self.limits.max_frame_age:
+            if frame_age > self.config.max_frame_age:
                 return self._fault_stop(now, "stale_frame", frame_age=frame_age)
 
         try:
@@ -187,41 +174,19 @@ class PhysicalDuckiebotControl:
                 frame_age=frame_age,
             )
 
-        normalized_linear = 0.5 * (left + right)
-        normalized_angular = 0.5 * (right - left)
-        if self.limits.forward_only:
-            normalized_linear = max(0.0, normalized_linear)
+        wheel_speed_left = left * self.config.wheel_speed_scale
+        wheel_speed_right = right * self.config.wheel_speed_scale
+        linear = 0.5 * (wheel_speed_left + wheel_speed_right)
+        angular = (
+            wheel_speed_right - wheel_speed_left
+        ) / self.config.wheel_baseline
 
-        target_linear = normalized_linear * self.limits.max_linear_velocity
-        target_angular = normalized_angular * self.limits.max_angular_velocity
-        if self.limits.rate_limit_commands:
-            delta_time = self._delta_time(now)
-            linear, linear_limited = self._move_towards(
-                self._current_linear_velocity,
-                target_linear,
-                self.limits.max_linear_acceleration * delta_time,
-            )
-            angular, angular_limited = self._move_towards(
-                self._current_angular_velocity,
-                target_angular,
-                self.limits.max_angular_acceleration * delta_time,
-            )
-        else:
-            linear, angular = target_linear, target_angular
-            linear_limited = angular_limited = False
-        linear, angular, coupled_limited = self._enforce_coupled_limit(
-            linear,
-            angular,
-        )
-
-        self._current_linear_velocity = linear
-        self._current_angular_velocity = angular
         self._last_update_at = now
         self._last_command = ChassisCommand(
             linear_velocity=linear,
             angular_velocity=angular,
-            target_linear_velocity=target_linear,
-            target_angular_velocity=target_angular,
+            wheel_speed_left=wheel_speed_left,
+            wheel_speed_right=wheel_speed_right,
             normalized_left_wheel=left,
             normalized_right_wheel=right,
             policy_controls=controls,
@@ -230,9 +195,6 @@ class PhysicalDuckiebotControl:
             reason="active",
             armed=True,
             emergency_stop_latched=False,
-            linear_rate_limited=linear_limited,
-            angular_rate_limited=angular_limited,
-            coupled_limit_applied=coupled_limited,
         )
         return self._last_command
 
@@ -248,27 +210,9 @@ class PhysicalDuckiebotControl:
             return self._fault_stop(now, "no_command")
         if now < self._last_update_at:
             return self._fault_stop(now, "non_monotonic_timestamp")
-        if now - self._last_update_at > self.limits.command_timeout:
+        if now - self._last_update_at > self.config.command_timeout:
             return self._fault_stop(now, "watchdog_timeout")
         return self._last_command
-
-    def _delta_time(self, now: float) -> float:
-        if self._last_update_at is None:
-            return self.limits.nominal_control_period
-        return now - self._last_update_at
-
-    def _enforce_coupled_limit(
-        self,
-        linear: float,
-        angular: float,
-    ) -> tuple[float, float, bool]:
-        load = (
-            abs(linear) / self.limits.max_linear_velocity
-            + abs(angular) / self.limits.max_angular_velocity
-        )
-        if load <= 1.0:
-            return linear, angular, False
-        return linear / load, angular / load, True
 
     def _set_stop(
         self,
@@ -277,8 +221,6 @@ class PhysicalDuckiebotControl:
         *,
         frame_age: float | None = None,
     ) -> ChassisCommand:
-        self._current_linear_velocity = 0.0
-        self._current_angular_velocity = 0.0
         self._last_command = self._stop_command(
             timestamp=timestamp,
             reason=reason,
@@ -308,8 +250,8 @@ class PhysicalDuckiebotControl:
         return ChassisCommand(
             linear_velocity=0.0,
             angular_velocity=0.0,
-            target_linear_velocity=0.0,
-            target_angular_velocity=0.0,
+            wheel_speed_left=0.0,
+            wheel_speed_right=0.0,
             normalized_left_wheel=0.0,
             normalized_right_wheel=0.0,
             policy_controls=(),
@@ -327,25 +269,14 @@ class PhysicalDuckiebotControl:
             raise ValueError("timestamp must be finite and non-negative")
         return timestamp
 
-    @staticmethod
-    def _move_towards(
-        current: float,
-        target: float,
-        maximum_delta: float,
-    ) -> tuple[float, bool]:
-        delta = target - current
-        if abs(delta) <= maximum_delta:
-            return target, False
-        return current + math.copysign(maximum_delta, delta), True
-
 
 def hardware_control_from_checkpoint_config(
     checkpoint_config: dict[str, Any],
-    limits: PhysicalControlLimits | None = None,
+    config: PhysicalControlConfig | None = None,
 ) -> PhysicalDuckiebotControl:
     """Construct the adapter using the action semantics stored in a checkpoint."""
 
     return PhysicalDuckiebotControl(
         action_control=action_control_from_config(checkpoint_config),
-        limits=limits,
+        config=config,
     )

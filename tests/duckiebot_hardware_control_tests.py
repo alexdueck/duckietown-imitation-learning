@@ -7,21 +7,17 @@ import unittest
 
 from dt_utils.duckietown_action_control import DuckietownActionControl
 from dt_utils.duckiebot_hardware_control import (
-    PhysicalControlLimits,
+    PhysicalControlConfig,
     PhysicalDuckiebotControl,
     hardware_control_from_checkpoint_config,
 )
 
 
-FAST_LIMITS = PhysicalControlLimits(
-    max_linear_velocity=0.10,
-    max_angular_velocity=1.50,
-    max_linear_acceleration=10.0,
-    max_angular_acceleration=100.0,
+TEST_CONFIG = PhysicalControlConfig(
+    wheel_speed_scale=0.10,
+    wheel_baseline=0.102,
     command_timeout=0.50,
     max_frame_age=0.25,
-    nominal_control_period=0.10,
-    forward_only=True,
 )
 
 
@@ -57,10 +53,10 @@ class ActionControlScalarTests(unittest.TestCase):
 
 
 class PhysicalDuckiebotControlTests(unittest.TestCase):
-    def make_control(self, limits: PhysicalControlLimits = FAST_LIMITS):
+    def make_control(self, config: PhysicalControlConfig = TEST_CONFIG):
         return PhysicalDuckiebotControl(
             DuckietownActionControl(mode="wheel"),
-            limits,
+            config,
         )
 
     def test_starts_disarmed(self) -> None:
@@ -80,48 +76,24 @@ class PhysicalDuckiebotControlTests(unittest.TestCase):
         control = self.make_control()
         control.arm(timestamp=0.0)
         command = control.update((0.0, 1.0), timestamp=0.1, frame_age=0.01)
-        self.assertAlmostEqual(command.target_linear_velocity, 0.05)
-        self.assertAlmostEqual(command.target_angular_velocity, 0.75)
+        self.assertAlmostEqual(command.linear_velocity, 0.05)
+        self.assertAlmostEqual(command.angular_velocity, 0.10 / 0.102)
+        self.assertAlmostEqual(command.wheel_speed_left, 0.0)
+        self.assertAlmostEqual(command.wheel_speed_right, 0.10)
 
-    def test_forward_only_blocks_reverse(self) -> None:
+    def test_reverse_is_not_blocked(self) -> None:
         control = self.make_control()
         control.arm(timestamp=0.0)
         command = control.update((-1.0, -1.0), timestamp=0.1, frame_age=0.0)
-        self.assertEqual(command.linear_velocity, 0.0)
+        self.assertAlmostEqual(command.linear_velocity, -0.10)
+        self.assertAlmostEqual(command.angular_velocity, 0.0)
 
-    def test_slew_rate_limits_acceleration(self) -> None:
-        limits = PhysicalControlLimits(
-            max_linear_velocity=0.10,
-            max_angular_velocity=1.50,
-            max_linear_acceleration=0.20,
-            max_angular_acceleration=3.00,
-            command_timeout=0.50,
-            max_frame_age=0.25,
-            nominal_control_period=0.10,
-        )
-        control = self.make_control(limits)
+    def test_geometry_preserves_wheel_action_curvature(self) -> None:
+        control = self.make_control()
         control.arm(timestamp=0.0)
-        command = control.update((1.0, 1.0), timestamp=0.1, frame_age=0.0)
-        self.assertAlmostEqual(command.linear_velocity, 0.02)
-        self.assertTrue(command.linear_rate_limited)
-
-    def test_rate_limiting_can_be_disabled_for_analog_control(self) -> None:
-        limits = PhysicalControlLimits(
-            max_linear_velocity=0.41,
-            max_angular_velocity=8.0,
-            max_linear_acceleration=0.01,
-            max_angular_acceleration=0.01,
-            command_timeout=0.50,
-            max_frame_age=0.25,
-            nominal_control_period=0.10,
-            forward_only=False,
-            rate_limit_commands=False,
-        )
-        control = self.make_control(limits)
-        control.arm(timestamp=0.0)
-        command = control.update((1.0, 1.0), timestamp=0.1, frame_age=0.0)
-        self.assertAlmostEqual(command.linear_velocity, 0.41)
-        self.assertFalse(command.linear_rate_limited)
+        command = control.update((0.0, 1.0), timestamp=0.1, frame_age=0.0)
+        radius = command.linear_velocity / command.angular_velocity
+        self.assertAlmostEqual(radius, TEST_CONFIG.wheel_baseline / 2.0)
 
     def test_stale_frame_stops_immediately(self) -> None:
         control = self.make_control()
@@ -175,7 +147,7 @@ class PhysicalDuckiebotControlTests(unittest.TestCase):
                 "max_throttle": 0.5,
                 "max_steering": 0.2,
             },
-            FAST_LIMITS,
+            TEST_CONFIG,
         )
         control.arm(timestamp=0.0)
         command = control.update((0.0,), timestamp=0.1, frame_age=0.0)

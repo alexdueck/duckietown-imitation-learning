@@ -64,7 +64,7 @@ repository root/
 | `dt_utils/duckiebot_teleop_input.py` | Keyboard/SDL device adapters, deadzone, and keyboard-only ramps |
 | `dt_utils/duckiebot_dataset_recorder.py` | Stream aligned compressed camera frames and effective wheel-equivalent actions |
 | `dt_utils/duckiebot_rosbridge.py` | Shared rosbridge camera subscriber, `Twist2DStamped` publisher, and robot-address resolution |
-| `dt_utils/duckiebot_hardware_control.py` | ROS-independent fail-closed conversion from normalized wheels to bounded `v`/`omega` |
+| `dt_utils/duckiebot_hardware_control.py` | ROS-independent fail-closed geometric conversion from normalized wheels to `v`/`omega` |
 
 ## PPO Trainer Structure
 
@@ -188,8 +188,8 @@ between those two transports:
 physical_duckiebot_control.py on macOS (model mode)
     |
     | checkpoint preprocessing and deterministic IL/PPO inference
-    | checkpoint action mapping -> common wheel scale
-    | PhysicalDuckiebotControl -> bounded v/omega
+    | checkpoint action mapping -> normalized wheels
+    | PhysicalDuckiebotControl -> wheel speeds -> geometric v/omega
     v
 command rosbridge WebSocket
     |

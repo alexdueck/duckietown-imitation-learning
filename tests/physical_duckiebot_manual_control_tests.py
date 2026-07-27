@@ -18,7 +18,6 @@ from dt_utils.duckiebot_teleop_input import (
 from physical_duckiebot_control import effective_wheel_actions
 from dt_utils.duckiebot_hardware_control import (
     ChassisCommand,
-    PhysicalControlLimits,
 )
 
 
@@ -28,8 +27,8 @@ class ActionMixerTests(unittest.TestCase):
             DriveProfile(throttle_rate=100.0, steering_rate=100.0)
         )
         action = mixer.update(InputState(throttle=1.0, steering=1.0), 0.1)
-        self.assertAlmostEqual(action[0], 0.0)
-        self.assertAlmostEqual(action[1], 1.0)
+        self.assertAlmostEqual(action[0], 0.23)
+        self.assertAlmostEqual(action[1], 0.67)
 
     def test_deadzone_suppresses_stick_drift(self) -> None:
         mixer = ActionMixer()
@@ -39,6 +38,7 @@ class ActionMixerTests(unittest.TestCase):
     def test_deadzone_does_not_weaken_values_above_threshold(self) -> None:
         mixer = ActionMixer(
             DriveProfile(
+                forward=1.0,
                 throttle_rate=100.0,
                 steering_rate=100.0,
                 auto_center_rate=100.0,
@@ -48,7 +48,7 @@ class ActionMixerTests(unittest.TestCase):
         self.assertAlmostEqual(action[0], 0.10)
         self.assertAlmostEqual(action[1], 0.10)
 
-    def test_analog_control_bypasses_ramps(self) -> None:
+    def test_analog_reverse_flips_steering_direction(self) -> None:
         mixer = ActionMixer(
             DriveProfile(throttle_rate=0.01, steering_rate=0.01)
         )
@@ -57,8 +57,31 @@ class ActionMixerTests(unittest.TestCase):
             0.001,
             smooth=False,
         )
-        self.assertAlmostEqual(action[0], -1.0)
-        self.assertAlmostEqual(action[1], -1.0 / 3.0)
+        self.assertAlmostEqual(action[0], -0.19)
+        self.assertAlmostEqual(action[1], -0.41)
+
+    def test_simulator_mixer_keeps_inner_wheel_moving(self) -> None:
+        profile = DriveProfile(throttle_rate=100.0, steering_rate=100.0)
+        turning = ActionMixer(profile).update(
+            InputState(throttle=1.0, steering=1.0),
+            0.1,
+        )
+        self.assertAlmostEqual(turning[0], 0.45 - 0.22)
+        self.assertAlmostEqual(turning[1], 0.45 + 0.22)
+
+    def test_simulator_mixer_uniformly_normalizes_out_of_range_wheels(self) -> None:
+        profile = DriveProfile(
+            forward=1.0,
+            turn=1.0,
+            throttle_rate=100.0,
+            steering_rate=100.0,
+        )
+        turning = ActionMixer(profile).update(
+            InputState(throttle=1.0, steering=0.5),
+            0.1,
+        )
+        self.assertAlmostEqual(turning[0], 1.0 / 3.0)
+        self.assertAlmostEqual(turning[1], 1.0)
 
     def test_standard_sdl_controller_normalizes_signed_axes(self) -> None:
         class FakePygame:
@@ -84,13 +107,12 @@ class ActionMixerTests(unittest.TestCase):
 
 
 class EffectiveWheelTests(unittest.TestCase):
-    def test_labels_describe_sent_rate_limited_command(self) -> None:
-        limits = PhysicalControlLimits()
+    def test_labels_describe_sent_command(self) -> None:
         command = ChassisCommand(
             linear_velocity=0.05,
-            angular_velocity=0.75,
-            target_linear_velocity=0.1,
-            target_angular_velocity=1.5,
+            angular_velocity=0.05 / 0.102,
+            wheel_speed_left=0.0,
+            wheel_speed_right=0.1,
             normalized_left_wheel=0.0,
             normalized_right_wheel=1.0,
             policy_controls=(0.0, 1.0),
@@ -100,7 +122,7 @@ class EffectiveWheelTests(unittest.TestCase):
             armed=True,
             emergency_stop_latched=False,
         )
-        self.assertEqual(effective_wheel_actions(command, limits), (0.0, 1.0))
+        self.assertEqual(effective_wheel_actions(command), (0.0, 1.0))
 
 
 class RecorderTests(unittest.TestCase):

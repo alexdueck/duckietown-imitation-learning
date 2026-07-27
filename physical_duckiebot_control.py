@@ -25,7 +25,10 @@ from PIL import Image, ImageOps
 
 from dt_utils.cli_completion import parse_args_with_completion
 from dt_utils.duckiebot_dataset_recorder import PhysicalDatasetRecorder
-from dt_utils.duckiebot_hardware_control import PhysicalControlLimits, PhysicalDuckiebotControl
+from dt_utils.duckiebot_hardware_control import (
+    PhysicalControlConfig,
+    PhysicalDuckiebotControl,
+)
 from dt_utils.duckiebot_rosbridge import (
     RosbridgeCameraFrame,
     RosbridgeCameraSubscriber,
@@ -87,7 +90,6 @@ class InferenceResult:
 @dataclass(frozen=True)
 class PublishedInference:
     result: InferenceResult
-    scaled_wheels: tuple[float, float]
     effective_wheels: tuple[float, float]
     command: Any
 
@@ -104,7 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Control a physical Duckiebot manually or with an IL/PPO model. "
-            "Camera and bounded Twist2DStamped commands use rosbridge."
+            "Camera and geometric Twist2DStamped commands use rosbridge."
         )
     )
     parser.add_argument(
@@ -142,6 +144,42 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.08,
         help="Zero manual input axes below this absolute value.",
+    )
+    parser.add_argument(
+        "--forward-target",
+        type=float,
+        default=0.45,
+        help="Manual forward-throttle target; matches gym-duckietown.",
+    )
+    parser.add_argument(
+        "--backward-target",
+        type=float,
+        default=0.30,
+        help="Magnitude of the manual reverse-throttle target.",
+    )
+    parser.add_argument(
+        "--turn-target",
+        type=float,
+        default=0.35,
+        help="Manual steering target; matches gym-duckietown.",
+    )
+    parser.add_argument(
+        "--throttle-rate",
+        type=float,
+        default=2.0,
+        help="Manual throttle change per second.",
+    )
+    parser.add_argument(
+        "--steering-rate",
+        type=float,
+        default=1.5,
+        help="Manual steering change per second while steering.",
+    )
+    parser.add_argument(
+        "--auto-center-rate",
+        type=float,
+        default=1.5,
+        help="Manual steering return-to-center rate per second.",
     )
     parser.add_argument(
         "--rate-limit-analog",
@@ -184,30 +222,22 @@ def parse_args() -> argparse.Namespace:
         help="Physical compressed camera images decode to RGB by default.",
     )
     parser.add_argument(
-        "--wheel-action-scale",
+        "--wheel-speed-scale",
         type=float,
-        default=1.0,
+        default=0.10,
         help=(
-            "Common zero-centered scale applied to both normalized wheel "
-            "actions after checkpoint mapping; 0.5 gives range [-0.5, 0.5]."
-        ),
-    )
-    parser.add_argument("--max-linear-velocity", type=float, default=0.10)
-    parser.add_argument("--max-angular-velocity", type=float, default=1.50)
-    parser.add_argument("--max-linear-acceleration", type=float, default=0.25)
-    parser.add_argument("--max-angular-acceleration", type=float, default=3.0)
-    parser.add_argument(
-        "--rate-limit-commands",
-        action="store_true",
-        help=(
-            "Enable independent v/omega slew limits. Disabled by default so "
-            "transient wheel ratios are not altered."
+            "Linear wheel speed in m/s represented by normalized wheel action "
+            "+1. Applied equally in manual and model mode."
         ),
     )
     parser.add_argument(
-        "--forward-only",
-        action="store_true",
-        help="Block negative chassis velocity in both control modes.",
+        "--wheel-baseline",
+        type=float,
+        default=0.102,
+        help=(
+            "Distance between wheel centers in meters. The default matches "
+            "gym-duckietown's nominal geometry."
+        ),
     )
     parser.add_argument(
         "--command-timeout",
@@ -257,12 +287,29 @@ def parse_args() -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     if not 1 <= args.rosbridge_port <= 65535:
         raise ValueError("--rosbridge-port must be in [1, 65535]")
-    if not 0.0 < args.wheel_action_scale <= 1.0:
-        raise ValueError("--wheel-action-scale must be in (0, 1]")
+    if (
+        not math.isfinite(args.wheel_speed_scale)
+        or args.wheel_speed_scale <= 0.0
+    ):
+        raise ValueError("--wheel-speed-scale must be finite and positive")
+    if not math.isfinite(args.wheel_baseline) or args.wheel_baseline <= 0.0:
+        raise ValueError("--wheel-baseline must be finite and positive")
     if not math.isfinite(args.control_rate) or args.control_rate <= 0.0:
         raise ValueError("--control-rate must be finite and positive")
     if not math.isfinite(args.deadzone) or not 0.0 <= args.deadzone < 1.0:
         raise ValueError("--deadzone must be finite and in [0, 1)")
+    for name in (
+        "forward_target",
+        "backward_target",
+        "turn_target",
+        "throttle_rate",
+        "steering_rate",
+        "auto_center_rate",
+    ):
+        value = float(getattr(args, name))
+        if not math.isfinite(value) or value <= 0.0:
+            option = "--" + name.replace("_", "-")
+            raise ValueError(f"{option} must be finite and positive")
     if args.controller_index < 0:
         raise ValueError("--controller-index must be non-negative")
     if not math.isfinite(args.max_inference_rate) or args.max_inference_rate < 0.0:
@@ -302,34 +349,14 @@ def decode_frame_image(
     return image
 
 
-def scale_wheel_actions(
-    wheels: Any,
-    scale: float,
-) -> tuple[float, float]:
-    values = np.asarray(wheels, dtype=np.float64).reshape(-1)
-    if values.size != 2 or not np.all(np.isfinite(values)):
-        raise ValueError("wheel actions must contain two finite values")
-    if not 0.0 < scale <= 1.0:
-        raise ValueError("wheel action scale must be in (0, 1]")
-    left, right = (float(value) * float(scale) for value in values)
-    return left, right
-
-
 def effective_wheel_actions(
     command: Any,
-    limits: PhysicalControlLimits,
 ) -> tuple[float, float]:
-    """Invert this runtime's v/omega scaling for display and diagnostics."""
+    """Return the normalized wheel actions represented by a command."""
 
-    normalized_linear = (
-        float(command.linear_velocity) / limits.max_linear_velocity
-    )
-    normalized_angular = (
-        float(command.angular_velocity) / limits.max_angular_velocity
-    )
     return (
-        normalized_linear - normalized_angular,
-        normalized_linear + normalized_angular,
+        float(command.normalized_left_wheel),
+        float(command.normalized_right_wheel),
     )
 
 
@@ -468,12 +495,10 @@ class ModelActionRecorder:
         "policy_control_1",
         "model_wheel_left",
         "model_wheel_right",
-        "scaled_wheel_left",
-        "scaled_wheel_right",
+        "wheel_speed_left",
+        "wheel_speed_right",
         "published_linear_velocity",
         "published_angular_velocity",
-        "target_linear_velocity",
-        "target_angular_velocity",
         "command_reason",
     )
 
@@ -514,7 +539,6 @@ class ModelActionRecorder:
         self,
         result: InferenceResult,
         *,
-        scaled_wheels: tuple[float, float],
         command: Any,
     ) -> None:
         sample_idx = self._sample_count
@@ -546,12 +570,10 @@ class ModelActionRecorder:
                 ),
                 "model_wheel_left": f"{float(model_wheels[0]):.9f}",
                 "model_wheel_right": f"{float(model_wheels[1]):.9f}",
-                "scaled_wheel_left": f"{scaled_wheels[0]:.9f}",
-                "scaled_wheel_right": f"{scaled_wheels[1]:.9f}",
+                "wheel_speed_left": f"{command.wheel_speed_left:.9f}",
+                "wheel_speed_right": f"{command.wheel_speed_right:.9f}",
                 "published_linear_velocity": f"{command.linear_velocity:.9f}",
                 "published_angular_velocity": f"{command.angular_velocity:.9f}",
-                "target_linear_velocity": f"{command.target_linear_velocity:.9f}",
-                "target_angular_velocity": f"{command.target_angular_velocity:.9f}",
                 "command_reason": command.reason,
             }
         )
@@ -817,7 +839,8 @@ def draw_status(
     armed: bool,
     emergency_stop: bool,
     camera_age: float | None,
-    wheel_scale: float,
+    wheel_speed_scale: float,
+    wheel_baseline: float,
     sample_count: int,
     recording_text: str,
     policy_control_names: tuple[str, ...],
@@ -905,8 +928,6 @@ def draw_status(
             float(value) for value in prediction.wheel_commands
         )
         sent_left, sent_right = published.effective_wheels
-        sent_v_norm = 0.5 * (sent_left + sent_right)
-        sent_omega_norm = 0.5 * (sent_right - sent_left)
 
         y += 67
         render_text(
@@ -993,19 +1014,17 @@ def draw_status(
             screen,
             fonts["small"],
             f"Twist sent for image: v={command.linear_velocity:+.3f} m/s   "
-            f"omega={command.angular_velocity:+.3f} rad/s   "
-            f"|   normalized v={sent_v_norm:+.3f}, "
-            f"omega={sent_omega_norm:+.3f}",
+            f"omega={command.angular_velocity:+.3f} rad/s   |   "
+            f"wheel speeds [{command.wheel_speed_left:+.3f}, "
+            f"{command.wheel_speed_right:+.3f}] m/s",
             (20, y),
         )
         y += 29
         render_text(
             screen,
             fonts["small"],
-            f"requested scaled wheels "
-            f"[{published.scaled_wheels[0]:+.3f}, "
-            f"{published.scaled_wheels[1]:+.3f}]   |   "
-            f"wheel scale {wheel_scale:.2f}   |   "
+            f"wheel speed scale {wheel_speed_scale:.3f} m/s   |   "
+            f"baseline {wheel_baseline:.3f} m   |   "
             f"inference {result.inference_seconds * 1000:.1f} ms   |   "
             f"{command.reason}",
             (20, y),
@@ -1088,7 +1107,9 @@ def draw_status(
             screen,
             fonts["small"],
             f"Twist sent: v={manual.command.linear_velocity:+.3f} m/s   "
-            f"omega={manual.command.angular_velocity:+.3f} rad/s",
+            f"omega={manual.command.angular_velocity:+.3f} rad/s   |   "
+            f"wheel speeds [{manual.command.wheel_speed_left:+.3f}, "
+            f"{manual.command.wheel_speed_right:+.3f}] m/s",
             (20, y),
             MUTED,
         )
@@ -1181,20 +1202,15 @@ def main() -> int:
             print("Warming up model...", flush=True)
             warm_up_model(bundle)
 
-        limits = PhysicalControlLimits(
-            max_linear_velocity=args.max_linear_velocity,
-            max_angular_velocity=args.max_angular_velocity,
-            max_linear_acceleration=args.max_linear_acceleration,
-            max_angular_acceleration=args.max_angular_acceleration,
+        physical_config = PhysicalControlConfig(
+            wheel_speed_scale=args.wheel_speed_scale,
+            wheel_baseline=args.wheel_baseline,
             command_timeout=effective_command_timeout(args),
             max_frame_age=args.max_frame_age,
-            nominal_control_period=1.0 / args.control_rate,
-            forward_only=args.forward_only,
-            rate_limit_commands=args.rate_limit_commands,
         )
         control = PhysicalDuckiebotControl(
             DuckietownActionControl(mode="wheel"),
-            limits=limits,
+            config=physical_config,
         )
         if bundle is not None:
             worker = InferenceWorker(
@@ -1241,8 +1257,7 @@ def main() -> int:
                 ),
                 "policy_control_names": list(policy_control_names),
                 "preprocess": asdict(bundle.preprocess),
-                "wheel_action_scale": args.wheel_action_scale,
-                "physical_control_limits": asdict(limits),
+                "physical_control_config": asdict(physical_config),
                 "max_inference_rate": args.max_inference_rate,
                 "camera_topic": camera_topic,
                 "command_topic": command_topic,
@@ -1272,7 +1287,17 @@ def main() -> int:
         )
         if controller_device is not None:
             print(f"Controller: {controller_device.name}")
-        mixer = ActionMixer(DriveProfile(deadzone=args.deadzone))
+        mixer = ActionMixer(
+            DriveProfile(
+                forward=args.forward_target,
+                backward=args.backward_target,
+                turn=args.turn_target,
+                throttle_rate=args.throttle_rate,
+                steering_rate=args.steering_rate,
+                auto_center_rate=args.auto_center_rate,
+                deadzone=args.deadzone,
+            )
+        )
 
         mode = MODE_MANUAL
         epoch = 0
@@ -1296,13 +1321,10 @@ def main() -> int:
             f"model={'loaded' if bundle is not None else 'not loaded'}"
         )
         print(
-            f"Limits: v=±{limits.max_linear_velocity:.3f} m/s, "
-            f"omega=±{limits.max_angular_velocity:.3f} rad/s, "
-            f"wheel range=[-{args.wheel_action_scale:.3f}, "
-            f"+{args.wheel_action_scale:.3f}], "
-            f"reverse={'off' if limits.forward_only else 'on'}, "
-            f"rate limit={'on' if limits.rate_limit_commands else 'off'}, "
-            f"watchdog={limits.command_timeout:.3f}s"
+            f"Geometry: wheel_speed_scale="
+            f"{physical_config.wheel_speed_scale:.3f} m/s, "
+            f"baseline={physical_config.wheel_baseline:.3f} m, "
+            f"watchdog={physical_config.command_timeout:.3f}s"
         )
         print(
             "M: mode  I: input  Enter/Cross: arm  R/Options: record  "
@@ -1542,7 +1564,7 @@ def main() -> int:
                             "type": input_name,
                             "drive_profile": asdict(mixer.profile),
                         },
-                        "physical_control_limits": asdict(limits),
+                        "physical_control_config": asdict(physical_config),
                         "sample_period_seconds": 1.0 / args.control_rate,
                     },
                 )
@@ -1566,7 +1588,7 @@ def main() -> int:
                     frame_age=camera_age,
                 )
                 publisher.publish(command)
-                effective_wheels = effective_wheel_actions(command, limits)
+                effective_wheels = effective_wheel_actions(command)
                 manual_display = ManualControlDisplay(
                     state=state,
                     requested_wheels=requested_wheels,
@@ -1609,21 +1631,21 @@ def main() -> int:
                     if result.epoch != epoch or not control.armed:
                         continue
                     publish_at = monotonic()
-                    scaled_wheels = scale_wheel_actions(
-                        result.prediction.wheel_commands,
-                        args.wheel_action_scale,
+                    requested_wheels = tuple(
+                        float(value)
+                        for value in result.prediction.wheel_commands
                     )
                     result_frame_age = max(
                         0.0,
                         publish_at - result.frame.received_at,
                     )
                     command = control.update(
-                        scaled_wheels,
+                        requested_wheels,
                         timestamp=publish_at,
                         frame_age=result_frame_age,
                     )
                     publisher.publish(command)
-                    effective_wheels = effective_wheel_actions(command, limits)
+                    effective_wheels = effective_wheel_actions(command)
                     if (
                         recording_enabled
                         and model_recorder is None
@@ -1637,12 +1659,10 @@ def main() -> int:
                     if model_recorder is not None:
                         model_recorder.record(
                             result,
-                            scaled_wheels=scaled_wheels,
                             command=command,
                         )
                     last_published = PublishedInference(
                         result=result,
-                        scaled_wheels=scaled_wheels,
                         effective_wheels=effective_wheels,
                         command=command,
                     )
@@ -1713,7 +1733,8 @@ def main() -> int:
                 armed=control.armed,
                 emergency_stop=control.emergency_stop_latched,
                 camera_age=camera_age,
-                wheel_scale=args.wheel_action_scale,
+                wheel_speed_scale=physical_config.wheel_speed_scale,
+                wheel_baseline=physical_config.wheel_baseline,
                 sample_count=(
                     0 if active_recorder is None else active_recorder.sample_count
                 ),

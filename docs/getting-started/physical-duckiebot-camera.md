@@ -154,12 +154,24 @@ stop. SDL mappings can vary by OS or USB/Bluetooth mode; override them with
 switch between keyboard and PS4 input. If no controller is available, the
 switch is rejected and the current input remains active.
 
-The conservative physical defaults limit full input to 0.10 m/s and
-1.50 rad/s. Reverse is enabled, and absolute stick values below 0.08 are
-treated as exactly zero. Use `--forward-only`, `--deadzone`,
-`--max-linear-velocity`, or `--max-angular-velocity` to override these
-defaults. Actual parsed limits and the drive profile are saved in every
-recording's `meta.json`.
+Manual mixing and ramps match `manual_control_gym_duckietown.py`: forward,
+reverse, and steering targets default to `0.45`, `0.30`, and `0.22`.
+Consequently, full forward plus full left steering produces wheel actions
+`[0.23, 0.67]`; the inner wheel does not stop. The mixer computes
+`left = throttle - steering` and `right = throttle + steering`, then applies
+one common normalization factor only if either result exceeds `[-1, 1]`.
+Reverse steering is flipped so left/right remain relative to the driven
+trajectory. Tune this behavior with `--forward-target`, `--backward-target`,
+`--turn-target`, `--throttle-rate`, `--steering-rate`, and
+`--auto-center-rate`.
+
+Normalized wheel action `1.0` represents `--wheel-speed-scale` meters per
+second; the default is `0.10`. This is an open-loop command scale, not a
+guarantee of measured physical speed. `--wheel-baseline` defaults to the
+gym-duckietown geometry of `0.102 m`. There are no additional linear,
+angular, forward-only, or acceleration limits. Absolute stick values below
+the `--deadzone` default of `0.08` are treated as zero. The parsed geometry
+and drive profile are saved in every recording's `meta.json`.
 
 PS4 input is applied directly without throttle, steering, or command ramps;
 the analog stick itself supplies the continuous target. Keyboard control keeps
@@ -229,20 +241,18 @@ This direct connection does not use `ROS_MASTER_URI` or a GUI-tools
 `/etc/hosts` entry.
 
 The window shows the live camera image and current mode, input, arming,
-E-stop, recording, wheel-action, `v`/`omega`, and direction-arrow state. In
-model mode it additionally separates raw policy controls, gym wheel actions,
-scaled requested wheels, and the effective wheel-equivalent action represented
-by the published command.
+E-stop, recording, wheel actions, wheel speeds, geometric `v`/`omega`, and
+direction-arrow state. In model mode it additionally separates raw policy
+controls, gym wheel actions, and the effective action represented by the
+published command.
 
-Default limits in both modes are
-`max_linear_velocity=0.10 m/s` and
-`max_angular_velocity=1.50 rad/s`; reverse motion is not blocked. Model
-inference is deterministic. The checkpoint-specific action mapping first
-produces normalized left/right wheel commands. `--wheel-action-scale` then
-multiplies both wheels by the same value, preserving their ratio; its default
-is `1.0`, for an allowed post-scale range of `[-1, 1]`. A camera frame older
+Model inference is deterministic. The checkpoint-specific action mapping
+first produces normalized left/right wheel commands `l` and `r`. The physical
+adapter converts these to wheel speeds using `--wheel-speed-scale`, then
+computes `v = (speed_left + speed_right) / 2` and
+`omega = (speed_right - speed_left) / wheel_baseline`. A camera frame older
 than 0.5 s or, normally, 0.5 s without a new command stops and disarms the
-controller; adjust these thresholds with `--max-frame-age` and
+controller; adjust these freshness thresholds with `--max-frame-age` and
 `--command-timeout`. For a deliberately low `--max-inference-rate`, the
 command timeout automatically grows to 1.25 times the selected period unless
 you set it explicitly.
@@ -250,17 +260,12 @@ you set it explicitly.
 Every new unique frame is submitted by default, with no fixed frequency cap.
 If inference is slower than the camera, only the newest waiting frame is kept
 rather than building a stale queue. Use `--max-inference-rate 10` to impose a
-lower rate. Independent `v`/`omega` slew limiting is off by default because it
-can temporarily alter the wheel ratio; enable it with
-`--rate-limit-commands` and configure the acceleration limits when desired.
-For example:
+lower rate. For example:
 
 ```bash
 python physical_duckiebot_control.py ROBOT_NAME \
   --checkpoint CHECKPOINT \
-  --wheel-action-scale 0.5 \
-  --max-linear-velocity 0.05 \
-  --max-angular-velocity 1.0 \
+  --wheel-speed-scale 0.05 \
   --max-inference-rate 10
 ```
 
@@ -270,8 +275,8 @@ run contains:
 
 ```text
 images/       raw compressed camera payloads
-actions.csv   policy controls, model/scaled wheels, published v/omega, timing
-meta.json     checkpoint, preprocessing, topics, limits, and sample count
+actions.csv   policy controls, model wheels, wheel speeds, v/omega, timing
+meta.json     checkpoint, preprocessing, topics, geometry, and sample count
 ```
 
 While armed, an image is recorded only with the command produced from that

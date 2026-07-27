@@ -101,53 +101,49 @@ physical adapter composes the checkpoint's `DuckietownActionControl` with
 policy controls
     -> checkpoint action mapping
     -> normalized left/right wheels
-    -> normalized linear/angular motion
-    -> physical v/omega limits
-    -> acceleration and coupled-command limits
+    -> left/right linear wheel speeds
+    -> differential-drive geometry
     -> ChassisCommand
 ```
 
 For normalized wheel commands `l` and `r`, the chassis coordinates are:
 
 ```text
-linear_normalized  = (l + r) / 2
-angular_normalized = (r - l) / 2
-v     = linear_normalized  * max_linear_velocity
-omega = angular_normalized * max_angular_velocity
+speed_left  = l * wheel_speed_scale
+speed_right = r * wheel_speed_scale
+v           = (speed_left + speed_right) / 2
+omega       = (speed_right - speed_left) / wheel_baseline
 ```
 
 Positive `omega` therefore corresponds to the right wheel moving faster than
-the left wheel. The adapter also enforces the coupled envelope:
+the left wheel. The adapter does not independently clip or slew-limit
+`v`/`omega`, because doing so would alter the wheel ratio and therefore the
+commanded curvature. Its defaults are:
 
-```text
-abs(v / v_max) + abs(omega / omega_max) <= 1
-```
-
-The initial defaults are deliberately conservative and are not robot
-identification results:
-
-| Limit | Default |
+| Parameter | Default |
 | --- | ---: |
-| Maximum linear velocity | `0.10 m/s` |
-| Maximum angular velocity | `1.50 rad/s` |
-| Maximum linear acceleration | `0.25 m/s^2` |
-| Maximum angular acceleration | `3.00 rad/s^2` |
+| Wheel-speed scale | `0.10 m/s` |
+| Wheel baseline | `0.102 m` |
 | Command timeout | `0.50 s` |
 | Maximum frame age | `0.50 s` |
-| Nominal control period | `0.10 s` |
-| Reverse motion | disabled |
+
+The wheel-speed scale is an open-loop target, not a calibrated guarantee of
+measured speed.
 
 Minimal integration after loading a checkpoint:
 
 ```python
 from dt_utils.duckiebot_hardware_control import (
-    PhysicalControlLimits,
+    PhysicalControlConfig,
     hardware_control_from_checkpoint_config,
 )
 
 hardware = hardware_control_from_checkpoint_config(
     checkpoint["config"],
-    PhysicalControlLimits(max_linear_velocity=0.10),
+    PhysicalControlConfig(
+        wheel_speed_scale=0.10,
+        wheel_baseline=0.102,
+    ),
 )
 hardware.arm()
 

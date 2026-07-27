@@ -95,13 +95,16 @@ image, active mode and input, requested/model and published actions,
 | Group | Parameters | Meaning |
 | --- | --- | --- |
 | Robot connection | `robot_name`, `--robot-ip`, `--rosbridge-port`, `--camera-topic`, `--command-topic` | Connect to rosbridge and choose topics |
-| Manual input | `--input`, `--controller-index`, `--deadzone`, `--rate-limit-analog`, axis/button flags | Choose and configure keyboard or direct PS4 input |
+| Manual input | `--input`, `--controller-index`, `--deadzone`, `--forward-target`, `--backward-target`, `--turn-target`, ramp parameters, `--rate-limit-analog`, axis/button flags | Choose and tune keyboard or direct PS4 input |
 | Model | `--checkpoint`, `--device`, `--image-size`, `--crop-y-start`, `--jpeg-stage`, `--jpeg-quality`, `--file-channel-order` | Optionally load an IL/PPO policy and reproduce preprocessing |
-| Wheel range | `--wheel-action-scale` | Apply one common scale to model wheel actions |
-| Chassis limits | `--max-linear-velocity`, `--max-angular-velocity`, `--forward-only` | Bound published motion |
-| Optional slew limits | `--rate-limit-commands`, `--max-linear-acceleration`, `--max-angular-acceleration` | Enable and configure command-rate limiting |
+| Wheel geometry | `--wheel-speed-scale`, `--wheel-baseline` | Convert normalized wheel actions to wheel speeds and geometric `v`/`omega` |
 | Timing/watchdog | `--control-rate`, `--command-timeout`, `--max-frame-age`, `--max-inference-rate` | Set manual command rate, stale-input stops, and optional inference cap |
 | Recording/status | `--manual-output-dir`, `--model-output-dir`, `--no-recording`, `--status-period` | Configure aligned recordings and console status |
+
+Manual keyboard mixing matches `manual_control_gym_duckietown.py`: the defaults
+are forward `0.45`, reverse `0.30`, and steering `0.22`; left/right wheels are
+`throttle - steering` and `throttle + steering`, followed by common
+normalization only when necessary. Reverse steering is direction-corrected.
 
 The physical setup guide documents the complete workflow:
 [Physical Duckiebot camera and control](../getting-started/physical-duckiebot-camera.md).

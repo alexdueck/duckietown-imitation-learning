@@ -24,7 +24,6 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 from dt_utils.duckiebot_hardware_control import (
     ChassisCommand,
-    PhysicalControlLimits,
 )
 from dt_utils.duckiebot_teleop_input import InputState
 from dt_utils.duckiebot_rosbridge import (
@@ -45,7 +44,6 @@ from physical_duckiebot_control import (
     effective_command_timeout,
     effective_wheel_actions,
     merge_keyboard_control_events,
-    scale_wheel_actions,
     validate_args,
 )
 from view_model_actions_on_images import Prediction
@@ -109,14 +107,16 @@ def active_command(
     linear_velocity: float,
     angular_velocity: float,
     frame_age: float,
+    wheel_speeds: tuple[float, float] = (0.0, 0.0),
+    normalized_wheels: tuple[float, float] = (0.0, 0.0),
 ) -> ChassisCommand:
     return ChassisCommand(
         linear_velocity=linear_velocity,
         angular_velocity=angular_velocity,
-        target_linear_velocity=linear_velocity,
-        target_angular_velocity=angular_velocity,
-        normalized_left_wheel=0.0,
-        normalized_right_wheel=0.0,
+        wheel_speed_left=wheel_speeds[0],
+        wheel_speed_right=wheel_speeds[1],
+        normalized_left_wheel=normalized_wheels[0],
+        normalized_right_wheel=normalized_wheels[1],
         policy_controls=(),
         timestamp=monotonic(),
         frame_age=frame_age,
@@ -212,36 +212,15 @@ class CameraDecodeTests(unittest.TestCase):
         )
 
 
-class WheelScalingTests(unittest.TestCase):
-    def test_common_scale_preserves_sign_and_ratio(self) -> None:
-        left, right = scale_wheel_actions((0.8, -0.4), 0.25)
-        self.assertAlmostEqual(left, 0.2)
-        self.assertAlmostEqual(right, -0.1)
-        self.assertAlmostEqual(left / right, -2.0)
-
-    def test_rejects_invalid_actions_or_scale(self) -> None:
-        for wheels in ((1.0,), (1.0, 2.0, 3.0), (np.nan, 0.0)):
-            with self.subTest(wheels=wheels):
-                with self.assertRaises(ValueError):
-                    scale_wheel_actions(wheels, 1.0)
-        for scale in (0.0, -0.1, 1.01):
-            with self.subTest(scale=scale):
-                with self.assertRaises(ValueError):
-                    scale_wheel_actions((0.5, 0.5), scale)
-
-    def test_inverts_published_twist_to_effective_wheel_actions(self) -> None:
+class EffectiveWheelTests(unittest.TestCase):
+    def test_returns_wheel_actions_represented_by_command(self) -> None:
         command = active_command(
             linear_velocity=0.0325,
             angular_velocity=0.0375,
             frame_age=0.01,
+            normalized_wheels=(0.30, 0.35),
         )
-        left, right = effective_wheel_actions(
-            command,
-            PhysicalControlLimits(
-                max_linear_velocity=0.10,
-                max_angular_velocity=1.50,
-            ),
-        )
+        left, right = effective_wheel_actions(command)
         self.assertAlmostEqual(left, 0.30)
         self.assertAlmostEqual(right, 0.35)
 
@@ -269,7 +248,8 @@ class GuiRenderTests(unittest.TestCase):
             "armed": True,
             "emergency_stop": False,
             "camera_age": 0.01,
-            "wheel_scale": 1.0,
+            "wheel_speed_scale": 0.1,
+            "wheel_baseline": 0.102,
             "sample_count": 3,
             "recording_text": "REC ON",
             "policy_control_names": ("left_wheel", "right_wheel"),
@@ -294,7 +274,6 @@ class GuiRenderTests(unittest.TestCase):
             manual=None,
             published=PublishedInference(
                 result=model_result,
-                scaled_wheels=(0.3, 0.4),
                 effective_wheels=(0.1, 0.3),
                 command=command,
             ),
@@ -306,13 +285,20 @@ class RuntimeConfigurationTests(unittest.TestCase):
     def args(**overrides: float | None) -> argparse.Namespace:
         values = {
             "rosbridge_port": 9001,
-            "wheel_action_scale": 1.0,
+            "wheel_speed_scale": 0.10,
+            "wheel_baseline": 0.102,
             "max_inference_rate": 0.0,
             "status_period": 1.0,
             "command_timeout": None,
             "control_rate": 20.0,
             "deadzone": 0.08,
             "controller_index": 0,
+            "forward_target": 0.45,
+            "backward_target": 0.30,
+            "turn_target": 0.22,
+            "throttle_rate": 2.0,
+            "steering_rate": 0.75,
+            "auto_center_rate": 0.55,
         }
         values.update(overrides)
         return argparse.Namespace(**values)
@@ -514,20 +500,20 @@ class ModelActionRecorderTests(unittest.TestCase):
             )
             recorder.record(
                 first,
-                scaled_wheels=(0.15, -0.2),
                 command=active_command(
                     linear_velocity=-0.0025,
                     angular_velocity=-0.2625,
                     frame_age=0.01,
+                    wheel_speeds=(0.015, -0.020),
                 ),
             )
             recorder.record(
                 second,
-                scaled_wheels=(0.3, 0.35),
                 command=active_command(
                     linear_velocity=0.0325,
                     angular_velocity=0.0375,
                     frame_age=0.02,
+                    wheel_speeds=(0.030, 0.035),
                 ),
             )
             run_dir = recorder.run_dir
@@ -539,7 +525,7 @@ class ModelActionRecorderTests(unittest.TestCase):
             self.assertEqual([row["camera_receive_id"] for row in rows], ["11", "12"])
             self.assertEqual(rows[0]["policy_control_1"], "-0.200000003")
             self.assertEqual(rows[1]["policy_control_1"], "")
-            self.assertEqual(rows[0]["scaled_wheel_left"], "0.150000000")
+            self.assertEqual(rows[0]["wheel_speed_left"], "0.015000000")
             self.assertEqual(rows[1]["published_linear_velocity"], "0.032500000")
             self.assertEqual(
                 (run_dir / "images" / rows[0]["image"]).read_bytes(),

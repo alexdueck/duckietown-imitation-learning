@@ -22,12 +22,14 @@ class InputState:
 
 @dataclass(frozen=True)
 class DriveProfile:
-    forward: float = 1.0
-    backward: float = 1.0
-    turn: float = 1.0
-    throttle_rate: float = 6.0
-    steering_rate: float = 6.0
-    auto_center_rate: float = 8.0
+    """Manual targets matching ``manual_control_gym_duckietown.py``."""
+
+    forward: float = 0.45
+    backward: float = 0.30
+    turn: float = 0.22
+    throttle_rate: float = 2.0
+    steering_rate: float = 0.75
+    auto_center_rate: float = 0.55
     deadzone: float = 0.08
 
     def __post_init__(self) -> None:
@@ -72,26 +74,35 @@ class ActionMixer:
             self.profile.forward if throttle_input >= 0.0 else self.profile.backward
         )
         target_throttle = throttle_input * throttle_scale
-        target_steering = steering_input * self.profile.turn
-        steering_rate = (
-            self.profile.steering_rate
-            if steering_input != 0.0
-            else self.profile.auto_center_rate
-        )
         if smooth:
             self.throttle = _move_towards(
                 self.throttle,
                 target_throttle,
                 self.profile.throttle_rate * dt,
             )
+        else:
+            self.throttle = target_throttle
+
+        driving_direction = -1.0 if self.throttle < 0.0 else 1.0
+        target_steering = (
+            steering_input * self.profile.turn * driving_direction
+        )
+        steering_rate = (
+            self.profile.steering_rate
+            if steering_input != 0.0
+            else self.profile.auto_center_rate
+        )
+        if smooth:
             self.steering = _move_towards(
                 self.steering,
                 target_steering,
                 steering_rate * dt,
             )
         else:
-            self.throttle = target_throttle
             self.steering = target_steering
+        # Keep this identical to the simulator collectors: mix throttle and
+        # steering first, then apply one common normalization factor. This
+        # preserves the ratio between both wheel commands.
         left = self.throttle - self.steering
         right = self.throttle + self.steering
         scale = max(1.0, abs(left), abs(right))

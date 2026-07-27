@@ -76,7 +76,7 @@ python -m unittest discover -s tests -t . -p '*_tests.py'
 ```
 
 These checks cover scalar checkpoint action mapping, physical `v`/`omega`
-conversion, forward-only operation, acceleration limiting, stale frames,
+geometric wheel-to-chassis conversion, reverse motion, stale frames,
 invalid policy values, watchdog timeout, and the latched emergency-stop state.
 They do not publish ROS messages or move a Duckiebot.
 

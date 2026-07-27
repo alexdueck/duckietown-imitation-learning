@@ -19,9 +19,7 @@ Platform setup and complete workflows remain in the linked guides.
 | Script | Use it to | Runs in |
 | --- | --- | --- |
 | [`imitation_learning.py`](#imitation_learningpy) | Drive in Duckiematrix and record image/action data | Duckiematrix environment |
-| [`physical_duckiebot_teleop.py`](#physical_duckiebot_teleoppy) | Drive a physical Duckiebot and optionally record image/action data | `dts start_gui_tools` container |
-| [`run_physical_duckiebot_teleop.sh`](#run_physical_duckiebot_teleopsh) | Start physical teleoperation with the ROS environment sourced | `dts start_gui_tools` container |
-| [`host_ps4_controller_bridge.py`](#host_ps4_controller_bridgepy) | Make a controller connected to macOS available inside Docker Desktop | macOS host |
+| [`physical_duckiebot_control.py`](#physical_duckiebot_controlpy) | Drive a physical Duckiebot manually or with an IL/PPO policy and record data | macOS gym/PyTorch environment |
 | [`capture_duckiebot_camera.py`](#capture_duckiebot_camerapy) | Save one physical camera frame and metadata | `dts start_gui_tools` container |
 | [`data_viewer.py`](#data_viewerpy) | Inspect recorded frames, actions, rewards, and telemetry | Duckiematrix environment |
 | [`preprocess.py`](#preprocesspy) | Create legacy cropped/resized IL images | Duckiematrix environment, or Python with pandas/Pillow |
@@ -43,7 +41,6 @@ Platform setup and complete workflows remain in the linked guides.
 | [`live_eval_imitation_policy_gym_duckietown.py`](#live_eval_imitation_policy_gym_duckietownpy) | Run an IL policy in gym-duckietown | gym-duckietown environment |
 | [`live_eval_rl_policy_gym_duckietown.py`](#live_eval_rl_policy_gym_duckietownpy) | Run a PPO policy in gym-duckietown | gym-duckietown environment |
 | [`view_model_actions_on_images.py`](#view_model_actions_on_imagespy) | Inspect IL/PPO outputs on saved images without driving | Python environment with PyTorch |
-| [`physical_duckiebot_model_control.py`](#physical_duckiebot_model_controlpy) | Let an IL/PPO policy drive a physical Duckiebot | macOS gym/PyTorch environment |
 
 ### Analyze runs
 
@@ -73,73 +70,41 @@ The Duckiematrix entity and connection are configured by the Duckiematrix
 setup rather than this small CLI. See
 [Duckiematrix setup](../getting-started/duckiematrix.md).
 
-### `physical_duckiebot_teleop.py`
+### `physical_duckiebot_control.py`
 
-Drives a physical Duckiebot with keyboard, a locally visible PS4 controller,
-or the macOS controller bridge. It can record compressed camera frames aligned
-with the effective wheel-equivalent actions.
+Controls a physical Duckiebot directly from macOS. It starts in manual mode,
+uses either keyboard or a directly connected SDL-compatible PS4 controller,
+and can switch to deterministic IL/PPO control when `--checkpoint` is
+provided. Camera subscription and command publication use outbound rosbridge
+WebSockets; ROS and Docker are not required.
 
 ```bash
-python physical_duckiebot_teleop.py realbot \
+python physical_duckiebot_control.py realbot \
   --input keyboard \
-  --command-transport rosbridge \
+  --checkpoint /path/to/checkpoint.pt \
   --robot-ip 192.168.2.125
 ```
 
-Important parameter groups:
+The controller always starts disarmed. Press M to switch manual/model mode and
+I to switch keyboard/PS4 input; either switch publishes zero and disarms.
+Enter/Cross arms, R/Options toggles recording, Space/Circle latches E-stop,
+C/Triangle clears it, and Escape exits. The GUI displays the live inference
+image, active mode and input, requested/model and published actions,
+`v`/`omega`, and a direction arrow.
 
 | Group | Parameters | Meaning |
 | --- | --- | --- |
-| Robot connection | `robot_name`, `--robot-ip`, `--camera-topic`, `--command-topic` | Select the robot and optionally override ROS topics |
-| Transport | `--command-transport`, `--rosbridge-port`, `--no-hosts-fix` | Choose rosbridge or direct ROS/TCPROS |
-| Input | `--input`, `--bridge-host`, `--bridge-port` | Choose keyboard, direct PS4, or the macOS bridge |
-| Recording | `--output-dir`, `--max-frame-age` | Select dataset location and reject stale camera frames |
-| Timing | `--control-rate`, `--status-period` | Set command frequency and console status frequency |
-| Motion limits | `--max-linear-velocity`, `--max-angular-velocity`, `--max-linear-acceleration`, `--max-angular-acceleration` | Bound chassis commands and optional ramps |
-| Input behavior | `--rate-limit-analog`, `--forward-only`, `--deadzone` | Configure analog ramps, reverse motion, and stick deadzone |
-| Controller mapping | `--throttle-axis`, `--steering-axis`, `--arm-button`, `--record-button`, `--emergency-button`, `--clear-button` | Override SDL axis/button indices |
+| Robot connection | `robot_name`, `--robot-ip`, `--rosbridge-port`, `--camera-topic`, `--command-topic` | Connect to rosbridge and choose topics |
+| Manual input | `--input`, `--controller-index`, `--deadzone`, `--rate-limit-analog`, axis/button flags | Choose and configure keyboard or direct PS4 input |
+| Model | `--checkpoint`, `--device`, `--image-size`, `--crop-y-start`, `--jpeg-stage`, `--jpeg-quality`, `--file-channel-order` | Optionally load an IL/PPO policy and reproduce preprocessing |
+| Wheel range | `--wheel-action-scale` | Apply one common scale to model wheel actions |
+| Chassis limits | `--max-linear-velocity`, `--max-angular-velocity`, `--forward-only` | Bound published motion |
+| Optional slew limits | `--rate-limit-commands`, `--max-linear-acceleration`, `--max-angular-acceleration` | Enable and configure command-rate limiting |
+| Timing/watchdog | `--control-rate`, `--command-timeout`, `--max-frame-age`, `--max-inference-rate` | Set manual command rate, stale-input stops, and optional inference cap |
+| Recording/status | `--manual-output-dir`, `--model-output-dir`, `--no-recording`, `--status-period` | Configure aligned recordings and console status |
 
-The physical setup guide documents keyboard/controller controls, arming,
-recording, and E-stop behavior:
+The physical setup guide documents the complete workflow:
 [Physical Duckiebot camera and control](../getting-started/physical-duckiebot-camera.md).
-
-### `run_physical_duckiebot_teleop.sh`
-
-Convenience wrapper for `physical_duckiebot_teleop.py` inside
-`dts start_gui_tools`. It sources ROS Noetic and the Duckietown catkin
-workspace, then forwards every argument unchanged.
-
-```bash
-/workspace/run_physical_duckiebot_teleop.sh realbot --input keyboard
-```
-
-It has no parameters of its own. Use:
-
-```bash
-/workspace/run_physical_duckiebot_teleop.sh --help
-```
-
-to see the parameters forwarded to `physical_duckiebot_teleop.py`.
-
-### `host_ps4_controller_bridge.py`
-
-Reads an SDL-compatible controller connected to macOS and serves normalized
-input states over TCP to a teleoperation process in Docker Desktop.
-
-```bash
-python host_ps4_controller_bridge.py --list
-python host_ps4_controller_bridge.py
-```
-
-| Parameters | Meaning |
-| --- | --- |
-| `--list`, `--controller-index` | Discover controllers or choose one |
-| `--port`, `--rate` | Configure the TCP port and controller sampling rate |
-| `--throttle-axis`, `--steering-axis` | Override SDL axis indices |
-| `--arm-button`, `--record-button`, `--emergency-button`, `--clear-button` | Override SDL button indices |
-
-Run this script on the Mac and start `physical_duckiebot_teleop.py` with
-`--input ps4-bridge` in the container.
 
 ### `capture_duckiebot_camera.py`
 
@@ -385,32 +350,6 @@ python view_model_actions_on_images.py duckiebot_captures /path/to/checkpoint.pt
 | `--file-channel-order` | Interpret decoded files as RGB or BGR |
 
 Use `D` and `A` to move to the next and previous image.
-
-### `physical_duckiebot_model_control.py`
-
-Runs a supported IL or PPO checkpoint against the physical camera stream over
-rosbridge and publishes bounded `Twist2DStamped` commands. The window displays
-the inference image, model controls, published wheel-equivalent actions, and a
-direction arrow. By default it records each processed frame with its action.
-
-```bash
-python physical_duckiebot_model_control.py \
-  realbot /path/to/checkpoint.pt \
-  --robot-ip 192.168.2.125
-```
-
-| Group | Parameters | Meaning |
-| --- | --- | --- |
-| Robot connection | `robot_name`, `--robot-ip`, `--rosbridge-port`, `--camera-topic`, `--command-topic` | Connect to rosbridge and choose topics |
-| Model/input | `checkpoint`, `--device`, `--image-size`, `--crop-y-start`, `--jpeg-stage`, `--jpeg-quality`, `--file-channel-order` | Load the policy and reproduce preprocessing |
-| Wheel range | `--wheel-action-scale` | Apply one common scale to both normalized wheel actions |
-| Chassis limits | `--max-linear-velocity`, `--max-angular-velocity` | Bound the published `v` and `omega` |
-| Optional slew limits | `--rate-limit-commands`, `--max-linear-acceleration`, `--max-angular-acceleration` | Enable and configure command-rate limiting |
-| Stream/watchdog | `--command-timeout`, `--max-frame-age`, `--max-inference-rate` | Stop on stale commands/frames and optionally cap inference frequency |
-| Recording/status | `--output-dir`, `--no-recording`, `--status-period` | Configure aligned recording and console status |
-
-The keyboard E-stop/arming behavior and first hardware procedure are described
-in [Physical Duckiebot camera and control](../getting-started/physical-duckiebot-camera.md).
 
 ## Run Analysis
 

@@ -15,7 +15,6 @@ import hashlib
 import ipaddress
 import json
 import os
-import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +22,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from dt_utils.cli_completion import parse_args_with_completion
+from dt_utils.duckiebot_rosbridge import compressed_format, normalize_robot_name
 
 
 DEFAULT_TIMEOUT_SECONDS = 15.0
@@ -120,19 +120,6 @@ def parse_args() -> argparse.Namespace:
         help="Replace existing output files.",
     )
     return parse_args_with_completion(parser)
-
-
-def normalize_robot_name(value: str | None) -> str:
-    if value is None or not value.strip():
-        raise ValueError(
-            "robot_name is required unless the VEHICLE_NAME environment variable is set"
-        )
-    robot_name = value.strip()
-    if robot_name.endswith(".local"):
-        robot_name = robot_name[: -len(".local")]
-    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", robot_name):
-        raise ValueError(f"Invalid Duckiebot hostname: {value!r}")
-    return robot_name
 
 
 def camera_topic(robot_name: str, override: str | None) -> str:
@@ -280,21 +267,6 @@ def ensure_output_paths_available(paths: list[Path], overwrite: bool) -> None:
         raise FileExistsError(
             f"Output already exists: {formatted}. Use --overwrite to replace it."
         )
-
-
-def compressed_format(message_format: str, payload: bytes) -> str:
-    format_lower = message_format.lower()
-    if "jpeg" in format_lower or "jpg" in format_lower:
-        return "jpeg"
-    if "png" in format_lower:
-        return "png"
-    if payload.startswith(b"\xff\xd8\xff"):
-        return "jpeg"
-    if payload.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "png"
-    raise ValueError(
-        f"Unsupported compressed camera format {message_format!r}; expected JPEG or PNG"
-    )
 
 
 def validate_output_suffix(path: Path, image_format: str) -> None:

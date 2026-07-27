@@ -12,8 +12,7 @@ editable package installation.
 ```text
 repository root/
 |-- *.py                         user-facing entry points
-|-- run_physical_duckiebot_teleop.sh
-|-- dt_utils/               reusable importable modules
+|-- dt_utils/                    reusable importable modules
 |-- tests/                       test modules
 |-- configs/
 |-- docs/
@@ -53,6 +52,7 @@ repository root/
 | `dt_utils/rl_models.py` | CNN actor, Q-network scaffold, tanh log probability, and IL actor loading |
 | `dt_utils/duckietown_paths.py` | Artifact locations below `~/duckietown` |
 | `dt_utils/cli_completion.py` | Optional argcomplete integration |
+| `dt_utils/duckiebot_rosbridge.py` | ROS-independent compressed-camera subscription and chassis-command publication over rosbridge |
 | `tests/ppo_control_tests.py` | PPO invariant, Pendulum, and image-control tests |
 | `preprocess.py` | Legacy optional offline image preprocessing |
 
@@ -60,12 +60,10 @@ repository root/
 
 | File | Responsibility |
 | --- | --- |
-| `host_ps4_controller_bridge.py` | Read the macOS SDL GameController and serve normalized input states over TCP |
-| `physical_duckiebot_teleop.py` | Arming, emergency stop, input mixing, physical limits, camera subscription, rosbridge command transport, and recording |
-| `physical_duckiebot_model_control.py` | Host-side rosbridge camera input, deterministic IL/PPO inference, bounded command publication, and aligned recording |
-| `run_physical_duckiebot_teleop.sh` | Load ROS Noetic and the Duckietown catkin workspace before starting teleop in GUI tools |
-| `dt_utils/duckiebot_teleop_input.py` | Device adapters, bridge protocol, deadzone, and keyboard-only ramps |
+| `physical_duckiebot_control.py` | Unified host-side manual/model control, GUI, inference, arming, E-stop, rosbridge camera/commands, and recording |
+| `dt_utils/duckiebot_teleop_input.py` | Keyboard/SDL device adapters, deadzone, and keyboard-only ramps |
 | `dt_utils/duckiebot_dataset_recorder.py` | Stream aligned compressed camera frames and effective wheel-equivalent actions |
+| `dt_utils/duckiebot_rosbridge.py` | Shared rosbridge camera subscriber, `Twist2DStamped` publisher, and robot-address resolution |
 | `dt_utils/duckiebot_hardware_control.py` | ROS-independent fail-closed conversion from normalized wheels to bounded `v`/`omega` |
 
 ## PPO Trainer Structure
@@ -114,35 +112,30 @@ runtime.
 
 ## Physical Duckiebot Control Architecture
 
-Manual teleoperation spans the macOS host, a GUI-tools container, and the
-onboard Duckietown stack. Model control instead runs wholly in the Mac
-`gymdt39_venv` and uses rosbridge for both camera input and command output.
-Neither runtime installs or replaces code on the robot.
+The unified manual/model controller runs in the Mac `gymdt39_venv`. It uses
+rosbridge for camera input and command output and needs neither a ROS
+installation nor Docker. It does not install or replace code on the robot.
 
 | Component | Location | Ownership |
 | --- | --- | --- |
-| PS4 controller and `host_ps4_controller_bridge.py` | macOS host | This repository |
-| `physical_duckiebot_model_control.py` | macOS host | This repository |
-| `physical_duckiebot_teleop.py` | GUI-tools container | This repository |
+| Keyboard or PS4 controller | macOS host | User hardware |
+| `physical_duckiebot_control.py` | macOS host | This repository |
+| `dt_utils/duckiebot_rosbridge.py` | macOS host | This repository |
 | `rosbridge_websocket` | Physical Duckiebot | ROS/Duckietown |
 | `car_cmd_switch_node` | Physical Duckiebot | Duckietown `dt-core` |
 | `kinematics_node` | Physical Duckiebot | Duckietown `dt-core` |
 | `wheels_driver_node` | Physical Duckiebot | Duckietown hardware stack |
 
-The control path is:
+The manual control path is:
 
 ```text
-PS4 over Bluetooth
+keyboard or PS4 controller on macOS
     |
     v
-host_ps4_controller_bridge.py on macOS
-    |
-    | TCP input-state stream to container port 8765
-    v
-physical_duckiebot_teleop.py in GUI tools
+physical_duckiebot_control.py (manual mode)
     |
     | deadzone, arming, emergency stop, wheel mixing, physical limits
-    | outbound WebSocket connection to ROBOT_IP:9001
+    | command rosbridge WebSocket to ROBOT_IP:9001
     v
 rosbridge_websocket on the Duckiebot
     |
@@ -170,9 +163,9 @@ The camera and recording path is independent:
 ```text
 camera_node on the Duckiebot
     |
-    | ROS CompressedImage; subscriber connection initiated by GUI tools
+    | CompressedImage over a camera rosbridge WebSocket
     v
-LatestCamera in physical_duckiebot_teleop.py
+RosbridgeCameraSubscriber in dt_utils/duckiebot_rosbridge.py
     |
     | newest unique frame + effective command sent for that control tick
     v
@@ -183,15 +176,16 @@ dt_utils/duckiebot_dataset_recorder.py
     +-- meta.json
 ```
 
-The model-control runtime uses a separate camera and command WebSocket so a
-slow subscriber receive cannot block a command send:
+The controller uses separate camera and command WebSockets so a slow
+subscriber receive cannot block a command send. Model mode adds inference
+between those two transports:
 
 ```text
 /ROBOT_NAME/camera_node/image/compressed
     |
     | rosbridge WebSocket; newest frame replaces any waiting older frame
     v
-physical_duckiebot_model_control.py on macOS
+physical_duckiebot_control.py on macOS (model mode)
     |
     | checkpoint preprocessing and deterministic IL/PPO inference
     | checkpoint action mapping -> common wheel scale
@@ -209,39 +203,23 @@ changes increment an inference generation, so a result started in an earlier
 generation cannot publish afterward. Successfully published results are paired
 with the exact raw frame in `actions.csv` and `images/`.
 
-### Why commands use rosbridge on Docker Desktop
+### Why physical control uses rosbridge
 
-ROS 1 uses its master for discovery, but topic data is peer-to-peer. After
-discovering a publisher, the subscriber connects back to the publisher's
-advertised TCPROS address. A `rospy.Publisher` inside Docker Desktop advertised
-an address such as:
-
-```text
-http://docker-desktop:RANDOM_PORT/
-```
-
-The physical robot could register the subscriber through the shared ROS
-master, but could not resolve or reach that container-internal callback. This
-failure is directional: camera subscription works because the container
-connects to a publisher on the robot.
-
-For commands, the container therefore opens an outbound connection to the
-fixed rosbridge server on the robot:
+ROS 1 discovery plus TCPROS required ROS Python packages and bidirectional
+network reachability. Docker Desktop made this especially awkward because the
+robot could not reach container-internal callback addresses. Rosbridge exposes
+a fixed WebSocket endpoint instead:
 
 ```text
-GUI-tools container --> ws://ROBOT_IP:9001
+macOS process --> ws://ROBOT_IP:9001
 ```
 
-From the robot's perspective this is an incoming WebSocket connection. Over
-the established bidirectional socket, teleop sends rosbridge `advertise` and
-`publish` operations. `rosbridge_websocket` then acts as a ROS publisher
-onboard the robot, where `car_cmd_switch_node` can reach it locally. Native
-Linux deployments with a robot-reachable ROS host may opt into direct TCPROS
-with `--command-transport ros`.
-
-The host-side model runtime uses the same outbound approach for commands and
-also subscribes to the camera through rosbridge. It therefore needs neither a
-ROS installation nor a Docker callback address.
+Over one outbound connection the runtime subscribes to compressed camera
+messages. Over a second it sends rosbridge `advertise` and `publish`
+operations for `Twist2DStamped`. The onboard `rosbridge_websocket` process
+then participates in ROS locally, where camera, command switch, kinematics,
+and wheel-driver nodes can reach it normally. This shared transport is why the
+unified controller runs directly on macOS without ROS or Docker.
 
 ### Command-source selection
 
@@ -255,10 +233,10 @@ lane source     --> lane_controller_node/car_cmd
 stop source     --> simple_stop_controller_node/car_cmd
 ```
 
-The current teleop and model-control runtimes do not publish an FSM state or
-explicitly switch the robot into joystick mode. They rely on the onboard switch
-starting in `joystick`. If an FSM later selects lane following or stop,
-commands remain published but are not forwarded to kinematics.
+The current unified runtime does not publish an FSM state or explicitly switch
+the robot into joystick mode. It relies on the onboard switch starting in
+`joystick`. If an FSM later selects lane following or stop, commands remain
+published but are not forwarded to kinematics.
 
 `speed_gain` and `steer_gain` belong to `joy_mapper_node`'s conversion from
 `sensor_msgs/Joy` to `Twist2DStamped`. Our runtime already publishes

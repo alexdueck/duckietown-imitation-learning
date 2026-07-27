@@ -1,4 +1,4 @@
-"""Unit tests for rosbridge model control without robot or network access."""
+"""Unit tests for unified physical control without robot or network access."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ import unittest
 
 import numpy as np
 from PIL import Image
+import pygame
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
@@ -25,16 +26,25 @@ from dt_utils.duckiebot_hardware_control import (
     ChassisCommand,
     PhysicalControlLimits,
 )
-from physical_duckiebot_model_control import (
-    InferenceResult,
-    InferenceWorker,
-    ModelActionRecorder,
+from dt_utils.duckiebot_teleop_input import InputState
+from dt_utils.duckiebot_rosbridge import (
     RosbridgeCameraFrame,
     RosbridgeTwistPublisher,
-    decode_frame_image,
     decode_rosbridge_camera_publish,
+)
+from physical_duckiebot_control import (
+    InferenceResult,
+    InferenceWorker,
+    ManualControlDisplay,
+    ModelActionRecorder,
+    PublishedInference,
+    alternate_control_mode,
+    alternate_input_name,
+    decode_frame_image,
+    draw_status,
     effective_command_timeout,
     effective_wheel_actions,
+    merge_keyboard_control_events,
     scale_wheel_actions,
     validate_args,
 )
@@ -236,6 +246,61 @@ class WheelScalingTests(unittest.TestCase):
         self.assertAlmostEqual(right, 0.35)
 
 
+class GuiRenderTests(unittest.TestCase):
+    def test_manual_and_model_panels_render(self) -> None:
+        pygame.font.init()
+        screen = pygame.Surface((1080, 820))
+        fonts = {
+            "large": pygame.font.Font(None, 38),
+            "normal": pygame.font.Font(None, 25),
+            "small": pygame.font.Font(None, 20),
+        }
+        command = active_command(
+            linear_velocity=0.02,
+            angular_velocity=0.15,
+            frame_age=0.01,
+        )
+        common = {
+            "screen": screen,
+            "fonts": fonts,
+            "input_name": "keyboard",
+            "camera_image": Image.new("RGB", (640, 480)),
+            "current_command": command,
+            "armed": True,
+            "emergency_stop": False,
+            "camera_age": 0.01,
+            "wheel_scale": 1.0,
+            "sample_count": 3,
+            "recording_text": "REC ON",
+            "policy_control_names": ("left_wheel", "right_wheel"),
+            "model_available": True,
+            "notice": None,
+        }
+        draw_status(
+            **common,
+            mode="manual",
+            published=None,
+            manual=ManualControlDisplay(
+                state=SimpleNamespace(throttle=0.3, steering=-0.1),
+                requested_wheels=(0.4, 0.2),
+                effective_wheels=(0.1, 0.3),
+                command=command,
+            ),
+        )
+        model_result = result_for(camera_frame(1))
+        draw_status(
+            **common,
+            mode="model",
+            manual=None,
+            published=PublishedInference(
+                result=model_result,
+                scaled_wheels=(0.3, 0.4),
+                effective_wheels=(0.1, 0.3),
+                command=command,
+            ),
+        )
+
+
 class RuntimeConfigurationTests(unittest.TestCase):
     @staticmethod
     def args(**overrides: float | None) -> argparse.Namespace:
@@ -245,6 +310,9 @@ class RuntimeConfigurationTests(unittest.TestCase):
             "max_inference_rate": 0.0,
             "status_period": 1.0,
             "command_timeout": None,
+            "control_rate": 20.0,
+            "deadzone": 0.08,
+            "controller_index": 0,
         }
         values.update(overrides)
         return argparse.Namespace(**values)
@@ -269,6 +337,42 @@ class RuntimeConfigurationTests(unittest.TestCase):
                     validate_args(args)
 
 
+class ModeAndInputTests(unittest.TestCase):
+    def test_mode_switch_requires_model_and_toggles_both_directions(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "--checkpoint"):
+            alternate_control_mode("manual", model_available=False)
+        self.assertEqual(
+            alternate_control_mode("manual", model_available=True),
+            "model",
+        )
+        self.assertEqual(
+            alternate_control_mode("model", model_available=True),
+            "manual",
+        )
+
+    def test_input_switch_toggles_keyboard_and_ps4(self) -> None:
+        self.assertEqual(alternate_input_name("keyboard"), "ps4")
+        self.assertEqual(alternate_input_name("ps4"), "keyboard")
+
+    def test_keyboard_estop_remains_available_with_ps4_input(self) -> None:
+        fake_pygame = SimpleNamespace(
+            QUIT=1,
+            KEYDOWN=2,
+            K_ESCAPE=27,
+            K_RETURN=13,
+            K_r=ord("r"),
+            K_SPACE=32,
+            K_c=ord("c"),
+        )
+        state = merge_keyboard_control_events(
+            InputState(throttle=0.5),
+            [SimpleNamespace(type=2, key=32)],
+            fake_pygame,
+        )
+        self.assertEqual(state.throttle, 0.5)
+        self.assertTrue(state.emergency_stop)
+
+
 class PublisherTests(unittest.TestCase):
     def test_stored_status_error_blocks_motion_but_still_attempts_zero(self) -> None:
         publisher = object.__new__(RosbridgeTwistPublisher)
@@ -276,6 +380,7 @@ class PublisherTests(unittest.TestCase):
         publisher._error = RuntimeError("advertise rejected")
         publisher._sequence = 0
         publisher._topic = "/robot/joy_mapper_node/car_cmd"
+        publisher._advertisement_id = "test-command"
         sent: list[dict[str, object]] = []
         publisher._send = sent.append
 

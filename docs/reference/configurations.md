@@ -10,7 +10,7 @@
 |   |-- imitation_learning/
 |   |   |-- train/
 |   |   `-- val/
-|   |-- physical_model_control/
+|   |-- physical_control/
 |   `-- evaluations/
 |       |-- il_gym_duckietown/
 |       |-- rl_gym_duckietown/

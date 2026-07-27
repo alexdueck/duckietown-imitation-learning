@@ -40,6 +40,7 @@ still optimization but not the kind we were hoping for.
   CSV diagnostics
 - Standalone HTML reports for completed or running PPO experiments
 - Manual reward inspection and visual policy evaluation tools
+- Unified manual/IL/PPO control of a physical Duckiebot over rosbridge
 
 ## Quick Start
 
@@ -95,6 +96,7 @@ Experiment artifacts live outside the Git repository by default:
 ~/duckietown/
 |-- data/
 |   |-- imitation_learning/
+|   |-- physical_control/
 |   `-- evaluations/
 `-- checkpoints/
     |-- imitation_learning/

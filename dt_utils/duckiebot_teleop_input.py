@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import math
-import socket
-from time import monotonic
 from typing import Any
+
 
 @dataclass(frozen=True)
 class InputState:
@@ -136,72 +134,8 @@ class KeyboardInput:
         )
 
 
-class PS4Input:
-    """SDL/pygame adapter for a DualShock 4 (axis and button IDs configurable)."""
-
-    name = "ps4"
-
-    def __init__(
-        self,
-        pygame_module: Any,
-        joystick: Any,
-        *,
-        throttle_axis: int = 1,
-        steering_axis: int = 0,
-        arm_button: int = 0,
-        recording_button: int = 6,
-        emergency_button: int = 1,
-        clear_button: int = 3,
-    ) -> None:
-        self.pg = pygame_module
-        self.joystick = joystick
-        self.throttle_axis = throttle_axis
-        self.steering_axis = steering_axis
-        self.buttons = {
-            arm_button: "arm_toggle",
-            recording_button: "recording_toggle",
-            emergency_button: "emergency_stop",
-            clear_button: "clear_emergency_stop",
-        }
-        unavailable = [
-            button
-            for button in self.buttons
-            if not 0 <= button < joystick.get_numbuttons()
-        ]
-        if unavailable:
-            raise ValueError(
-                f"Controller has {joystick.get_numbuttons()} buttons; "
-                f"button(s) {unavailable} are unavailable"
-            )
-        self._button_pressed = {
-            button: bool(joystick.get_button(button)) for button in self.buttons
-        }
-
-    def poll(self, events: list[Any]) -> InputState:
-        flags = dict.fromkeys(self.buttons.values(), False)
-        quit_requested = False
-        for event in events:
-            if event.type == self.pg.QUIT:
-                quit_requested = True
-            elif event.type == self.pg.KEYDOWN and event.key == self.pg.K_ESCAPE:
-                quit_requested = True
-
-        # Poll button state instead of relying on JOYBUTTONDOWN. On macOS,
-        # SDL can expose the axes while omitting raw joystick button events.
-        for button, flag in self.buttons.items():
-            pressed = bool(self.joystick.get_button(button))
-            flags[flag] |= pressed and not self._button_pressed[button]
-            self._button_pressed[button] = pressed
-        return InputState(
-            throttle=-_axis(self.joystick, self.throttle_axis),
-            steering=-_axis(self.joystick, self.steering_axis),
-            quit=quit_requested,
-            **flags,
-        )
-
-
 class SDLControllerInput:
-    """Standardized SDL GameController adapter used by the macOS bridge."""
+    """Standardized SDL GameController adapter used by the macOS runtime."""
 
     name = "ps4"
 
@@ -261,102 +195,6 @@ class SDLControllerInput:
             quit=quit_requested,
             **flags,
         )
-
-
-class RemoteInput:
-    """Receive newline-delimited InputState objects from the macOS host."""
-
-    name = "ps4-bridge"
-
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        *,
-        connect_timeout: float = 10.0,
-        stale_timeout: float = 0.5,
-    ) -> None:
-        if not 1 <= port <= 65535:
-            raise ValueError("bridge port must be between 1 and 65535")
-        self._socket = socket.create_connection((host, port), timeout=connect_timeout)
-        self._socket.setblocking(False)
-        self._buffer = b""
-        self._latest = InputState()
-        self._last_message_at = monotonic()
-        self._stale_timeout = stale_timeout
-
-    def poll(self, events: list[Any] | None = None) -> InputState:
-        del events
-        arm = recording = emergency = clear = quit_requested = False
-        while True:
-            try:
-                chunk = self._socket.recv(65536)
-            except BlockingIOError:
-                break
-            if not chunk:
-                raise RuntimeError("PS4 host bridge disconnected")
-            self._buffer += chunk
-
-        while b"\n" in self._buffer:
-            line, self._buffer = self._buffer.split(b"\n", 1)
-            if not line:
-                continue
-            state = input_state_from_json(line)
-            self._latest = state
-            self._last_message_at = monotonic()
-            arm |= state.arm_toggle
-            recording |= state.recording_toggle
-            emergency |= state.emergency_stop
-            clear |= state.clear_emergency_stop
-            quit_requested |= state.quit
-
-        if monotonic() - self._last_message_at > self._stale_timeout:
-            raise RuntimeError("PS4 host bridge timed out")
-        return InputState(
-            throttle=self._latest.throttle,
-            steering=self._latest.steering,
-            arm_toggle=arm,
-            recording_toggle=recording,
-            emergency_stop=emergency,
-            clear_emergency_stop=clear,
-            quit=quit_requested,
-        )
-
-    def close(self) -> None:
-        self._socket.close()
-
-
-def input_state_from_json(payload: bytes | str) -> InputState:
-    data = json.loads(payload)
-    if not isinstance(data, dict):
-        raise ValueError("bridge message must be a JSON object")
-    allowed = set(InputState.__dataclass_fields__)
-    unknown = set(data) - allowed
-    if unknown:
-        raise ValueError(f"unknown bridge fields: {', '.join(sorted(unknown))}")
-    state = InputState(**data)
-    if not math.isfinite(float(state.throttle)) or not math.isfinite(
-        float(state.steering)
-    ):
-        raise ValueError("bridge axes must be finite")
-    return InputState(
-        throttle=max(-1.0, min(1.0, float(state.throttle))),
-        steering=max(-1.0, min(1.0, float(state.steering))),
-        arm_toggle=bool(state.arm_toggle),
-        recording_toggle=bool(state.recording_toggle),
-        emergency_stop=bool(state.emergency_stop),
-        clear_emergency_stop=bool(state.clear_emergency_stop),
-        quit=bool(state.quit),
-    )
-
-
-def _axis(joystick: Any, index: int) -> float:
-    if not 0 <= index < joystick.get_numaxes():
-        raise ValueError(
-            f"Controller has {joystick.get_numaxes()} axes; axis {index} is unavailable"
-        )
-    value = float(joystick.get_axis(index))
-    return max(-1.0, min(1.0, value)) if math.isfinite(value) else 0.0
 
 
 def _sdl_axis(controller: Any, index: int) -> float:

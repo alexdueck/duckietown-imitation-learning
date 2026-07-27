@@ -1,4 +1,4 @@
-"""Unit tests for device-neutral teleop and physical dataset recording."""
+"""Tests for manual physical control and physical dataset recording."""
 
 from __future__ import annotations
 
@@ -14,9 +14,8 @@ from dt_utils.duckiebot_teleop_input import (
     DriveProfile,
     InputState,
     SDLControllerInput,
-    input_state_from_json,
 )
-from physical_duckiebot_teleop import _effective_wheels
+from physical_duckiebot_control import effective_wheel_actions
 from dt_utils.duckiebot_hardware_control import (
     ChassisCommand,
     PhysicalControlLimits,
@@ -61,51 +60,6 @@ class ActionMixerTests(unittest.TestCase):
         self.assertAlmostEqual(action[0], -1.0)
         self.assertAlmostEqual(action[1], -1.0 / 3.0)
 
-    def test_bridge_message_is_validated_and_clamped(self) -> None:
-        state = input_state_from_json(
-            '{"throttle":2,"steering":-2,"recording_toggle":true}'
-        )
-        self.assertEqual(state.throttle, 1.0)
-        self.assertEqual(state.steering, -1.0)
-        self.assertTrue(state.recording_toggle)
-
-    def test_bridge_rejects_unknown_fields(self) -> None:
-        with self.assertRaises(ValueError):
-            input_state_from_json('{"throttle":0,"surprise":true}')
-
-    def test_ps4_button_polling_emits_only_rising_edge(self) -> None:
-        class FakePygame:
-            QUIT = 1
-            KEYDOWN = 2
-            K_ESCAPE = 27
-
-        class FakeJoystick:
-            buttons = [False] * 7
-
-            def get_numbuttons(self):
-                return len(self.buttons)
-
-            def get_button(self, index):
-                return self.buttons[index]
-
-            def get_numaxes(self):
-                return 2
-
-            def get_axis(self, index):
-                return 0.0
-
-        from dt_utils.duckiebot_teleop_input import PS4Input
-
-        joystick = FakeJoystick()
-        controller = PS4Input(FakePygame(), joystick)
-        joystick.buttons[0] = True
-        self.assertTrue(controller.poll([]).arm_toggle)
-        self.assertFalse(controller.poll([]).arm_toggle)
-        joystick.buttons[0] = False
-        controller.poll([])
-        joystick.buttons[0] = True
-        self.assertTrue(controller.poll([]).arm_toggle)
-
     def test_standard_sdl_controller_normalizes_signed_axes(self) -> None:
         class FakePygame:
             QUIT = 1
@@ -146,7 +100,7 @@ class EffectiveWheelTests(unittest.TestCase):
             armed=True,
             emergency_stop_latched=False,
         )
-        self.assertEqual(_effective_wheels(command, limits), (0.0, 1.0))
+        self.assertEqual(effective_wheel_actions(command, limits), (0.0, 1.0))
 
 
 class RecorderTests(unittest.TestCase):

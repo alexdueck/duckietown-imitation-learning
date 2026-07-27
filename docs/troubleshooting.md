@@ -29,32 +29,22 @@ export PATH="/opt/X11/bin:$PATH"
 An adjacent warning about a missing Avahi socket is a separate mDNS issue.
 Use `dts start_gui_tools --ip ...` when connecting to the robot by address.
 
-## `No module named 'rospy'` with `docker exec`
-
-`docker exec ... python3` does not run the Duckietown launcher's interactive
-shell initialization. Use the repository wrapper, which sources both ROS
-Noetic and the Duckietown catkin workspace before starting Python:
-
-```bash
-docker exec -it duckiebot-camera-tools \
-  bash /workspace/run_physical_duckiebot_teleop.sh \
-  realbot \
-  --input ps4-bridge \
-  --output-dir /workspace/duckiebot_recordings
-```
-
 ## Inputs arrive but the physical Duckiebot does not move
 
-With Docker Desktop, a normal `rospy.Publisher` advertises a callback such as
-`http://docker-desktop:RANDOM_PORT/`. The physical robot cannot resolve or
-reach that container-internal TCPROS endpoint. Camera subscription still
-works because that connection is initiated in the opposite direction.
+`physical_duckiebot_control.py` uses the robot's rosbridge WebSocket for both
+camera input and command output. The current Duckiebot image exposes it on
+port 9001. Confirm the selected address and port, then check that the onboard
+`car_cmd_switch_node` still selects the joystick source.
 
-`physical_duckiebot_teleop.py` therefore publishes commands through the
-robot's outbound-reachable rosbridge WebSocket by default. The current
-Duckiebot image exposes it on port 9001. `--command-transport ros` remains
-available for native Linux networking where the robot can reach the ROS node
-directly.
+```bash
+python physical_duckiebot_control.py realbot \
+  --robot-ip ROBOT_IP \
+  --status-period 1
+```
+
+The status output should show a fresh camera age, `armed=1`, reason `active`,
+and nonzero `v` or `omega`. If those values are correct but the robot does not
+move, inspect the onboard command switch and wheel-driver state.
 
 ## `pip show gym-duckietown` Says Not Found
 

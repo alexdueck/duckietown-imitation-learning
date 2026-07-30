@@ -8,6 +8,7 @@ import unittest
 from types import SimpleNamespace
 
 import torch
+import numpy as np
 
 from dt_utils.temporal_rl import (
     FixedHistory,
@@ -18,7 +19,10 @@ from dt_utils.temporal_rl import (
     validate_history_lengths,
 )
 from train_rl_ppo_gym_duckietown import (
+    DEFAULT_MAP_NAMES,
+    choose_episode_map,
     environment_camera_calibration,
+    normalize_map_names,
     previous_camera_calibration_history,
     restore_resume_configuration,
 )
@@ -215,6 +219,8 @@ class ResumeConfigurationTests(unittest.TestCase):
     @staticmethod
     def args() -> argparse.Namespace:
         return argparse.Namespace(
+            map_name="loop_empty",
+            map_names=DEFAULT_MAP_NAMES,
             model="mobilenet_v3_small",
             action_mode="wheel",
             fixed_throttle=None,
@@ -240,6 +246,8 @@ class ResumeConfigurationTests(unittest.TestCase):
         self.assertEqual(args.action_history_length, 0)
         self.assertEqual(args.temporal_head_mode, TEMPORAL_HEAD_MODE_RESIDUAL)
         self.assertFalse(args.domain_rand)
+        self.assertEqual(args.map_names, ("loop_empty",))
+        self.assertEqual(args.map_name, "loop_empty")
 
     def test_explicit_incompatible_history_is_rejected(self) -> None:
         args = self.args()
@@ -268,6 +276,45 @@ class ResumeConfigurationTests(unittest.TestCase):
                 checkpoint,
                 {"--temporal-head-mode"},
             )
+
+    def test_explicit_map_names_override_checkpoint_maps(self) -> None:
+        args = self.args()
+        args.map_names = ("small_loop", "zigzag_dists")
+        args.map_name = "small_loop"
+
+        restore_resume_configuration(
+            args,
+            {"map_names": ("loop_empty",)},
+            {"--map-name"},
+        )
+
+        self.assertEqual(args.map_names, ("small_loop", "zigzag_dists"))
+
+
+class MultiMapConfigurationTests(unittest.TestCase):
+    def test_default_maps_are_unique(self) -> None:
+        self.assertEqual(
+            DEFAULT_MAP_NAMES,
+            ("loop_empty", "small_loop", "zigzag_dists"),
+        )
+        self.assertEqual(normalize_map_names(DEFAULT_MAP_NAMES), DEFAULT_MAP_NAMES)
+
+    def test_duplicate_maps_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "duplicates"):
+            normalize_map_names(("loop_empty", "loop_empty"))
+
+    def test_map_sampling_is_reproducible_and_can_be_forced(self) -> None:
+        first_rng = np.random.default_rng(123)
+        second_rng = np.random.default_rng(123)
+        first = [choose_episode_map(DEFAULT_MAP_NAMES, first_rng) for _ in range(20)]
+        second = [choose_episode_map(DEFAULT_MAP_NAMES, second_rng) for _ in range(20)]
+
+        self.assertEqual(first, second)
+        self.assertGreater(len(set(first)), 1)
+        self.assertEqual(
+            choose_episode_map(DEFAULT_MAP_NAMES, first_rng, "small_loop"),
+            "small_loop",
+        )
 
 
 if __name__ == "__main__":

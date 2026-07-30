@@ -209,6 +209,18 @@ python train_rl_ppo_gym_duckietown.py \
   --total-steps 100000
 ```
 
+Without `--map-name`, training samples equally from `loop_empty`, `small_loop`,
+and `zigzag_dists` at every episode reset. Repeat the option to select a custom
+map set:
+
+```bash
+python train_rl_ppo_gym_duckietown.py \
+  --map-name loop_empty \
+  --map-name small_loop
+```
+
+Each fixed evaluation seed is evaluated separately on every configured map.
+
 | Group | Parameters | Meaning |
 | --- | --- | --- |
 | Run/output | `--output-dir`, `--exp-name`, `--seed`, `--device`, `--log-level` | Name and locate the run; configure reproducibility/runtime |

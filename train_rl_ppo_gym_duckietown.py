@@ -74,11 +74,15 @@ from dt_utils.velopose_reward import (
 )
 
 
+DEFAULT_MAP_NAMES = ("loop_empty", "small_loop", "zigzag_dists")
+
+
 @dataclass
 class PPOConfig:
     output_dir: str
     exp_name: str | None
     map_name: str
+    map_names: tuple[str, ...]
     reward_function: str
     vd2pp_distance_weight: float
     model: str
@@ -179,6 +183,15 @@ def parse_experiment_name(value: str) -> str:
     return value
 
 
+def normalize_map_names(map_names: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    normalized = tuple(map_name.strip() for map_name in map_names)
+    if not normalized or any(not map_name for map_name in normalized):
+        raise ValueError("At least one non-empty --map-name is required")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("--map-name must not contain duplicates")
+    return normalized
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO in gym-duckietown.")
     parser.add_argument(
@@ -192,7 +205,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional experiment name appended to the timestamped run directory.",
     )
-    parser.add_argument("--map-name", default="loop_empty")
+    parser.add_argument(
+        "--map-name",
+        dest="map_names",
+        action="append",
+        metavar="MAP_NAME",
+        default=None,
+        help=(
+            "Training map; repeat for multiple maps. Defaults to loop_empty, "
+            "small_loop, and zigzag_dists."
+        ),
+    )
     parser.add_argument(
         "--reward-function",
         choices=REWARD_FUNCTION_CHOICES,
@@ -382,7 +405,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug-initial-action", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
-    return parse_args_with_completion(parser)
+    args = parse_args_with_completion(parser)
+    args.map_names = normalize_map_names(args.map_names or DEFAULT_MAP_NAMES)
+    args.map_name = args.map_names[0]
+    return args
 
 
 def explicit_cli_options(argv: list[str]) -> set[str]:
@@ -395,6 +421,7 @@ def restore_resume_configuration(
     explicit_options: set[str],
 ) -> list[str]:
     legacy_history_length = int(checkpoint_config.get("observation_history_length", 1))
+    restored_map_configuration = False
     restored = {
         "model": checkpoint_config.get("model", args.model),
         "action_mode": checkpoint_config.get("action_mode", "wheel"),
@@ -435,7 +462,33 @@ def restore_resume_configuration(
                 f"value {checkpoint_value!r}. Remove the option or use a compatible checkpoint."
             )
         setattr(args, key, checkpoint_value)
-    return sorted(restored)
+    if "--map-name" not in explicit_options:
+        checkpoint_map_names = checkpoint_config.get("map_names")
+        if checkpoint_map_names is None:
+            checkpoint_map_names = (
+                checkpoint_config.get("map_name", args.map_name),
+            )
+        args.map_names = normalize_map_names(tuple(checkpoint_map_names))
+        args.map_name = args.map_names[0]
+        restored_map_configuration = True
+    restored_keys = sorted(restored)
+    if restored_map_configuration:
+        restored_keys.append("map_names")
+    return restored_keys
+
+
+def validate_available_map_names(map_names: tuple[str, ...]) -> None:
+    from duckietown_world.resources import list_maps2
+
+    available = set(list_maps2())
+    missing = [map_name for map_name in map_names if map_name not in available]
+    if missing:
+        raise ValueError(
+            "Unknown gym-duckietown map(s): "
+            + ", ".join(missing)
+            + ". Available maps include: "
+            + ", ".join(sorted(available))
+        )
 
 
 def gym_duckietown_version() -> str:
@@ -537,6 +590,7 @@ def build_checkpoint_metadata(
         camera_calibration = environment_camera_calibration(raw_env)
         camera_calibration["training_context"] = {
             "map_name": config.map_name,
+            "map_names": list(config.map_names),
             "master_seed": config.seed,
             "resumed_from_checkpoint": config.resume_checkpoint,
         }
@@ -556,7 +610,7 @@ def build_checkpoint_metadata(
         else "zero-initialized output layer over current-frame head"
     )
     return {
-        "metadata_schema_version": 2,
+        "metadata_schema_version": 3,
         "domain_rand": config.domain_rand,
         "dynamics_rand": config.dynamics_rand,
         "camera_rand": config.camera_rand,
@@ -570,7 +624,9 @@ def build_checkpoint_metadata(
             "class": environment_class,
             "gym_duckietown_version": gym_duckietown_version(),
             "map_name": config.map_name,
-            "map_list": [config.map_name],
+            "map_list": list(config.map_names),
+            "map_sampling": "uniform_per_episode",
+            "evaluation_map_sampling": "every_seed_on_every_map",
             "master_seed": config.seed,
             "seed_config": {
                 "source": config.start_seeds_config,
@@ -885,6 +941,7 @@ def make_env(args: argparse.Namespace, seed: int | None = None):
     return Simulator(
         seed=args.seed if seed is None else seed,
         map_name=args.map_name,
+        randomize_maps_on_reset=False,
         max_steps=simulator_max_steps,
         draw_curve=False,
         draw_bbox=False,
@@ -924,6 +981,34 @@ def step_raw(env, action: np.ndarray):
     truncated = bool(done and done_code == MAX_STEPS_DONE_CODE)
     terminated = bool(done and not truncated)
     return observation, reward, terminated, truncated, info
+
+
+def current_environment_map(env) -> str:
+    raw_env = getattr(env, "unwrapped", env)
+    map_name = getattr(raw_env, "map_name", None)
+    if not isinstance(map_name, str) or not map_name:
+        raise RuntimeError("gym-duckietown environment does not expose its current map")
+    return map_name
+
+
+def choose_episode_map(
+    map_names: tuple[str, ...],
+    rng: np.random.Generator,
+    requested_map: str | None = None,
+) -> str:
+    if requested_map is not None:
+        if requested_map not in map_names:
+            raise ValueError(
+                f"Requested map {requested_map!r} is not in configured maps {map_names!r}"
+            )
+        return requested_map
+    return map_names[int(rng.integers(0, len(map_names)))]
+
+
+def load_environment_map(env, map_name: str) -> None:
+    raw_env = getattr(env, "unwrapped", env)
+    raw_env.randomize_maps_on_reset = False
+    raw_env._load_map(map_name)
 
 
 def render_training_environment(env) -> None:
@@ -991,9 +1076,8 @@ def capture_environment_start_defaults(env) -> EnvironmentStartDefaults:
 
 def apply_training_start(env, training_start: TrainingStart, defaults: EnvironmentStartDefaults) -> None:
     raw_env = getattr(env, "unwrapped", env)
+    raw_env.user_tile_start = deepcopy(defaults.user_tile_start)
     if training_start.pose is None:
-        raw_env.user_tile_start = deepcopy(defaults.user_tile_start)
-        raw_env.start_pose = deepcopy(defaults.start_pose)
         return
 
     apply_env_start_pose(env, training_start.pose)
@@ -1007,6 +1091,12 @@ def reset_training_environment(
     training_start: TrainingStart,
     defaults: EnvironmentStartDefaults,
 ):
+    selected_map = choose_episode_map(
+        args.map_names,
+        rng,
+        requested_map=training_start.map_name,
+    )
+    load_environment_map(env, selected_map)
     apply_training_start(env, training_start, defaults)
     observation, info = reset_environment(
         env,
@@ -1022,9 +1112,9 @@ def reset_training_environment(
             pose_label = training_start.name or "unnamed"
             raise ValueError(
                 f"Training pose {pose_label!r} from {args.start_seeds_config} is not valid "
-                f"on map {args.map_name!r}"
+                f"on map {selected_map!r}"
             )
-    return observation, info
+    return observation, info, selected_map
 
 
 def done_reason(
@@ -1053,6 +1143,7 @@ def write_training_episode(
     episode_length: int,
     reason: str,
     training_start: TrainingStart,
+    map_name: str,
 ) -> None:
     with metrics_file.open("a", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=metrics_fields)
@@ -1066,6 +1157,7 @@ def write_training_episode(
             "start_type": training_start.kind,
             "start_seed": training_start.seed,
             "start_name": training_start.name,
+            "map_name": map_name,
         })
 
 
@@ -1076,6 +1168,7 @@ def evaluate_policy(
     reward_calculator: GymDuckietownRewardCalculator,
     args: argparse.Namespace,
     evaluation_poses: tuple[TrainingPose, ...],
+    evaluation_pose_map_name: str | None,
     start_defaults: EnvironmentStartDefaults,
     transform: transforms.Compose,
     device: torch.device,
@@ -1090,20 +1183,27 @@ def evaluate_policy(
     aggregate_components = RewardComponentAccumulator()
 
     evaluation_starts = [
-        TrainingStart(kind="eval_seed", seed=seed)
+        TrainingStart(kind="eval_seed", seed=seed, map_name=map_name)
+        for map_name in args.map_names
         for seed in args.eval_seeds
     ]
+    if evaluation_poses and evaluation_pose_map_name is None:
+        raise ValueError("Evaluation poses require an associated map")
     evaluation_starts.extend(
         TrainingStart(
             kind="eval_pose",
             seed=args.seed + 100_000 + pose_index,
             pose=pose,
+            map_name=evaluation_pose_map_name,
         )
         for pose_index, pose in enumerate(evaluation_poses)
     )
 
     policy.eval()
     for scenario_index, evaluation_start in enumerate(evaluation_starts, start=1):
+        if evaluation_start.map_name is None:
+            raise RuntimeError("Evaluation scenarios must specify a map")
+        load_environment_map(env, evaluation_start.map_name)
         apply_training_start(env, evaluation_start, start_defaults)
         scenario_seed = evaluation_start.seed
         if scenario_seed is None:
@@ -1131,7 +1231,7 @@ def evaluate_policy(
             pose_label = evaluation_start.name or "unnamed"
             raise ValueError(
                 f"Evaluation pose {pose_label!r} from {args.start_seeds_config} is not valid "
-                f"on map {args.map_name!r}"
+                f"on map {evaluation_start.map_name!r}"
             )
         start_position = np.asarray(raw_env.cur_pos, dtype=np.float64).copy()
         start_angle = float(raw_env.cur_angle)
@@ -1196,6 +1296,7 @@ def evaluate_policy(
             "scenario_type": evaluation_start.kind,
             "scenario_seed": scenario_seed,
             "scenario_name": evaluation_start.name,
+            "map_name": current_environment_map(env),
             "start_x": float(start_position[0]),
             "start_y": float(start_position[1]),
             "start_z": float(start_position[2]),
@@ -1346,12 +1447,13 @@ def main() -> None:
         )
     start_config = None
     if args.start_seeds_config is not None:
-        start_config = load_start_config(args.start_seeds_config, args.map_name)
+        start_config = load_start_config(args.start_seeds_config, args.map_names)
         args.start_seeds_config = start_config.source_path
         args.eval_seeds = start_config.evaluation_seeds
     configure_gym_duckietown_logging(args.log_level)
     ensure_gym_duckietown_available()
     configure_gym_duckietown_logging(args.log_level)
+    validate_available_map_names(args.map_names)
 
     set_seed(args.seed)
     reset_rng = np.random.default_rng(args.seed + 1)
@@ -1541,6 +1643,7 @@ def main() -> None:
         "start_type",
         "start_seed",
         "start_name",
+        "map_name",
         "policy_loss",
         "value_loss",
         "entropy",
@@ -1649,6 +1752,7 @@ def main() -> None:
         "scenario_type",
         "scenario_seed",
         "scenario_name",
+        "map_name",
         "start_x",
         "start_y",
         "start_z",
@@ -1712,7 +1816,8 @@ def main() -> None:
                 + ", ".join(resumed_configuration_keys),
                 flush=True,
             )
-        print(f"Environment: gym-duckietown map={args.map_name}", flush=True)
+        print(f"Environment: gym-duckietown maps={','.join(args.map_names)}", flush=True)
+        print("Map sampling: uniform per episode", flush=True)
         print(f"Environment class: {checkpoint_metadata['environment']['class']}", flush=True)
         print(
             f"gym-duckietown version: {checkpoint_metadata['environment']['gym_duckietown_version']}",
@@ -1781,8 +1886,9 @@ def main() -> None:
             len(start_config.evaluation_poses) if start_config is not None else 0
         )
         print(
-            f"Evaluation scenarios: seeds={len(args.eval_seeds)} "
-            f"poses={evaluation_pose_count}",
+            f"Evaluation scenarios: maps={len(args.map_names)} "
+            f"seeds_per_map={len(args.eval_seeds)} poses={evaluation_pose_count} "
+            f"total={len(args.map_names) * len(args.eval_seeds) + evaluation_pose_count}",
             flush=True,
         )
         if start_config is None:
@@ -1793,7 +1899,7 @@ def main() -> None:
                 args.hard_start_probability,
                 start_rng,
             )
-        observation, info = reset_training_environment(
+        observation, info, current_training_map = reset_training_environment(
             env,
             args,
             reset_rng,
@@ -1950,11 +2056,13 @@ def main() -> None:
                         episode_length,
                         reason,
                         training_start,
+                        current_training_map,
                     )
                     print(
                         f"step={global_step} episode={episode} return={episode_return:.3f} "
                         f"length={episode_length} reward_per_step={episode_return / max(1, episode_length):.4f} "
                         f"done_reason={reason} start_type={training_start.kind} "
+                        f"map={current_training_map} "
                         f"start_seed={training_start.seed if training_start.seed is not None else 'continued_rng'} "
                         f"start_name={training_start.name or '-'}",
                         flush=True,
@@ -1965,7 +2073,7 @@ def main() -> None:
                         args.hard_start_probability,
                         start_rng,
                     )
-                    observation, info = reset_training_environment(
+                    observation, info, current_training_map = reset_training_environment(
                         env,
                         args,
                         reset_rng,
@@ -2310,6 +2418,9 @@ def main() -> None:
                     eval_reward_calculator,
                     args,
                     start_config.evaluation_poses if start_config is not None else (),
+                    (
+                        start_config.map_name if start_config is not None else None
+                    ),
                     eval_start_defaults,
                     transform,
                     device,

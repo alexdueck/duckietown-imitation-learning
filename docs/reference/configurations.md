@@ -54,7 +54,9 @@ Schema:
 
 Rules:
 
-- `map_name` must match the environment.
+- `map_name` must be one of the trainer's configured maps. Curated training
+  seeds and poses are used only on that map; evaluation seeds run on every
+  configured map, while evaluation poses remain tied to this map.
 - Seeds are non-negative unique integers.
 - Training and evaluation seeds may not overlap.
 - A trainer config needs at least one training seed/pose and one evaluation

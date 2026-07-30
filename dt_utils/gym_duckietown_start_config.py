@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import json
 import math
 from dataclasses import dataclass
@@ -44,6 +45,7 @@ class TrainingStart:
     kind: str
     seed: int | None
     pose: TrainingPose | None = None
+    map_name: str | None = None
 
     @property
     def name(self) -> str | None:
@@ -135,7 +137,7 @@ def apply_env_start_pose(env, pose: TrainingPose) -> None:
 
 def load_start_config(
     path: Path,
-    expected_map_name: str,
+    expected_map_name: str | Sequence[str],
     *,
     require_training_starts: bool = True,
     require_evaluation_scenarios: bool = True,
@@ -160,9 +162,15 @@ def load_start_config(
     map_name = data["map_name"]
     if not isinstance(map_name, str) or not map_name:
         raise ValueError(f"{resolved_path}: 'map_name' must be a non-empty string")
-    if map_name != expected_map_name:
+    expected_map_names = (
+        (expected_map_name,)
+        if isinstance(expected_map_name, str)
+        else tuple(expected_map_name)
+    )
+    if map_name not in expected_map_names:
         raise ValueError(
-            f"{resolved_path}: map_name is {map_name!r}, but the environment uses {expected_map_name!r}"
+            f"{resolved_path}: map_name is {map_name!r}, but the environment uses "
+            f"{expected_map_names!r}"
         )
 
     training_seeds = _parse_seed_list(
@@ -260,15 +268,23 @@ def choose_training_start(
     if rng.random() < hard_start_probability:
         hard_start_index = int(rng.integers(0, hard_start_count))
         if hard_start_index < len(config.training_seeds):
-            return TrainingStart(kind="hard_seed", seed=config.training_seeds[hard_start_index])
+            return TrainingStart(
+                kind="hard_seed",
+                seed=config.training_seeds[hard_start_index],
+                map_name=config.map_name,
+            )
         pose = config.training_poses[hard_start_index - len(config.training_seeds)]
         return TrainingStart(
             kind="hard_pose",
             seed=_draw_random_reset_seed(config, rng),
             pose=pose,
+            map_name=config.map_name,
         )
 
-    return TrainingStart(kind="random", seed=_draw_random_reset_seed(config, rng))
+    return TrainingStart(
+        kind="random",
+        seed=_draw_random_reset_seed(config, rng),
+    )
 
 
 def _draw_random_reset_seed(config: StartConfig, rng: np.random.Generator) -> int:

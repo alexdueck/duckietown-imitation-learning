@@ -51,8 +51,35 @@ class StartConfigTests(unittest.TestCase):
                 "loop_empty",
             )
             self.assertEqual(
+                payload["training_poses"][0]["name"],
+                "loop_empty_01",
+            )
+            self.assertEqual(
                 payload["evaluation_poses"][0]["map_name"],
                 "small_loop",
+            )
+            self.assertEqual(
+                payload["evaluation_poses"][0]["name"],
+                "small_loop_01",
+            )
+
+    def test_generated_pose_names_are_unique_across_collections(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "starts.json"
+
+            append_training_pose(path, "loop_empty", self.pose())
+            append_evaluation_pose(path, "loop_empty", self.pose())
+            append_training_pose(path, "loop_empty", self.pose())
+
+            payload = json.loads(path.read_text())
+            names = [
+                pose["name"]
+                for collection in ("training_poses", "evaluation_poses")
+                for pose in payload[collection]
+            ]
+            self.assertEqual(
+                names,
+                ["loop_empty_01", "loop_empty_03", "loop_empty_02"],
             )
 
     def test_multi_map_pose_config_loads_and_selects_pose_map(self) -> None:

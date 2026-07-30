@@ -9,7 +9,7 @@ import logging
 import sys
 import types
 from ctypes import POINTER, c_char_p, cast
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,7 @@ from dt_utils.gym_duckietown_start_config import (
     append_training_pose,
     apply_env_start_pose,
     load_pose_file,
+    next_pose_name,
 )
 from dt_utils.duckietown_rewards import (
     REWARD_FUNCTION_CHOICES,
@@ -717,7 +718,10 @@ def main() -> None:
                 print("Cannot save pose without --start-config", flush=True)
                 return
             try:
-                pose = capture_training_pose(env)
+                pose = replace(
+                    capture_training_pose(env),
+                    name=next_pose_name(args.start_config, args.map_name),
+                )
                 append_function = (
                     append_evaluation_pose
                     if collection == "evaluation_poses"
@@ -728,9 +732,10 @@ def main() -> None:
                 pose_save_status = "pose save failed; see terminal"
                 print(f"Could not save {pose_label} pose: {error}", flush=True)
             else:
-                pose_save_status = f"saved {pose_label} pose #{pose_index}"
+                pose_save_status = f"saved {pose_label} pose {pose.name}"
                 print(
-                    f"saved {pose_label}_pose={pose_index} map={args.map_name} tile={pose.tile} "
+                    f"saved {pose_label}_pose={pose_index} name={pose.name} "
+                    f"map={args.map_name} tile={pose.tile} "
                     f"position={pose.position} angle={pose.angle:.8f} "
                     f"config={args.start_config.expanduser()}",
                     flush=True,

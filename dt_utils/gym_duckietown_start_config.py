@@ -233,6 +233,38 @@ def write_start_config(config: StartConfig) -> None:
     temporary_path.replace(config.source_path)
 
 
+def next_available_pose_name(config: StartConfig, map_name: str) -> str:
+    existing_names = {
+        pose.name
+        for pose in (*config.training_poses, *config.evaluation_poses)
+        if pose.name is not None
+    }
+    index = 1
+    while True:
+        candidate = f"{map_name}_{index:02d}"
+        if candidate not in existing_names:
+            return candidate
+        index += 1
+
+
+def next_pose_name(path: Path, map_name: str) -> str:
+    resolved_path = path.expanduser().resolve()
+    if resolved_path.exists():
+        config = load_start_config(
+            resolved_path,
+            None,
+            require_training_starts=False,
+            require_evaluation_scenarios=False,
+        )
+    else:
+        config = StartConfig(
+            source_path=resolved_path,
+            training_poses=(),
+            evaluation_poses=(),
+        )
+    return next_available_pose_name(config, map_name)
+
+
 def append_pose(
     path: Path,
     map_name: str,
@@ -254,7 +286,15 @@ def append_pose(
             evaluation_poses=(),
         )
 
-    captured_pose = replace(pose, map_name=map_name)
+    pose_name = pose.name or next_available_pose_name(config, map_name)
+    existing_names = {
+        existing_pose.name
+        for existing_pose in (*config.training_poses, *config.evaluation_poses)
+        if existing_pose.name is not None
+    }
+    if pose_name in existing_names:
+        raise ValueError(f"pose name {pose_name!r} already exists in {resolved_path}")
+    captured_pose = replace(pose, map_name=map_name, name=pose_name)
     if collection == "training_poses":
         training_poses = (*config.training_poses, captured_pose)
         evaluation_poses = config.evaluation_poses

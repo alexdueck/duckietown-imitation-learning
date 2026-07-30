@@ -36,17 +36,19 @@ python manual_control_gym_duckietown.py \
 
 ```bash
 cp \
-  configs/gym_duckietown_start_seeds.json.template \
-  configs/gym_duckietown_start_seeds.json
+  configs/gym_duckietown_start_poses.json.template \
+  configs/gym_duckietown_start_poses.json
 ```
 
-Edit the local JSON, or start the manual viewer with that path and press `P`
-to append the current valid pose to `training_poses`:
+Edit the local JSON, or start the manual viewer with that path:
 
 ```bash
 python manual_control_gym_duckietown.py \
-  --start-seeds-config configs/gym_duckietown_start_seeds.json
+  --start-config configs/gym_duckietown_start_poses.json
 ```
+
+Press `P` to append the current pose to `training_poses`; press `Shift+P` to
+append it to `evaluation_poses`.
 
 The local `configs/*.json` files are ignored by Git. The templates remain
 versioned.
@@ -113,19 +115,16 @@ This is an experimental configuration, not a universal optimum.
 
 ```bash
 python train_rl_ppo_gym_duckietown.py \
-  --start-seeds-config configs/gym_duckietown_start_seeds.json \
+  --start-config configs/gym_duckietown_start_poses.json \
   --hard-start-probability 0.25 \
-  --map-name loop_empty \
   --reward-function velopose \
   --total-steps 1000000
 ```
 
-At each training reset, a configured training seed or pose is selected with
-the requested probability. Other resets use random seeds that exclude all
-reserved training and evaluation seeds.
+At each training reset, a configured training pose is selected with the
+requested probability. Other resets use the simulator's normal random start.
 
-When a start config is supplied, its evaluation seeds and poses replace
-`--eval-seeds`.
+When a start config is supplied, its evaluation poses replace `--eval-seeds`.
 
 ## Overfit One Scenario Deliberately
 

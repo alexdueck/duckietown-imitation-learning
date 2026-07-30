@@ -20,6 +20,7 @@ from dt_utils.temporal_rl import (
 )
 from train_rl_ppo_gym_duckietown import (
     DEFAULT_MAP_NAMES,
+    assign_evaluation_maps,
     choose_episode_map,
     environment_camera_calibration,
     normalize_map_names,
@@ -314,6 +315,19 @@ class MultiMapConfigurationTests(unittest.TestCase):
         self.assertEqual(
             choose_episode_map(DEFAULT_MAP_NAMES, first_rng, "small_loop"),
             "small_loop",
+        )
+
+    def test_evaluation_assigns_one_reproducible_map_per_seed(self) -> None:
+        evaluation_seeds = (10042, 10043, 10044, 10045)
+
+        first = assign_evaluation_maps(DEFAULT_MAP_NAMES, evaluation_seeds, 42)
+        second = assign_evaluation_maps(DEFAULT_MAP_NAMES, evaluation_seeds, 42)
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), len(evaluation_seeds))
+        self.assertEqual(tuple(seed for seed, _ in first), evaluation_seeds)
+        self.assertTrue(
+            all(map_name in DEFAULT_MAP_NAMES for _, map_name in first)
         )
 
 

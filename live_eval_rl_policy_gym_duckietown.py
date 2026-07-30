@@ -110,7 +110,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
-        "--start-seeds-config",
+        "--start-config",
         type=Path,
         default=None,
         help="Start config containing the evaluation_poses available to this viewer.",
@@ -119,7 +119,7 @@ def parse_args() -> argparse.Namespace:
         "--eval-pose-index",
         type=int,
         default=0,
-        help="Zero-based evaluation_poses index selected from --start-seeds-config.",
+        help="Zero-based evaluation_poses index selected from --start-config.",
     )
     parser.add_argument(
         "--max-steps",
@@ -327,14 +327,14 @@ def apply_checkpoint_defaults(args: argparse.Namespace, config: dict[str, Any]) 
 
 
 def load_evaluation_pose(args: argparse.Namespace) -> TrainingPose | None:
-    if args.start_seeds_config is None:
+    if args.start_config is None:
         return None
     if args.eval_pose_index < 0:
         raise ValueError("--eval-pose-index must be non-negative")
 
     start_config = load_start_config(
-        args.start_seeds_config,
-        args.map_name,
+        args.start_config,
+        None,
         require_training_starts=False,
     )
     if not start_config.evaluation_poses:
@@ -346,7 +346,7 @@ def load_evaluation_pose(args: argparse.Namespace) -> TrainingPose | None:
             f"--eval-pose-index {args.eval_pose_index} is out of range for "
             f"{len(start_config.evaluation_poses)} evaluation pose(s)"
         )
-    args.start_seeds_config = start_config.source_path
+    args.start_config = start_config.source_path
     return start_config.evaluation_poses[args.eval_pose_index]
 
 
@@ -396,7 +396,7 @@ def draw_sidebar(
         ("RL policy in gym-duckietown", 18, ACCENT, True),
         (f"map {args.map_name}   {status}", 13, status_color, True),
     ]
-    if args.start_seeds_config is not None:
+    if args.start_config is not None:
         lines.append((
             f"eval pose {args.eval_pose_index}: {args.eval_pose_name or 'unnamed'}",
             12,
@@ -514,6 +514,8 @@ def main() -> None:
     apply_checkpoint_defaults(args, checkpoint_config)
     evaluation_pose = load_evaluation_pose(args)
     args.eval_pose_name = evaluation_pose.name if evaluation_pose is not None else None
+    if evaluation_pose is not None and evaluation_pose.map_name is not None:
+        args.map_name = evaluation_pose.map_name
 
     if args.max_steps <= 0:
         raise ValueError("--max-steps must be positive")

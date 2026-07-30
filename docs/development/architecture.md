@@ -43,7 +43,7 @@ repository root/
 | `dt_utils/velopose_reward.py` | Pure custom reward equations |
 | `dt_utils/duckietown_action_control.py` | Policy-control to wheel-action mapping |
 | `dt_utils/duckiebot_hardware_control.py` | Fail-closed wheel-action to physical chassis-command mapping |
-| `dt_utils/gym_duckietown_start_config.py` | Seed/pose configuration, validation, and sampling |
+| `dt_utils/gym_duckietown_start_config.py` | Multi-map pose configuration, validation, and sampling |
 
 ## Shared Modules
 

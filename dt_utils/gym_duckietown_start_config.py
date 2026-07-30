@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -18,13 +18,19 @@ class TrainingPose:
     position: tuple[float, float, float]
     angle: float
     name: str | None = None
+    map_name: str | None = None
 
     def as_json(self) -> dict[str, Any]:
-        pose = {
-            "tile": list(self.tile),
-            "position": list(self.position),
-            "angle": self.angle,
-        }
+        pose: dict[str, Any] = {}
+        if self.map_name is not None:
+            pose["map_name"] = self.map_name
+        pose.update(
+            {
+                "tile": list(self.tile),
+                "position": list(self.position),
+                "angle": self.angle,
+            }
+        )
         if self.name is not None:
             pose["name"] = self.name
         return pose
@@ -33,9 +39,6 @@ class TrainingPose:
 @dataclass(frozen=True)
 class StartConfig:
     source_path: Path
-    map_name: str
-    training_seeds: tuple[int, ...]
-    evaluation_seeds: tuple[int, ...]
     training_poses: tuple[TrainingPose, ...]
     evaluation_poses: tuple[TrainingPose, ...]
 
@@ -52,25 +55,6 @@ class TrainingStart:
         return self.pose.name if self.pose is not None else None
 
 
-def _parse_seed_list(
-    data: Any,
-    key: str,
-    path: Path,
-    *,
-    allow_empty: bool = False,
-) -> tuple[int, ...]:
-    if not isinstance(data, list):
-        raise ValueError(f"{path}: {key!r} must be a JSON list")
-    if not data and not allow_empty:
-        raise ValueError(f"{path}: {key!r} must contain at least one seed")
-    if any(isinstance(seed, bool) or not isinstance(seed, int) or seed < 0 for seed in data):
-        raise ValueError(f"{path}: {key!r} must contain non-negative integers only")
-    seeds = tuple(data)
-    if len(set(seeds)) != len(seeds):
-        raise ValueError(f"{path}: {key!r} must not contain duplicate seeds")
-    return seeds
-
-
 def _parse_number(value: Any, label: str, path: Path) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{path}: {label} must be a number")
@@ -80,11 +64,18 @@ def _parse_number(value: Any, label: str, path: Path) -> float:
     return number
 
 
-def _parse_pose(data: Any, label: str, path: Path) -> TrainingPose:
+def _parse_pose(
+    data: Any,
+    label: str,
+    path: Path,
+    *,
+    expected_map_names: tuple[str, ...] | None = None,
+    require_map_name: bool = True,
+) -> TrainingPose:
     if not isinstance(data, dict):
         raise ValueError(f"{path}: {label} must be a JSON object")
     required_keys = {"tile", "position", "angle"}
-    allowed_keys = required_keys | {"name"}
+    allowed_keys = required_keys | {"name", "map_name"}
     missing_keys = required_keys - data.keys()
     unexpected_keys = data.keys() - allowed_keys
     if missing_keys:
@@ -112,11 +103,26 @@ def _parse_pose(data: Any, label: str, path: Path) -> TrainingPose:
     if name is not None and (not isinstance(name, str) or not name.strip()):
         raise ValueError(f"{path}: {label}.name must be a non-empty string or null")
 
+    map_name = data.get("map_name")
+    if map_name is not None and (not isinstance(map_name, str) or not map_name.strip()):
+        raise ValueError(f"{path}: {label}.map_name must be a non-empty string")
+    if map_name is None and require_map_name:
+        raise ValueError(
+            f"{path}: {label} must contain a non-empty 'map_name'"
+        )
+    parsed_map_name = map_name.strip() if isinstance(map_name, str) else None
+    if expected_map_names is not None and parsed_map_name not in expected_map_names:
+        raise ValueError(
+            f"{path}: {label}.map_name is {parsed_map_name!r}, but configured maps are "
+            f"{expected_map_names!r}"
+        )
+
     return TrainingPose(
         tile=(tile[0], tile[1]),
         position=parsed_position,
         angle=_parse_number(data["angle"], f"{label}.angle", path),
         name=name.strip() if isinstance(name, str) else None,
+        map_name=parsed_map_name,
     )
 
 
@@ -126,7 +132,12 @@ def load_pose_file(path: Path) -> TrainingPose:
         data = json.loads(resolved_path.read_text())
     except json.JSONDecodeError as error:
         raise ValueError(f"Invalid JSON in pose file {resolved_path}: {error}") from error
-    return _parse_pose(data, "pose", resolved_path)
+    return _parse_pose(
+        data,
+        "pose",
+        resolved_path,
+        require_map_name=False,
+    )
 
 
 def apply_env_start_pose(env, pose: TrainingPose) -> None:
@@ -137,7 +148,7 @@ def apply_env_start_pose(env, pose: TrainingPose) -> None:
 
 def load_start_config(
     path: Path,
-    expected_map_name: str | Sequence[str],
+    expected_map_name: str | Sequence[str] | None,
     *,
     require_training_starts: bool = True,
     require_evaluation_scenarios: bool = True,
@@ -150,75 +161,62 @@ def load_start_config(
     if not isinstance(data, dict):
         raise ValueError(f"{resolved_path}: top-level JSON value must be an object")
 
-    required_keys = {"map_name", "training_seeds", "evaluation_seeds"}
-    allowed_keys = required_keys | {"training_poses", "evaluation_poses"}
+    required_keys = {"training_poses", "evaluation_poses"}
+    allowed_keys = required_keys
     missing_keys = required_keys - data.keys()
     unexpected_keys = data.keys() - allowed_keys
     if missing_keys:
-        raise ValueError(f"{resolved_path}: missing keys: {', '.join(sorted(missing_keys))}")
+        raise ValueError(
+            f"{resolved_path}: missing keys: {', '.join(sorted(missing_keys))}"
+        )
     if unexpected_keys:
-        raise ValueError(f"{resolved_path}: unexpected keys: {', '.join(sorted(unexpected_keys))}")
-
-    map_name = data["map_name"]
-    if not isinstance(map_name, str) or not map_name:
-        raise ValueError(f"{resolved_path}: 'map_name' must be a non-empty string")
-    expected_map_names = (
-        (expected_map_name,)
-        if isinstance(expected_map_name, str)
-        else tuple(expected_map_name)
-    )
-    if map_name not in expected_map_names:
         raise ValueError(
-            f"{resolved_path}: map_name is {map_name!r}, but the environment uses "
-            f"{expected_map_names!r}"
+            f"{resolved_path}: unexpected keys: {', '.join(sorted(unexpected_keys))}; "
+            "start configs support map-specific training_poses and evaluation_poses only"
         )
 
-    training_seeds = _parse_seed_list(
-        data["training_seeds"],
-        "training_seeds",
-        resolved_path,
-        allow_empty=True,
-    )
-    evaluation_seeds = _parse_seed_list(
-        data["evaluation_seeds"],
-        "evaluation_seeds",
-        resolved_path,
-        allow_empty=True,
-    )
-    overlap = set(training_seeds) & set(evaluation_seeds)
-    if overlap:
-        raise ValueError(
-            f"{resolved_path}: training_seeds and evaluation_seeds overlap: "
-            f"{', '.join(str(seed) for seed in sorted(overlap))}"
+    expected_map_names = None
+    if expected_map_name is not None:
+        expected_map_names = (
+            (expected_map_name,)
+            if isinstance(expected_map_name, str)
+            else tuple(expected_map_name)
         )
 
-    training_poses_data = data.get("training_poses", [])
+    training_poses_data = data["training_poses"]
     if not isinstance(training_poses_data, list):
         raise ValueError(f"{resolved_path}: 'training_poses' must be a JSON list")
     training_poses = tuple(
-        _parse_pose(pose, f"training_poses[{index}]", resolved_path)
+        _parse_pose(
+            pose,
+            f"training_poses[{index}]",
+            resolved_path,
+            expected_map_names=expected_map_names,
+        )
         for index, pose in enumerate(training_poses_data)
     )
-    evaluation_poses_data = data.get("evaluation_poses", [])
+    evaluation_poses_data = data["evaluation_poses"]
     if not isinstance(evaluation_poses_data, list):
         raise ValueError(f"{resolved_path}: 'evaluation_poses' must be a JSON list")
     evaluation_poses = tuple(
-        _parse_pose(pose, f"evaluation_poses[{index}]", resolved_path)
+        _parse_pose(
+            pose,
+            f"evaluation_poses[{index}]",
+            resolved_path,
+            expected_map_names=expected_map_names,
+        )
         for index, pose in enumerate(evaluation_poses_data)
     )
-    if require_training_starts and not training_seeds and not training_poses:
+    if require_training_starts and not training_poses:
         raise ValueError(
-            f"{resolved_path}: configure at least one training seed or training pose"
+            f"{resolved_path}: configure at least one training pose"
         )
-    if require_evaluation_scenarios and not evaluation_seeds and not evaluation_poses:
+    if require_evaluation_scenarios and not evaluation_poses:
         raise ValueError(
-            f"{resolved_path}: configure at least one evaluation seed or evaluation pose"
+            f"{resolved_path}: configure at least one evaluation pose"
         )
     return StartConfig(
         source_path=resolved_path,
-        map_name=map_name,
-        training_seeds=training_seeds,
-        evaluation_seeds=evaluation_seeds,
         training_poses=training_poses,
         evaluation_poses=evaluation_poses,
     )
@@ -226,34 +224,63 @@ def load_start_config(
 
 def write_start_config(config: StartConfig) -> None:
     payload = {
-        "map_name": config.map_name,
-        "training_seeds": list(config.training_seeds),
-        "evaluation_seeds": list(config.evaluation_seeds),
         "training_poses": [pose.as_json() for pose in config.training_poses],
         "evaluation_poses": [pose.as_json() for pose in config.evaluation_poses],
     }
+    config.source_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = config.source_path.with_name(f".{config.source_path.name}.tmp")
     temporary_path.write_text(json.dumps(payload, indent=2) + "\n")
     temporary_path.replace(config.source_path)
 
 
-def append_training_pose(path: Path, expected_map_name: str, pose: TrainingPose) -> int:
-    config = load_start_config(
-        path,
-        expected_map_name,
-        require_training_starts=False,
-        require_evaluation_scenarios=False,
-    )
+def append_pose(
+    path: Path,
+    map_name: str,
+    pose: TrainingPose,
+    collection: str,
+) -> int:
+    resolved_path = path.expanduser().resolve()
+    if resolved_path.exists():
+        config = load_start_config(
+            resolved_path,
+            None,
+            require_training_starts=False,
+            require_evaluation_scenarios=False,
+        )
+    else:
+        config = StartConfig(
+            source_path=resolved_path,
+            training_poses=(),
+            evaluation_poses=(),
+        )
+
+    captured_pose = replace(pose, map_name=map_name)
+    if collection == "training_poses":
+        training_poses = (*config.training_poses, captured_pose)
+        evaluation_poses = config.evaluation_poses
+        pose_count = len(training_poses)
+    elif collection == "evaluation_poses":
+        training_poses = config.training_poses
+        evaluation_poses = (*config.evaluation_poses, captured_pose)
+        pose_count = len(evaluation_poses)
+    else:
+        raise ValueError(f"unknown pose collection {collection!r}")
+
     updated_config = StartConfig(
         source_path=config.source_path,
-        map_name=config.map_name,
-        training_seeds=config.training_seeds,
-        evaluation_seeds=config.evaluation_seeds,
-        training_poses=(*config.training_poses, pose),
-        evaluation_poses=config.evaluation_poses,
+        training_poses=training_poses,
+        evaluation_poses=evaluation_poses,
     )
     write_start_config(updated_config)
-    return len(updated_config.training_poses)
+    return pose_count
+
+
+def append_training_pose(path: Path, map_name: str, pose: TrainingPose) -> int:
+    return append_pose(path, map_name, pose, "training_poses")
+
+
+def append_evaluation_pose(path: Path, map_name: str, pose: TrainingPose) -> int:
+    return append_pose(path, map_name, pose, "evaluation_poses")
 
 
 def choose_training_start(
@@ -264,32 +291,22 @@ def choose_training_start(
     if config is None:
         return TrainingStart(kind="random", seed=None)
 
-    hard_start_count = len(config.training_seeds) + len(config.training_poses)
     if rng.random() < hard_start_probability:
-        hard_start_index = int(rng.integers(0, hard_start_count))
-        if hard_start_index < len(config.training_seeds):
-            return TrainingStart(
-                kind="hard_seed",
-                seed=config.training_seeds[hard_start_index],
-                map_name=config.map_name,
-            )
-        pose = config.training_poses[hard_start_index - len(config.training_seeds)]
+        pose = config.training_poses[int(rng.integers(0, len(config.training_poses)))]
+        if pose.map_name is None:
+            raise RuntimeError("Training pose has no associated map")
         return TrainingStart(
             kind="hard_pose",
-            seed=_draw_random_reset_seed(config, rng),
+            seed=_draw_random_reset_seed(rng),
             pose=pose,
-            map_name=config.map_name,
+            map_name=pose.map_name,
         )
 
     return TrainingStart(
         kind="random",
-        seed=_draw_random_reset_seed(config, rng),
+        seed=_draw_random_reset_seed(rng),
     )
 
 
-def _draw_random_reset_seed(config: StartConfig, rng: np.random.Generator) -> int:
-    reserved_seeds = set(config.training_seeds) | set(config.evaluation_seeds)
-    while True:
-        seed = int(rng.integers(0, np.iinfo(np.int32).max))
-        if seed not in reserved_seeds:
-            return seed
+def _draw_random_reset_seed(rng: np.random.Generator) -> int:
+    return int(rng.integers(0, np.iinfo(np.int32).max))

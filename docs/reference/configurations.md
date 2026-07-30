@@ -29,38 +29,38 @@ run.
 Create a local file from the versioned template:
 
 ```bash
-cp configs/gym_duckietown_start_seeds.json.template \
-   configs/gym_duckietown_start_seeds.json
+cp configs/gym_duckietown_start_poses.json.template \
+   configs/gym_duckietown_start_poses.json
 ```
 
 Schema:
 
 ```json
 {
-  "map_name": "loop_empty",
-  "training_seeds": [123, 456],
-  "evaluation_seeds": [10042, 10043, 10044, 10045],
   "training_poses": [
     {
       "name": "optional_name",
+      "map_name": "loop_empty",
       "tile": [3, 5],
       "position": [0.51, 0.0, 0.43],
       "angle": 0.70
     }
   ],
-  "evaluation_poses": []
+  "evaluation_poses": [
+    {
+      "map_name": "small_loop",
+      "tile": [1, 2],
+      "position": [0.15, 0.0, 0.09],
+      "angle": 1.44
+    }
+  ]
 }
 ```
 
 Rules:
 
-- `map_name` must be one of the trainer's configured maps. Curated training
-  seeds and poses are used only on that map; evaluation seeds run on every
-  configured map, while evaluation poses remain tied to this map.
-- Seeds are non-negative unique integers.
-- Training and evaluation seeds may not overlap.
-- A trainer config needs at least one training seed/pose and one evaluation
-  seed/pose.
+- Every pose identifies its own `map_name`, which must be configured in the trainer.
+- A trainer config needs at least one training pose and one evaluation pose.
 - `name` is optional.
 - `tile` contains integer map tile coordinates.
 - `position` is local to that tile.
@@ -68,7 +68,7 @@ Rules:
 - Unknown fields are rejected.
 
 When this config is supplied to the trainer, configured evaluation scenarios
-replace `--eval-seeds`.
+come exclusively from `evaluation_poses`; `--eval-seeds` is not used.
 
 ## Training Start Sampling
 
@@ -76,13 +76,13 @@ At every training episode reset:
 
 ```text
 with probability hard_start_probability:
-    choose uniformly from training_seeds + training_poses
+    choose uniformly from training_poses
 otherwise:
-    draw a random reset seed not reserved by the config
+    use the simulator's normal random start
 ```
 
-A configured pose receives a fresh non-reserved reset seed for the simulator's
-other randomized reset state.
+A configured pose receives a fresh reset seed for the simulator's other
+randomized reset state.
 
 `--hard-start-probability 1.0` always uses curated starts. This is useful for
 an intentional overfitting test.
@@ -105,15 +105,16 @@ This file contains exactly one pose. Ordinary resets return to it.
 
 ## Capturing a Pose
 
-Start the manual viewer with an existing local start config:
+Start the manual viewer with a new or existing local start config:
 
 ```bash
 python manual_control_gym_duckietown.py \
-  --start-seeds-config configs/gym_duckietown_start_seeds.json
+  --start-config configs/gym_duckietown_start_poses.json
 ```
 
-Drive to a valid location and press `P`. The viewer appends a pose to
-`training_poses`.
+Drive to a valid location. Press `P` to append a training pose or `Shift+P` to
+append an evaluation pose. Missing files are created automatically, and each
+captured pose records the viewer's current map.
 
 Current lane metrics are useful diagnostics but are not required to reproduce
 the pose; they are recomputed from position, angle, and map geometry.

@@ -20,6 +20,7 @@ from dt_utils.cli_completion import parse_args_with_completion
 from dt_utils.duckietown_paths import EVALUATION_SCREENSHOT_DIR
 from dt_utils.gym_duckietown_start_config import (
     TrainingPose,
+    append_evaluation_pose,
     append_training_pose,
     apply_env_start_pose,
     load_pose_file,
@@ -155,10 +156,10 @@ def parse_args() -> argparse.Namespace:
         help="JSON file containing exactly one pose; startup and ordinary resets return to it.",
     )
     parser.add_argument(
-        "--start-seeds-config",
+        "--start-config",
         type=Path,
-        default="configs/gym_duckietown_start_seeds.json",
-        help="Existing local start config to which P appends the current training pose.",
+        default=None,
+        help="JSON config created or extended by P (training pose) and Shift+P (evaluation pose).",
     )
     parser.add_argument("--auto-reset", action="store_true", help="Reset immediately after gym-duckietown returns done.")
     parser.add_argument("--forward-target", type=float, default=0.45)
@@ -664,8 +665,9 @@ def main() -> None:
             flush=True,
         )
     print(
-        "WASD drives, arrow keys also work, R enters a reset seed, P saves a training pose, space stops, "
-        "backspace or slash resets, enter saves screenshot, escape exits",
+        "WASD drives, arrow keys also work, R enters a reset seed, "
+        "P saves a training pose, Shift+P saves an evaluation pose, space stops, "
+        "backspace or slash resets, enter saves a screenshot, escape exits",
         flush=True,
     )
 
@@ -702,22 +704,35 @@ def main() -> None:
             if symbol in pressed_keys:
                 return
             pressed_keys.add(symbol)
-            if args.start_seeds_config is None:
+            collection = (
+                "evaluation_poses"
+                if modifiers & key.MOD_SHIFT
+                else "training_poses"
+            )
+            pose_label = (
+                "evaluation" if collection == "evaluation_poses" else "training"
+            )
+            if args.start_config is None:
                 pose_save_status = "pose not saved: no config"
-                print("Cannot save pose without --start-seeds-config", flush=True)
+                print("Cannot save pose without --start-config", flush=True)
                 return
             try:
                 pose = capture_training_pose(env)
-                pose_index = append_training_pose(args.start_seeds_config, args.map_name, pose)
+                append_function = (
+                    append_evaluation_pose
+                    if collection == "evaluation_poses"
+                    else append_training_pose
+                )
+                pose_index = append_function(args.start_config, args.map_name, pose)
             except (OSError, ValueError) as error:
                 pose_save_status = "pose save failed; see terminal"
-                print(f"Could not save training pose: {error}", flush=True)
+                print(f"Could not save {pose_label} pose: {error}", flush=True)
             else:
-                pose_save_status = f"saved training pose #{pose_index}"
+                pose_save_status = f"saved {pose_label} pose #{pose_index}"
                 print(
-                    f"saved training_pose={pose_index} tile={pose.tile} "
+                    f"saved {pose_label}_pose={pose_index} map={args.map_name} tile={pose.tile} "
                     f"position={pose.position} angle={pose.angle:.8f} "
-                    f"config={args.start_seeds_config.expanduser()}",
+                    f"config={args.start_config.expanduser()}",
                     flush=True,
                 )
             return

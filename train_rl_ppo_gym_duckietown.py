@@ -97,9 +97,8 @@ class PPOConfig:
     reset_random_warmup_steps: int
     reset_random_warmup_retries: int
     reset_random_action_scale: float
-    start_seeds_config: str | None
+    start_config: str | None
     hard_start_probability: float
-    training_start_seeds: tuple[int, ...]
     training_start_poses: tuple[TrainingPose, ...]
     evaluation_start_poses: tuple[TrainingPose, ...]
     eval_interval_rollouts: int
@@ -277,19 +276,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reset-random-warmup-retries", type=int, default=3)
     parser.add_argument("--reset-random-action-scale", type=float, default=0.6)
     parser.add_argument(
-        "--start-seeds-config",
+        "--start-config",
         type=Path,
         default=None,
         help=(
-            "JSON config containing training_seeds/training_poses and "
-            "evaluation_seeds/evaluation_poses. Its evaluation scenarios replace --eval-seeds."
+            "JSON config containing map-specific training_poses and evaluation_poses. "
+            "Its evaluation poses replace --eval-seeds."
         ),
     )
     parser.add_argument(
         "--hard-start-probability",
         type=parse_probability,
         default=0.5,
-        help="Probability of selecting a configured training seed or pose at each episode reset.",
+        help="Probability of selecting a configured training pose at each episode reset.",
     )
     parser.add_argument("--eval-interval-rollouts", type=int, default=10)
     parser.add_argument(
@@ -610,7 +609,7 @@ def build_checkpoint_metadata(
         else "zero-initialized output layer over current-frame head"
     )
     return {
-        "metadata_schema_version": 3,
+        "metadata_schema_version": 4,
         "domain_rand": config.domain_rand,
         "dynamics_rand": config.dynamics_rand,
         "camera_rand": config.camera_rand,
@@ -626,14 +625,29 @@ def build_checkpoint_metadata(
             "map_name": config.map_name,
             "map_list": list(config.map_names),
             "map_sampling": "uniform_per_episode",
-            "evaluation_map_sampling": "every_seed_on_every_map",
+            "evaluation_map_sampling": (
+                "configured_pose_maps"
+                if config.evaluation_start_poses
+                else "fixed_random_map_per_seed"
+            ),
+            "evaluation_map_assignments": [
+                {"seed": seed, "map_name": map_name}
+                for seed, map_name in assign_evaluation_maps(
+                    config.map_names, config.eval_seeds, config.seed
+                )
+            ],
             "master_seed": config.seed,
-            "seed_config": {
-                "source": config.start_seeds_config,
-                "training_seeds": list(config.training_start_seeds),
-                "evaluation_seeds": list(config.eval_seeds),
+            "start_config": {
+                "source": config.start_config,
+                "format": "map_specific_poses",
                 "training_pose_count": len(config.training_start_poses),
                 "evaluation_pose_count": len(config.evaluation_start_poses),
+                "training_poses": [
+                    pose.as_json() for pose in config.training_start_poses
+                ],
+                "evaluation_poses": [
+                    pose.as_json() for pose in config.evaluation_start_poses
+                ],
             },
             "randomization": {
                 "requested": requested_randomization,
@@ -1005,6 +1019,27 @@ def choose_episode_map(
     return map_names[int(rng.integers(0, len(map_names)))]
 
 
+def assign_evaluation_maps(
+    map_names: tuple[str, ...],
+    evaluation_seeds: tuple[int, ...],
+    master_seed: int,
+) -> tuple[tuple[int, str], ...]:
+    assignments = []
+    for evaluation_seed in evaluation_seeds:
+        seed_sequence = np.random.SeedSequence(
+            [
+                int(master_seed) % (2**32),
+                int(evaluation_seed) % (2**32),
+                0x4556414C,
+            ]
+        )
+        rng = np.random.default_rng(seed_sequence)
+        assignments.append(
+            (evaluation_seed, choose_episode_map(map_names, rng))
+        )
+    return tuple(assignments)
+
+
 def load_environment_map(env, map_name: str) -> None:
     raw_env = getattr(env, "unwrapped", env)
     raw_env.randomize_maps_on_reset = False
@@ -1111,7 +1146,7 @@ def reset_training_environment(
         if not raw_env._valid_pose(raw_env.cur_pos, raw_env.cur_angle):
             pose_label = training_start.name or "unnamed"
             raise ValueError(
-                f"Training pose {pose_label!r} from {args.start_seeds_config} is not valid "
+                f"Training pose {pose_label!r} from {args.start_config} is not valid "
                 f"on map {selected_map!r}"
             )
     return observation, info, selected_map
@@ -1168,7 +1203,6 @@ def evaluate_policy(
     reward_calculator: GymDuckietownRewardCalculator,
     args: argparse.Namespace,
     evaluation_poses: tuple[TrainingPose, ...],
-    evaluation_pose_map_name: str | None,
     start_defaults: EnvironmentStartDefaults,
     transform: transforms.Compose,
     device: torch.device,
@@ -1184,20 +1218,21 @@ def evaluate_policy(
 
     evaluation_starts = [
         TrainingStart(kind="eval_seed", seed=seed, map_name=map_name)
-        for map_name in args.map_names
-        for seed in args.eval_seeds
-    ]
-    if evaluation_poses and evaluation_pose_map_name is None:
-        raise ValueError("Evaluation poses require an associated map")
-    evaluation_starts.extend(
-        TrainingStart(
-            kind="eval_pose",
-            seed=args.seed + 100_000 + pose_index,
-            pose=pose,
-            map_name=evaluation_pose_map_name,
+        for seed, map_name in assign_evaluation_maps(
+            args.map_names, args.eval_seeds, args.seed
         )
-        for pose_index, pose in enumerate(evaluation_poses)
-    )
+    ]
+    for pose_index, pose in enumerate(evaluation_poses):
+        if pose.map_name is None:
+            raise ValueError(f"Evaluation pose {pose_index} has no associated map")
+        evaluation_starts.append(
+            TrainingStart(
+                kind="eval_pose",
+                seed=args.seed + 100_000 + pose_index,
+                pose=pose,
+                map_name=pose.map_name,
+            )
+        )
 
     policy.eval()
     for scenario_index, evaluation_start in enumerate(evaluation_starts, start=1):
@@ -1230,7 +1265,7 @@ def evaluate_policy(
         ):
             pose_label = evaluation_start.name or "unnamed"
             raise ValueError(
-                f"Evaluation pose {pose_label!r} from {args.start_seeds_config} is not valid "
+                f"Evaluation pose {pose_label!r} from {args.start_config} is not valid "
                 f"on map {evaluation_start.map_name!r}"
             )
         start_position = np.asarray(raw_env.cur_pos, dtype=np.float64).copy()
@@ -1446,10 +1481,10 @@ def main() -> None:
             "the imitation head predicts left/right wheel commands."
         )
     start_config = None
-    if args.start_seeds_config is not None:
-        start_config = load_start_config(args.start_seeds_config, args.map_names)
-        args.start_seeds_config = start_config.source_path
-        args.eval_seeds = start_config.evaluation_seeds
+    if args.start_config is not None:
+        start_config = load_start_config(args.start_config, args.map_names)
+        args.start_config = start_config.source_path
+        args.eval_seeds = ()
     configure_gym_duckietown_logging(args.log_level)
     ensure_gym_duckietown_available()
     configure_gym_duckietown_logging(args.log_level)
@@ -1469,9 +1504,6 @@ def main() -> None:
         for k, v in vars(args).items()
         if k != "device"
     }
-    config_values["training_start_seeds"] = (
-        start_config.training_seeds if start_config is not None else ()
-    )
     config_values["training_start_poses"] = (
         start_config.training_poses if start_config is not None else ()
     )
@@ -1547,17 +1579,13 @@ def main() -> None:
             "source_path": (
                 str(start_config.source_path) if start_config is not None else None
             ),
-            "map_name": start_config.map_name if start_config is not None else args.map_name,
+            "format": "map_specific_poses",
             "hard_start_probability": args.hard_start_probability,
-            "training_seeds": (
-                list(start_config.training_seeds) if start_config is not None else []
-            ),
             "training_poses": (
                 [pose.as_json() for pose in start_config.training_poses]
                 if start_config is not None
                 else []
             ),
-            "evaluation_seeds": list(args.eval_seeds),
             "evaluation_poses": (
                 [pose.as_json() for pose in start_config.evaluation_poses]
                 if start_config is not None
@@ -1876,8 +1904,7 @@ def main() -> None:
         )
         if start_config is not None:
             print(
-                f"Hard starts: seeds={len(start_config.training_seeds)} "
-                f"poses={len(start_config.training_poses)} "
+                f"Hard starts: poses={len(start_config.training_poses)} "
                 f"probability={args.hard_start_probability:.3f} "
                 f"config={start_config.source_path}",
                 flush=True,
@@ -1885,12 +1912,21 @@ def main() -> None:
         evaluation_pose_count = (
             len(start_config.evaluation_poses) if start_config is not None else 0
         )
+        eval_map_assignments = assign_evaluation_maps(
+            args.map_names, args.eval_seeds, args.seed
+        )
         print(
-            f"Evaluation scenarios: maps={len(args.map_names)} "
-            f"seeds_per_map={len(args.eval_seeds)} poses={evaluation_pose_count} "
-            f"total={len(args.map_names) * len(args.eval_seeds) + evaluation_pose_count}",
+            f"Evaluation scenarios: seeds={len(args.eval_seeds)} "
+            f"poses={evaluation_pose_count} "
+            f"total={len(args.eval_seeds) + evaluation_pose_count}",
             flush=True,
         )
+        if eval_map_assignments:
+            print(
+                "Evaluation map assignments: "
+                + ", ".join(f"{seed}:{map_name}" for seed, map_name in eval_map_assignments),
+                flush=True,
+            )
         if start_config is None:
             training_start = TrainingStart(kind="random", seed=args.seed)
         else:
@@ -2418,9 +2454,6 @@ def main() -> None:
                     eval_reward_calculator,
                     args,
                     start_config.evaluation_poses if start_config is not None else (),
-                    (
-                        start_config.map_name if start_config is not None else None
-                    ),
                     eval_start_defaults,
                     transform,
                     device,

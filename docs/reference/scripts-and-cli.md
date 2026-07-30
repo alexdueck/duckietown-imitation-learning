@@ -219,7 +219,9 @@ python train_rl_ppo_gym_duckietown.py \
   --map-name small_loop
 ```
 
-Each fixed evaluation seed is evaluated separately on every configured map.
+Each fixed evaluation seed is assigned one randomly selected map. The assignment
+is derived from the master seed and remains fixed across evaluations and resumed
+runs.
 
 | Group | Parameters | Meaning |
 | --- | --- | --- |
@@ -231,7 +233,7 @@ Each fixed evaluation seed is evaluated separately on every configured map.
 | Action mapping | `--action-mode`, `--fixed-throttle`, `--max-throttle`, `--max-steering` | Map policy outputs to wheel commands |
 | Initialization/resume | `--imitation-checkpoint`, `--resume-checkpoint`, `--initial-log-std`, `--min-log-std`, `--max-log-std` | Warm-start or resume policy/value state and bound exploration |
 | PPO | `--total-steps`, `--rollout-steps`, `--epochs`, `--batch-size`, `--gamma`, `--gae-lambda`, `--clip-ratio`, `--policy-lr`, `--value-lr`, `--entropy-coef`, `--value-coef`, `--max-grad-norm` | Configure rollout collection and updates |
-| Starts | `--max-episode-steps`, `--reset-random-warmup-steps`, `--reset-random-warmup-retries`, `--reset-random-action-scale`, `--start-seeds-config`, `--hard-start-probability`, `--accept-start-angle-deg` | Configure episode boundaries and start-state distribution |
+| Starts | `--max-episode-steps`, `--reset-random-warmup-steps`, `--reset-random-warmup-retries`, `--reset-random-action-scale`, `--start-config`, `--hard-start-probability`, `--accept-start-angle-deg` | Configure episode boundaries and start-state distribution |
 | Evaluation | `--eval-interval-rollouts`, `--eval-steps`, `--eval-seeds`, `--eval-stochastic` | Configure periodic policy evaluation |
 | Diagnostics | `--render-training`, `--debug-initial-action` | Render training or print the first deterministic action |
 
@@ -279,7 +281,7 @@ python manual_control_gym_duckietown.py \
 | --- | --- | --- |
 | Environment | `--map-name`, `--seed`, `--max-steps`, `--frame-rate`, `--frame-skip`, `--camera-width`, `--camera-height`, `--robot-speed`, `--accept-start-angle-deg` | Configure simulator execution |
 | Rendering/randomization | `--draw-curve`, `--draw-bbox`, `--domain-rand`, `--distortion`, `--dynamics-rand`, `--camera-rand` | Enable diagnostics and domain variation |
-| Starts | `--start-pose-file`, `--start-seeds-config`, `--auto-reset` | Fix a pose, collect poses, or reset automatically |
+| Starts | `--start-pose-file`, `--start-config`, `--auto-reset` | Fix a pose, collect training/evaluation poses, or reset automatically |
 | Keyboard response | `--forward-target`, `--backward-target`, `--turn-target`, `--throttle-rate`, `--steering-rate`, `--auto-center-rate`, `--boost-multiplier` | Tune manual control ramps and limits |
 | Rewards | `--reward-functions`, `--posepot-gamma`, `--vd2pp-distance-weight` | Select displayed reward breakdowns |
 | Output/logging | `--screenshot-path`, `--log-level` | Configure screenshots and logs |
@@ -337,7 +339,7 @@ python live_eval_rl_policy_gym_duckietown.py \
 | Group | Parameters | Meaning |
 | --- | --- | --- |
 | Checkpoint/model | `--checkpoint`, `--device`, `--image-size`, `--crop-y-start`, `--source-observation-channel-order` | Load and optionally override policy input settings |
-| Scenario | `--map-name`, `--seed`, `--start-seeds-config`, `--eval-pose-index`, `--max-steps`, `--episodes` | Choose evaluation map/start and horizon |
+| Scenario | `--map-name`, `--seed`, `--start-config`, `--eval-pose-index`, `--max-steps`, `--episodes` | Choose evaluation map/start and horizon |
 | Environment | `--frame-rate`, `--frame-skip`, `--camera-width`, `--camera-height`, `--robot-speed`, `--accept-start-angle-deg` | Override checkpoint environment settings |
 | Variation | `--domain-rand`, `--dynamics-rand`, `--camera-rand`, `--distortion`, and their `--no-*` forms | Configure evaluation randomization independently; all default off while training settings remain visible |
 | Reward | `--reward-function`, `--vd2pp-distance-weight` | Override the reported reward |

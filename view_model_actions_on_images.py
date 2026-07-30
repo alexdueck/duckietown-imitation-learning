@@ -23,7 +23,7 @@ from dt_utils.duckietown_action_control import (
     DuckietownActionControl,
     action_control_from_config,
 )
-from dt_utils.rl_models import TanhGaussianPolicy
+from dt_utils.temporal_rl import TemporalTanhGaussianPolicy
 from train_imitation_learning import (
     IMAGENET_MEAN,
     IMAGENET_STD,
@@ -253,10 +253,17 @@ def load_policy_bundle(args: argparse.Namespace) -> PolicyBundle:
 
     if checkpoint_type == "RL/PPO":
         action_control = action_control_from_config(config)
-        model = TanhGaussianPolicy(
+        observation_history_length = int(config.get("observation_history_length", 1))
+        model = TemporalTanhGaussianPolicy(
             config.get("model", "mobilenet_v3_small"),
             action_dim=action_control.policy_action_dim,
             pretrained=False,
+            observation_history_length=observation_history_length,
+            action_history_length=int(
+                config.get("action_history_length", observation_history_length - 1)
+            ),
+            temporal_hidden_dim=int(config.get("temporal_hidden_dim", 256)),
+            temporal_head_mode=config.get("temporal_head_mode", "residual"),
         )
         model.load_state_dict(checkpoint["policy_state_dict"])
     else:
@@ -331,7 +338,28 @@ def predict(bundle: PolicyBundle, image: Image.Image) -> Prediction:
     ).unsqueeze(0).to(bundle.device)
 
     if bundle.checkpoint_type == "RL/PPO":
-        mean, log_std = bundle.model(tensor)
+        observation_history_length = int(
+            bundle.config.get("observation_history_length", 1)
+        )
+        action_history_length = int(
+            bundle.config.get(
+                "action_history_length",
+                observation_history_length - 1,
+            )
+        )
+        observation_history = tensor.unsqueeze(1).repeat(
+            1,
+            observation_history_length,
+            1,
+            1,
+            1,
+        )
+        action_history = torch.zeros(
+            (1, action_history_length, bundle.action_control.policy_action_dim),
+            dtype=tensor.dtype,
+            device=bundle.device,
+        )
+        mean, log_std = bundle.model(observation_history, action_history)
         policy_controls_tensor = torch.tanh(mean)
         wheel_tensor = bundle.action_control.to_wheels_tensor(policy_controls_tensor)
         controls = policy_controls_tensor.squeeze(0).cpu().numpy().astype(np.float32)

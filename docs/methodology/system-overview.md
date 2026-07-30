@@ -39,7 +39,10 @@ simulator camera observation
 channel conversion, crop, resize, ImageNet normalization
         |
         v
-CNN policy encoder
+five-frame history + four intervening policy actions
+        |
+        v
+shared CNN per frame + temporal policy MLP
         |
         v
 policy controls in [-1, 1]
@@ -55,8 +58,9 @@ simulator step
         +--> termination information
 ```
 
-Training uses only the image tensor as the policy and value-network input.
-Reward ground truth is deliberately privileged training information.
+Training uses only camera frames and the policy's own previous normalized
+actions as policy and value-network input. Reward ground truth is deliberately
+privileged training information.
 
 ## Imitation Learning
 
@@ -73,10 +77,10 @@ deviation.
 
 The RL implementation is on-policy PPO:
 
-1. Sample actions from a squashed Gaussian image policy.
+1. Sample actions from a squashed Gaussian history policy.
 2. Execute the mapped wheel actions in one simulator environment.
-3. Store observations, raw Gaussian actions, old log probabilities, rewards,
-   done flags, and value predictions.
+3. Store exact observation/action-history snapshots, raw Gaussian actions, old
+   log probabilities, rewards, done flags, and value predictions.
 4. Compute GAE advantages and returns.
 5. Reuse that rollout for several shuffled minibatch epochs.
 6. Discard the rollout after the PPO update.
@@ -94,7 +98,8 @@ The project keeps backend-specific training and evaluation scripts separate:
 
 Shared concepts live in focused modules:
 
-- image policies in `dt_utils/rl_models.py`
+- stateless image policies in `dt_utils/rl_models.py`
+- fixed-history state and temporal policies in `dt_utils/temporal_rl.py`
 - gym-duckietown action mapping in
   `dt_utils/duckietown_action_control.py`
 - gym-duckietown rewards in `dt_utils/velopose_reward.py` and

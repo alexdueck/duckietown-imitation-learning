@@ -6,7 +6,7 @@ The actor predicts a mean vector and a learned state-independent log standard
 deviation:
 
 ```text
-z ~ Normal(mu(observation), exp(log_std))
+z ~ Normal(mu(observation_history, action_history), exp(log_std))
 policy_control = tanh(z)
 ```
 
@@ -33,7 +33,8 @@ learned value and are then clamped to the new bounds.
 
 For each environment step the trainer stores:
 
-- preprocessed observation
+- the exact five-frame preprocessed observation history
+- the exact four-action normalized policy-control history
 - sampled bounded policy control
 - raw Gaussian action
 - mapped wheel action
@@ -86,7 +87,8 @@ no offline dataset in the current trainer.
 For the stored raw action:
 
 ```text
-ratio = pi_new(action | observation) / pi_old(action | observation)
+ratio = pi_new(action | observation_history, action_history)
+        / pi_old(action | observation_history, action_history)
 
 L_policy = -mean(
     min(
@@ -119,7 +121,7 @@ entropy is valid for concentrated continuous distributions.
 Training actions are sampled. Evaluation actions are deterministic by default:
 
 ```text
-action_eval = tanh(mu(observation))
+action_eval = tanh(mu(observation_history, action_history))
 ```
 
 This distinction explains why occasional `invalid_pose` episodes can remain

@@ -53,9 +53,14 @@ from manual_control_gym_duckietown import (
     prepare_window_2d,
     save_screenshot,
 )
-from dt_utils.rl_models import TanhGaussianPolicy
+from dt_utils.temporal_rl import FixedHistory, TemporalTanhGaussianPolicy
 from train_imitation_learning import resolve_device
-from train_rl_ppo_gym_duckietown import make_transform, preprocess, reset_raw
+from train_rl_ppo_gym_duckietown import (
+    initialize_history,
+    make_transform,
+    preprocess,
+    reset_raw,
+)
 
 
 SIDEBAR_WIDTH = 480
@@ -138,7 +143,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-domain-rand", dest="domain_rand", action="store_false")
     parser.add_argument("--distortion", dest="distortion", action="store_true")
     parser.add_argument("--no-distortion", dest="distortion", action="store_false")
-    parser.set_defaults(domain_rand=None, distortion=None)
+    parser.add_argument("--dynamics-rand", dest="dynamics_rand", action="store_true")
+    parser.add_argument("--no-dynamics-rand", dest="dynamics_rand", action="store_false")
+    parser.add_argument("--camera-rand", dest="camera_rand", action="store_true")
+    parser.add_argument("--no-camera-rand", dest="camera_rand", action="store_false")
+    parser.set_defaults(
+        domain_rand=None,
+        distortion=None,
+        dynamics_rand=None,
+        camera_rand=None,
+    )
     parser.add_argument("--image-size", type=int, default=None)
     parser.add_argument("--crop-y-start", type=int, default=None)
     parser.add_argument(
@@ -188,7 +202,7 @@ def config_value(value, config: dict[str, Any], key: str, default):
 def load_policy(
     checkpoint_path: Path,
     device: torch.device,
-) -> tuple[TanhGaussianPolicy, DuckietownActionControl, dict[str, Any], int]:
+) -> tuple[TemporalTanhGaussianPolicy, DuckietownActionControl, dict[str, Any], int]:
     checkpoint_path = checkpoint_path.expanduser()
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
@@ -207,10 +221,18 @@ def load_policy(
     config = checkpoint.get("config", {})
     action_control = action_control_from_config(config)
     model_name = config.get("model", "mobilenet_v3_small")
-    policy = TanhGaussianPolicy(
+    observation_history_length = int(config.get("observation_history_length", 1))
+    action_history_length = int(
+        config.get("action_history_length", observation_history_length - 1)
+    )
+    policy = TemporalTanhGaussianPolicy(
         model_name,
         action_dim=action_control.policy_action_dim,
         pretrained=False,
+        observation_history_length=observation_history_length,
+        action_history_length=action_history_length,
+        temporal_hidden_dim=int(config.get("temporal_hidden_dim", 256)),
+        temporal_head_mode=config.get("temporal_head_mode", "residual"),
     )
     policy.load_state_dict(checkpoint["policy_state_dict"])
     policy.to(device)
@@ -256,11 +278,27 @@ def apply_checkpoint_defaults(args: argparse.Namespace, config: dict[str, Any]) 
             4.0,
         )
     )
-    args.domain_rand = bool(
-        config_value(args.domain_rand, config, "domain_rand", False)
+    args.training_randomization = {
+        "domain_rand": bool(config.get("domain_rand", False)),
+        "dynamics_rand": bool(config.get("dynamics_rand", False)),
+        "camera_rand": bool(config.get("camera_rand", False)),
+        "distortion": bool(config.get("distortion", False)),
+    }
+    # Evaluation randomization is intentionally independent of the training
+    # metadata. It defaults off unless the corresponding viewer flag is given.
+    args.domain_rand = False if args.domain_rand is None else bool(args.domain_rand)
+    args.dynamics_rand = (
+        False if args.dynamics_rand is None else bool(args.dynamics_rand)
     )
-    args.distortion = bool(
-        config_value(args.distortion, config, "distortion", False)
+    args.camera_rand = False if args.camera_rand is None else bool(args.camera_rand)
+    args.distortion = False if args.distortion is None else bool(args.distortion)
+    if args.camera_rand and not args.distortion:
+        raise ValueError("--camera-rand requires --distortion")
+    args.observation_history_length = int(
+        config.get("observation_history_length", 1)
+    )
+    args.action_history_length = int(
+        config.get("action_history_length", args.observation_history_length - 1)
     )
     args.image_size = int(config_value(args.image_size, config, "image_size", 224))
     args.crop_y_start = int(
@@ -284,8 +322,6 @@ def apply_checkpoint_defaults(args: argparse.Namespace, config: dict[str, Any]) 
             args.max_steps = 100_000_000
 
     # make_env() shares these optional viewer settings with manual control.
-    args.dynamics_rand = False
-    args.camera_rand = False
     args.draw_curve = False
     args.draw_bbox = False
 
@@ -316,31 +352,25 @@ def load_evaluation_pose(args: argparse.Namespace) -> TrainingPose | None:
 
 @torch.no_grad()
 def predict_action(
-    policy: TanhGaussianPolicy,
+    policy: TemporalTanhGaussianPolicy,
     action_control: DuckietownActionControl,
-    observation: np.ndarray,
-    transform,
+    history: FixedHistory,
     args: argparse.Namespace,
     device: torch.device,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    obs_tensor = preprocess(
-        observation,
-        args.crop_y_start,
-        args.image_size,
-        args.source_observation_channel_order,
-        transform,
-    ).unsqueeze(0).to(device)
-    mean, log_std = policy(obs_tensor)
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    observation_history, action_history = history.batched(device)
+    mean, log_std = policy(observation_history, action_history)
     distribution = torch.distributions.Normal(mean, log_std.exp())
     raw_action = distribution.sample() if args.stochastic else distribution.mean
-    action = torch.tanh(raw_action)
+    policy_action = torch.tanh(raw_action)
     mean_action = torch.tanh(distribution.mean)
-    wheel_action = action_control.to_wheels_tensor(action)
+    wheel_action = action_control.to_wheels_tensor(policy_action)
     mean_wheel_action = action_control.to_wheels_tensor(mean_action)
     return (
         mean_wheel_action.squeeze(0).cpu().numpy().astype(np.float32),
         format_wheel_action(wheel_action.squeeze(0).cpu().numpy()),
         log_std.exp().squeeze(0).cpu().numpy().astype(np.float32),
+        policy_action.squeeze(0).cpu().numpy().astype(np.float32),
     )
 
 
@@ -509,6 +539,12 @@ def main() -> None:
         apply_env_start_pose(env, evaluation_pose)
     observation, _ = reset_raw(env, seed=args.seed)
     reward_calculator.reset(env)
+    history = initialize_history(
+        observation,
+        args,
+        transform,
+        action_control.policy_action_dim,
+    )
 
     with torch.no_grad():
         learned_std = policy.log_std.clamp(-5.0, 2.0).exp().cpu().numpy()
@@ -547,6 +583,27 @@ def main() -> None:
         flush=True,
     )
     print(f"Policy mode:      {'stochastic' if args.stochastic else 'deterministic'}", flush=True)
+    print(
+        "Training randomization: "
+        + ", ".join(
+            f"{name}={'on' if enabled else 'off'}"
+            for name, enabled in args.training_randomization.items()
+        ),
+        flush=True,
+    )
+    print(
+        "Evaluation randomization: "
+        f"domain_rand={'on' if args.domain_rand else 'off'}, "
+        f"dynamics_rand={'on' if args.dynamics_rand else 'off'}, "
+        f"camera_rand={'on' if args.camera_rand else 'off'}, "
+        f"distortion={'on' if args.distortion else 'off'}",
+        flush=True,
+    )
+    print(
+        f"History:          {args.observation_history_length} frames, "
+        f"{args.action_history_length} actions",
+        flush=True,
+    )
     if evaluation_pose is not None:
         print(
             f"Evaluation pose:  index={args.eval_pose_index} "
@@ -591,6 +648,15 @@ def main() -> None:
             apply_env_start_pose(env, evaluation_pose)
         observation, _ = reset_raw(env, seed=args.seed)
         reward_calculator.reset(env)
+        history.reset(
+            preprocess(
+                observation,
+                args.crop_y_start,
+                args.image_size,
+                args.source_observation_channel_order,
+                transform,
+            )
+        )
         episode += 1
         episode_length = 0
         selected_return = 0.0
@@ -636,11 +702,10 @@ def main() -> None:
         if paused:
             return
 
-        mean_action, action, std = predict_action(
+        mean_action, action, std, policy_action = predict_action(
             policy,
             action_control,
-            observation,
-            transform,
+            history,
             args,
             device,
         )
@@ -687,6 +752,16 @@ def main() -> None:
             )
 
         if not done:
+            history.append(
+                policy_action,
+                preprocess(
+                    observation,
+                    args.crop_y_start,
+                    args.image_size,
+                    args.source_observation_channel_order,
+                    transform,
+                ),
+            )
             return
 
         completed_returns.append(selected_return)

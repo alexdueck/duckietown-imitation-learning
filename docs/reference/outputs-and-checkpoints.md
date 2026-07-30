@@ -28,6 +28,20 @@ A run contains:
 `last.pt` is saved after each PPO update. Interrupting in the middle of a
 rollout leaves the most recent completed update.
 
+Each PPO checkpoint stores the complete resolved training config plus structured
+metadata for the environment class/version, requested and actual randomization,
+map and seeds, preprocessing and input shapes, action representation, fixed
+history initialization, and temporal model architecture. The same metadata is
+written in readable form to `config.json`. Resume restores architecture,
+preprocessing, action semantics, and randomization settings; explicit
+incompatible overrides fail before model construction.
+
+When camera distortion is active, metadata also contains the exact training
+environment `camera_matrix`, `distortion_coefs`, derived
+`new_camera_matrix`, and calibration dimensions. A flat
+`camera_calibration_history` carries these values across resumed runs so that
+all recorded training lenses can later be reconstructed.
+
 ## Episode History
 
 Important `history.csv` columns:

@@ -213,9 +213,9 @@ python train_rl_ppo_gym_duckietown.py \
 | --- | --- | --- |
 | Run/output | `--output-dir`, `--exp-name`, `--seed`, `--device`, `--log-level` | Name and locate the run; configure reproducibility/runtime |
 | Environment | `--map-name`, `--frame-skip`, `--frame-rate`, `--robot-speed`, `--simulator-max-steps`, `--camera-width`, `--camera-height` | Configure gym-duckietown |
-| Visual variation | `--domain-rand`, `--distortion`, `--source-observation-channel-order` | Configure observation domain and channel interpretation |
+| Domain variation | `--domain-rand`, `--dynamics-rand`, `--camera-rand`, `--distortion`, and their `--no-*` forms | Configure built-in gym-duckietown randomization; all four default on |
 | Reward | `--reward-function`, `--vd2pp-distance-weight` | Select the optimized reward and its optional distance term |
-| Model/input | `--model`, `--image-size`, `--crop-y-start` | Select encoder and policy input transform |
+| Model/input | `--model`, `--image-size`, `--crop-y-start`, `--source-observation-channel-order`, `--observation-history-length`, `--action-history-length`, `--temporal-hidden-dim`, `--temporal-head-mode` | Select encoder, preprocessing, and fixed-history architecture; direct temporal MLP is the default |
 | Action mapping | `--action-mode`, `--fixed-throttle`, `--max-throttle`, `--max-steering` | Map policy outputs to wheel commands |
 | Initialization/resume | `--imitation-checkpoint`, `--resume-checkpoint`, `--initial-log-std`, `--min-log-std`, `--max-log-std` | Warm-start or resume policy/value state and bound exploration |
 | PPO | `--total-steps`, `--rollout-steps`, `--epochs`, `--batch-size`, `--gamma`, `--gae-lambda`, `--clip-ratio`, `--policy-lr`, `--value-lr`, `--entropy-coef`, `--value-coef`, `--max-grad-norm` | Configure rollout collection and updates |
@@ -327,7 +327,7 @@ python live_eval_rl_policy_gym_duckietown.py \
 | Checkpoint/model | `--checkpoint`, `--device`, `--image-size`, `--crop-y-start`, `--source-observation-channel-order` | Load and optionally override policy input settings |
 | Scenario | `--map-name`, `--seed`, `--start-seeds-config`, `--eval-pose-index`, `--max-steps`, `--episodes` | Choose evaluation map/start and horizon |
 | Environment | `--frame-rate`, `--frame-skip`, `--camera-width`, `--camera-height`, `--robot-speed`, `--accept-start-angle-deg` | Override checkpoint environment settings |
-| Variation | `--domain-rand`, `--no-domain-rand`, `--distortion`, `--no-distortion` | Override checkpoint randomization |
+| Variation | `--domain-rand`, `--dynamics-rand`, `--camera-rand`, `--distortion`, and their `--no-*` forms | Configure evaluation randomization independently; all default off while training settings remain visible |
 | Reward | `--reward-function`, `--vd2pp-distance-weight` | Override the reported reward |
 | Policy/viewer | `--stochastic`, `--stop-on-done`, `--start-paused`, `--print-every` | Sample actions or configure viewer behavior |
 | Output | `--returns-file`, `--screenshot-path`, `--log-level` | Store results/screenshots and configure logs |

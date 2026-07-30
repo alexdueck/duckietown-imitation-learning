@@ -14,6 +14,7 @@ import csv
 import json
 import logging
 import re
+import sys
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -51,6 +52,16 @@ from dt_utils.gym_duckietown_start_config import (
     load_start_config,
 )
 from dt_utils.rl_models import TanhGaussianPolicy, load_imitation_actor, tanh_normal_log_prob
+from dt_utils.temporal_rl import (
+    FixedHistory,
+    HISTORY_INITIALIZATION,
+    TEMPORAL_HEAD_MODES,
+    TEMPORAL_HEAD_MODE_RESIDUAL,
+    TemporalTanhGaussianPolicy,
+    TemporalValueNetwork,
+    history_model_description,
+    validate_history_lengths,
+)
 from train_imitation_learning import IMAGENET_MEAN, IMAGENET_STD, build_model, resolve_device, set_seed
 from dt_utils.velopose_reward import (
     POSEPOT_SHAPING_WEIGHT,
@@ -108,8 +119,15 @@ class PPOConfig:
     image_size: int
     crop_y_start: int
     source_observation_channel_order: str
+    observation_history_length: int
+    action_history_length: int
+    temporal_hidden_dim: int
+    temporal_head_mode: str
     domain_rand: bool
+    dynamics_rand: bool
+    camera_rand: bool
     distortion: bool
+    randomization_config: str
     frame_skip: int
     frame_rate: int
     robot_speed: float | None
@@ -128,18 +146,6 @@ class PPOConfig:
 class EnvironmentStartDefaults:
     user_tile_start: Any
     start_pose: Any
-
-
-class ValueNetwork(nn.Module):
-    def __init__(self, model_name: str, pretrained: bool = False) -> None:
-        super().__init__()
-        from dt_utils.rl_models import build_encoder
-
-        self.encoder, features_dim = build_encoder(model_name, pretrained=pretrained)
-        self.value = nn.Linear(features_dim, 1)
-
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        return self.value(self.encoder(observations)).squeeze(1)
 
 
 def parse_eval_seeds(value: str) -> tuple[int, ...]:
@@ -298,8 +304,58 @@ def parse_args() -> argparse.Namespace:
         default="rgb",
         help="gym-duckietown observations are expected to be RGB.",
     )
-    parser.add_argument("--domain-rand", action="store_true")
-    parser.add_argument("--distortion", action="store_true")
+    parser.add_argument(
+        "--observation-history-length",
+        type=int,
+        default=5,
+        help="Number of consecutive preprocessed camera frames given to policy and value networks.",
+    )
+    parser.add_argument(
+        "--action-history-length",
+        type=int,
+        default=4,
+        help="Number of intervening normalized policy actions; must equal observation history minus one.",
+    )
+    parser.add_argument(
+        "--temporal-hidden-dim",
+        type=int,
+        default=256,
+        help="Hidden width of the temporal policy and value MLPs.",
+    )
+    parser.add_argument(
+        "--temporal-head-mode",
+        choices=TEMPORAL_HEAD_MODES,
+        default="temporal_mlp",
+        help=(
+            "temporal_mlp predicts policy mean and value directly from all "
+            "history features; residual adds a zero-initialized temporal "
+            "correction to a current-frame head."
+        ),
+    )
+    parser.add_argument(
+        "--domain-rand",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable gym-duckietown's built-in visual domain randomization.",
+    )
+    parser.add_argument(
+        "--dynamics-rand",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable per-reset Duckiebot trim randomization.",
+    )
+    parser.add_argument(
+        "--camera-rand",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable built-in camera calibration randomization.",
+    )
+    parser.add_argument(
+        "--distortion",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the distortion camera model required by camera randomization.",
+    )
     parser.add_argument("--frame-skip", type=int, default=1)
     parser.add_argument("--frame-rate", type=int, default=30)
     parser.add_argument("--robot-speed", type=float, default=None)
@@ -327,6 +383,305 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
     return parse_args_with_completion(parser)
+
+
+def explicit_cli_options(argv: list[str]) -> set[str]:
+    return {argument.split("=", 1)[0] for argument in argv if argument.startswith("--")}
+
+
+def restore_resume_configuration(
+    args: argparse.Namespace,
+    checkpoint_config: dict[str, Any],
+    explicit_options: set[str],
+) -> list[str]:
+    legacy_history_length = int(checkpoint_config.get("observation_history_length", 1))
+    restored = {
+        "model": checkpoint_config.get("model", args.model),
+        "action_mode": checkpoint_config.get("action_mode", "wheel"),
+        "fixed_throttle": checkpoint_config.get("fixed_throttle"),
+        "max_throttle": float(checkpoint_config.get("max_throttle", 1.0)),
+        "max_steering": float(checkpoint_config.get("max_steering", 0.5)),
+        "observation_history_length": legacy_history_length,
+        "action_history_length": int(
+            checkpoint_config.get("action_history_length", legacy_history_length - 1)
+        ),
+        "temporal_hidden_dim": int(checkpoint_config.get("temporal_hidden_dim", 256)),
+        "temporal_head_mode": checkpoint_config.get(
+            "temporal_head_mode", TEMPORAL_HEAD_MODE_RESIDUAL
+        ),
+        "domain_rand": bool(checkpoint_config.get("domain_rand", False)),
+        "dynamics_rand": bool(checkpoint_config.get("dynamics_rand", False)),
+        "camera_rand": bool(checkpoint_config.get("camera_rand", False)),
+        "distortion": bool(checkpoint_config.get("distortion", False)),
+        "image_size": int(checkpoint_config.get("image_size", args.image_size)),
+        "crop_y_start": int(checkpoint_config.get("crop_y_start", args.crop_y_start)),
+        "source_observation_channel_order": checkpoint_config.get(
+            "source_observation_channel_order",
+            args.source_observation_channel_order,
+        ),
+    }
+    option_names = {
+        key: "--" + key.replace("_", "-")
+        for key in restored
+    }
+    for key, checkpoint_value in restored.items():
+        current_value = getattr(args, key)
+        option = option_names[key]
+        negative_option = "--no-" + option.removeprefix("--")
+        option_was_explicit = option in explicit_options or negative_option in explicit_options
+        if option_was_explicit and current_value != checkpoint_value:
+            raise ValueError(
+                f"{option}={current_value!r} is incompatible with the resumed checkpoint "
+                f"value {checkpoint_value!r}. Remove the option or use a compatible checkpoint."
+            )
+        setattr(args, key, checkpoint_value)
+    return sorted(restored)
+
+
+def gym_duckietown_version() -> str:
+    import gym_duckietown
+
+    return str(getattr(gym_duckietown, "__version__", "unknown"))
+
+
+def environment_randomization_settings(env) -> dict[str, Any]:
+    raw_env = getattr(env, "unwrapped", env)
+    return {
+        "domain_rand": bool(getattr(raw_env, "domain_rand", False)),
+        "dynamics_rand": bool(getattr(raw_env, "dynamics_rand", False)),
+        "camera_rand": bool(getattr(raw_env, "camera_rand", False)),
+        "distortion": bool(getattr(raw_env, "distortion", False)),
+    }
+
+
+def environment_camera_calibration(env) -> dict[str, Any]:
+    raw_env = getattr(env, "unwrapped", env)
+    camera_model = getattr(raw_env, "camera_model", None)
+    calibration = {
+        "available": camera_model is not None,
+        "distortion_enabled": bool(getattr(raw_env, "distortion", False)),
+        "camera_randomization_enabled": bool(
+            getattr(raw_env, "camera_rand", False)
+        ),
+        "lifetime": "fixed for this environment instance",
+        "camera_matrix": None,
+        "distortion_coefs": None,
+        "new_camera_matrix": None,
+        "calibration_width": None,
+        "calibration_height": None,
+    }
+    if camera_model is None:
+        return calibration
+
+    def array_values(name: str):
+        value = getattr(camera_model, name, None)
+        if value is None:
+            return None
+        return np.asarray(value, dtype=np.float64).tolist()
+
+    calibration.update(
+        {
+            "camera_matrix": array_values("camera_matrix"),
+            "distortion_coefs": array_values("distortion_coefs"),
+            "new_camera_matrix": array_values("new_camera_matrix"),
+            "calibration_width": int(getattr(camera_model, "W", 0)) or None,
+            "calibration_height": int(getattr(camera_model, "H", 0)) or None,
+        }
+    )
+    return calibration
+
+
+def previous_camera_calibration_history(
+    checkpoint_metadata: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not checkpoint_metadata:
+        return []
+    environment_metadata = checkpoint_metadata.get("environment", {})
+    history = environment_metadata.get("camera_calibration_history")
+    if isinstance(history, list):
+        return deepcopy(history)
+    calibration = environment_metadata.get("camera_calibration")
+    if isinstance(calibration, dict):
+        return [deepcopy(calibration)]
+    return []
+
+
+def build_checkpoint_metadata(
+    config: PPOConfig,
+    action_control: DuckietownActionControl,
+    env=None,
+    previous_checkpoint_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    requested_randomization = {
+        "domain_rand": config.domain_rand,
+        "dynamics_rand": config.dynamics_rand,
+        "camera_rand": config.camera_rand,
+        "distortion": config.distortion,
+    }
+    environment_class = "gym_duckietown.simulator.Simulator"
+    actual_randomization = requested_randomization
+    randomization_distributions = None
+    camera_calibration = None
+    camera_calibration_history = previous_camera_calibration_history(
+        previous_checkpoint_metadata
+    )
+    if env is not None:
+        raw_env = getattr(env, "unwrapped", env)
+        environment_class = f"{type(raw_env).__module__}.{type(raw_env).__qualname__}"
+        actual_randomization = environment_randomization_settings(raw_env)
+        randomizer = getattr(raw_env, "randomizer", None)
+        if randomizer is not None:
+            randomization_distributions = deepcopy(
+                getattr(randomizer, "randomization_config", None)
+            )
+        camera_calibration = environment_camera_calibration(raw_env)
+        camera_calibration["training_context"] = {
+            "map_name": config.map_name,
+            "master_seed": config.seed,
+            "resumed_from_checkpoint": config.resume_checkpoint,
+        }
+        camera_calibration_history.append(deepcopy(camera_calibration))
+    if config.resume_checkpoint is not None:
+        policy_encoder_initialization = "resumed RL checkpoint"
+        value_encoder_initialization = "resumed RL checkpoint"
+    elif config.imitation_checkpoint is not None:
+        policy_encoder_initialization = "imitation checkpoint"
+        value_encoder_initialization = "ImageNet"
+    else:
+        policy_encoder_initialization = "ImageNet"
+        value_encoder_initialization = "ImageNet"
+    temporal_head_initialization = (
+        "standard PyTorch initialization"
+        if config.temporal_head_mode == "temporal_mlp"
+        else "zero-initialized output layer over current-frame head"
+    )
+    return {
+        "metadata_schema_version": 2,
+        "domain_rand": config.domain_rand,
+        "dynamics_rand": config.dynamics_rand,
+        "camera_rand": config.camera_rand,
+        "distortion": config.distortion,
+        "randomization_config": config.randomization_config,
+        "observation_history_length": config.observation_history_length,
+        "action_history_length": config.action_history_length,
+        "history_initialization": deepcopy(HISTORY_INITIALIZATION),
+        "environment": {
+            "backend": "gym-duckietown",
+            "class": environment_class,
+            "gym_duckietown_version": gym_duckietown_version(),
+            "map_name": config.map_name,
+            "map_list": [config.map_name],
+            "master_seed": config.seed,
+            "seed_config": {
+                "source": config.start_seeds_config,
+                "training_seeds": list(config.training_start_seeds),
+                "evaluation_seeds": list(config.eval_seeds),
+                "training_pose_count": len(config.training_start_poses),
+                "evaluation_pose_count": len(config.evaluation_start_poses),
+            },
+            "randomization": {
+                "requested": requested_randomization,
+                "actual": actual_randomization,
+                "config": config.randomization_config,
+                "built_in_distributions": randomization_distributions,
+            },
+            "camera_calibration": camera_calibration,
+            "camera_calibration_history": camera_calibration_history,
+        },
+        "observation": {
+            "source_shape": [config.camera_height, config.camera_width, 3],
+            "preprocessed_frame_shape": [3, config.image_size, config.image_size],
+            "policy_observation_shape": [
+                config.observation_history_length,
+                3,
+                config.image_size,
+                config.image_size,
+            ],
+            "channel_order": config.source_observation_channel_order,
+            "crop_y_start": config.crop_y_start,
+            "normalization": {
+                "mean": list(IMAGENET_MEAN),
+                "std": list(IMAGENET_STD),
+            },
+        },
+        "action": {
+            "policy_shape": [action_control.policy_action_dim],
+            "history_shape": [
+                config.action_history_length,
+                action_control.policy_action_dim,
+            ],
+            "history_representation": "squashed normalized policy controls in [-1, 1]",
+            "mode": action_control.mode,
+            "controls": list(action_control.control_names),
+            "environment_shape": [2],
+        },
+        "history": {
+            "observation_history_length": config.observation_history_length,
+            "action_history_length": config.action_history_length,
+            "initialization": HISTORY_INITIALIZATION,
+            "model": history_model_description(config.temporal_head_mode),
+            "temporal_head_mode": config.temporal_head_mode,
+        },
+        "model": {
+            "encoder": config.model,
+            "policy_encoder_initialization": policy_encoder_initialization,
+            "value_encoder_initialization": value_encoder_initialization,
+            "temporal_head_initialization": temporal_head_initialization,
+            "architecture": history_model_description(config.temporal_head_mode),
+            "temporal_hidden_dim": config.temporal_hidden_dim,
+            "temporal_head_mode": config.temporal_head_mode,
+            "separate_policy_and_value_encoders": True,
+        },
+    }
+
+
+def initialize_history(
+    observation: np.ndarray,
+    args: argparse.Namespace,
+    transform: transforms.Compose,
+    action_dim: int,
+) -> FixedHistory:
+    history = FixedHistory(
+        args.observation_history_length,
+        args.action_history_length,
+        action_dim,
+    )
+    history.reset(
+        preprocess(
+            observation,
+            args.crop_y_start,
+            args.image_size,
+            args.source_observation_channel_order,
+            transform,
+        )
+    )
+    return history
+
+
+@torch.no_grad()
+def rollout_log_probabilities(
+    policy: TemporalTanhGaussianPolicy,
+    observations: torch.Tensor,
+    action_histories: torch.Tensor,
+    raw_actions: torch.Tensor,
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    values = []
+    for start in range(0, observations.shape[0], batch_size):
+        stop = min(start + batch_size, observations.shape[0])
+        batch_observations = observations[start:stop].to(device)
+        batch_histories = action_histories[start:stop].to(device)
+        batch_raw_actions = raw_actions[start:stop]
+        distribution = policy.distribution(batch_observations, batch_histories)
+        values.append(
+            tanh_normal_log_prob(
+                distribution,
+                batch_raw_actions,
+                torch.tanh(batch_raw_actions),
+            )
+        )
+    return torch.cat(values)
 
 
 def observation_to_rgb(observation: np.ndarray, channel_order: str) -> np.ndarray:
@@ -534,6 +889,8 @@ def make_env(args: argparse.Namespace, seed: int | None = None):
         draw_curve=False,
         draw_bbox=False,
         domain_rand=args.domain_rand,
+        dynamics_rand=args.dynamics_rand,
+        camera_rand=args.camera_rand,
         frame_rate=args.frame_rate,
         frame_skip=args.frame_skip,
         camera_width=args.camera_width,
@@ -714,7 +1071,7 @@ def write_training_episode(
 
 def evaluate_policy(
     env,
-    policy: TanhGaussianPolicy,
+    policy: TemporalTanhGaussianPolicy,
     action_control: DuckietownActionControl,
     reward_calculator: GymDuckietownRewardCalculator,
     args: argparse.Namespace,
@@ -760,6 +1117,12 @@ def evaluate_policy(
             seed=scenario_seed,
             use_random_warmup=False,
         )
+        history = initialize_history(
+            observation,
+            args,
+            transform,
+            action_control.policy_action_dim,
+        )
         raw_env = getattr(env, "unwrapped", env)
         if evaluation_start.pose is not None and not raw_env._valid_pose(
             raw_env.cur_pos,
@@ -780,17 +1143,12 @@ def evaluate_policy(
         components = RewardComponentAccumulator()
 
         for eval_step in range(args.eval_steps):
-            obs_tensor = preprocess(
-                observation,
-                args.crop_y_start,
-                args.image_size,
-                args.source_observation_channel_order,
-                transform,
-            ).unsqueeze(0).to(device)
+            observation_history, action_history = history.batched(device)
             with torch.no_grad():
                 policy_controls = policy.act(
-                    obs_tensor,
+                    observation_history,
                     deterministic=args.eval_deterministic,
+                    action_history=action_history,
                 )
                 wheel_action = action_control.to_wheels_tensor(policy_controls)
                 action = format_wheel_action(
@@ -816,8 +1174,16 @@ def evaluate_policy(
             scenario_steps += 1
             scenario_terminated = bool(terminated)
             scenario_truncated = bool(truncated)
-            if scenario_terminated or scenario_truncated:
+            if scenario_terminated or scenario_truncated or reached_eval_limit:
                 break
+            next_frame = preprocess(
+                observation,
+                args.crop_y_start,
+                args.image_size,
+                args.source_observation_channel_order,
+                transform,
+            )
+            history.append(policy_controls.squeeze(0), next_frame)
 
         scenario_time_limit = not scenario_terminated and not scenario_truncated
         terminated_count += int(scenario_terminated)
@@ -870,7 +1236,16 @@ def evaluate_policy(
     }
 
 
-def save_checkpoint(path, policy, value, policy_optimizer, value_optimizer, config, step):
+def save_checkpoint(
+    path,
+    policy,
+    value,
+    policy_optimizer,
+    value_optimizer,
+    config,
+    metadata,
+    step,
+):
     action_control = DuckietownActionControl(
         mode=config.action_mode,
         fixed_throttle=config.fixed_throttle,
@@ -884,6 +1259,7 @@ def save_checkpoint(path, policy, value, policy_optimizer, value_optimizer, conf
         "policy_optimizer_state_dict": policy_optimizer.state_dict(),
         "value_optimizer_state_dict": value_optimizer.state_dict(),
         "config": asdict(config),
+        "metadata": deepcopy(metadata),
         "env_backend": "gym-duckietown",
         "action_space": {
             "mode": action_control.mode,
@@ -927,6 +1303,9 @@ def load_reference_imitation_model(checkpoint_path: Path, device: torch.device):
 
 def main() -> None:
     args = parse_args()
+    explicit_options = explicit_cli_options(sys.argv[1:])
+    resumed_configuration_keys: list[str] = []
+    previous_checkpoint_metadata = None
     if args.vd2pp_distance_weight < 0.0:
         raise ValueError("--vd2pp-distance-weight must be non-negative")
     if args.resume_checkpoint is not None and args.imitation_checkpoint is not None:
@@ -937,10 +1316,23 @@ def main() -> None:
             map_location="cpu",
         )
         resume_config = resume_preview.get("config", {})
-        args.action_mode = resume_config.get("action_mode", "wheel")
-        args.fixed_throttle = resume_config.get("fixed_throttle")
-        args.max_throttle = float(resume_config.get("max_throttle", 1.0))
-        args.max_steering = float(resume_config.get("max_steering", 0.5))
+        resumed_configuration_keys = restore_resume_configuration(
+            args,
+            resume_config,
+            explicit_options,
+        )
+        previous_checkpoint_metadata = deepcopy(
+            resume_preview.get("metadata")
+        )
+        del resume_preview
+    validate_history_lengths(
+        args.observation_history_length,
+        args.action_history_length,
+    )
+    if args.temporal_hidden_dim <= 0:
+        raise ValueError("--temporal-hidden-dim must be positive")
+    if args.camera_rand and not args.distortion:
+        raise ValueError("--camera-rand requires --distortion in gym-duckietown 6.2.0")
     action_control = DuckietownActionControl(
         mode=args.action_mode,
         fixed_throttle=args.fixed_throttle,
@@ -984,10 +1376,17 @@ def main() -> None:
     config_values["evaluation_start_poses"] = (
         start_config.evaluation_poses if start_config is not None else ()
     )
+    config_values["randomization_config"] = "gym-duckietown defaults"
     config = PPOConfig(**config_values, device=str(device))
+    checkpoint_metadata = build_checkpoint_metadata(
+        config,
+        action_control,
+        previous_checkpoint_metadata=previous_checkpoint_metadata,
+    )
     config_json = {
         **asdict(config),
         "env_backend": "gym-duckietown",
+        "metadata": checkpoint_metadata,
         "reward_metadata": {
             "name": args.reward_function,
             "source": reward_source(args.reward_function),
@@ -1064,16 +1463,34 @@ def main() -> None:
             ),
         },
     }
-    (run_dir / "config.json").write_text(json.dumps(config_json, indent=2) + "\n")
-
     transform = make_transform()
-    policy = TanhGaussianPolicy(
+    policy = TemporalTanhGaussianPolicy(
         args.model,
         action_dim=action_control.policy_action_dim,
         pretrained=args.imitation_checkpoint is None and args.resume_checkpoint is None,
+        observation_history_length=args.observation_history_length,
+        action_history_length=args.action_history_length,
+        temporal_hidden_dim=args.temporal_hidden_dim,
+        temporal_head_mode=args.temporal_head_mode,
     ).to(device)
     if args.imitation_checkpoint is not None:
-        load_imitation_actor(policy, args.imitation_checkpoint)
+        imitation_policy = TanhGaussianPolicy(
+            args.model,
+            action_dim=action_control.policy_action_dim,
+            pretrained=False,
+        )
+        load_imitation_actor(imitation_policy, args.imitation_checkpoint)
+        policy.encoder.load_state_dict(imitation_policy.encoder.state_dict())
+        if args.temporal_head_mode == TEMPORAL_HEAD_MODE_RESIDUAL:
+            if policy.mean is None:
+                raise RuntimeError("Residual policy is missing its current-frame head")
+            policy.mean.load_state_dict(imitation_policy.mean.state_dict())
+        else:
+            print(
+                "IL warm start: initialized the shared CNN encoder only; "
+                "the direct temporal MLP starts from its standard random initialization.",
+                flush=True,
+            )
         policy.to(device)
     if args.resume_checkpoint is None:
         initial_log_std = args.initial_log_std
@@ -1083,7 +1500,15 @@ def main() -> None:
         with torch.no_grad():
             policy.log_std.fill_(initial_log_std)
         print(f"Initial policy log_std={initial_log_std:.3f} std={np.exp(initial_log_std):.3f}", flush=True)
-    value = ValueNetwork(args.model, pretrained=args.resume_checkpoint is None).to(device)
+    value = TemporalValueNetwork(
+        args.model,
+        action_dim=action_control.policy_action_dim,
+        pretrained=args.resume_checkpoint is None,
+        observation_history_length=args.observation_history_length,
+        action_history_length=args.action_history_length,
+        temporal_hidden_dim=args.temporal_hidden_dim,
+        temporal_head_mode=args.temporal_head_mode,
+    ).to(device)
     policy_optimizer = torch.optim.AdamW(policy.parameters(), lr=args.policy_lr)
     value_optimizer = torch.optim.AdamW(value.parameters(), lr=args.value_lr)
     resumed_step = 0
@@ -1095,12 +1520,6 @@ def main() -> None:
             parameter_group["lr"] = args.value_lr
         resumed_step = int(checkpoint.get("step", 0))
         checkpoint_config = checkpoint.get("config", {})
-        checkpoint_model = checkpoint_config.get("model")
-        if checkpoint_model is not None and checkpoint_model != args.model:
-            raise ValueError(
-                f"Checkpoint model is {checkpoint_model!r}, but --model is {args.model!r}. "
-                "Use the same model architecture when resuming."
-            )
         with torch.no_grad():
             policy.log_std.clamp_(args.min_log_std, args.max_log_std)
         print(f"Resumed RL checkpoint {args.resume_checkpoint.expanduser()} at step={resumed_step}", flush=True)
@@ -1265,7 +1684,77 @@ def main() -> None:
             initial_eval_seed = args.eval_seeds[0] if args.eval_seeds else args.seed + 100_000
             eval_env = make_env(args, seed=initial_eval_seed)
             eval_start_defaults = capture_environment_start_defaults(eval_env)
+        checkpoint_metadata = build_checkpoint_metadata(
+            config,
+            action_control,
+            env,
+            previous_checkpoint_metadata=previous_checkpoint_metadata,
+        )
+        config_json["metadata"] = checkpoint_metadata
+        (run_dir / "config.json").write_text(json.dumps(config_json, indent=2) + "\n")
+        actual_randomization = environment_randomization_settings(env)
+        requested_randomization = {
+            "domain_rand": args.domain_rand,
+            "dynamics_rand": args.dynamics_rand,
+            "camera_rand": args.camera_rand,
+            "distortion": args.distortion,
+        }
+        if actual_randomization != requested_randomization:
+            raise RuntimeError(
+                "gym-duckietown did not apply the requested randomization settings: "
+                f"requested={requested_randomization}, actual={actual_randomization}"
+            )
+        run_mode = "resumed checkpoint" if args.resume_checkpoint is not None else "new training run"
+        print(f"Training mode: {run_mode}", flush=True)
+        if resumed_configuration_keys:
+            print(
+                "Checkpoint configuration restored: "
+                + ", ".join(resumed_configuration_keys),
+                flush=True,
+            )
         print(f"Environment: gym-duckietown map={args.map_name}", flush=True)
+        print(f"Environment class: {checkpoint_metadata['environment']['class']}", flush=True)
+        print(
+            f"gym-duckietown version: {checkpoint_metadata['environment']['gym_duckietown_version']}",
+            flush=True,
+        )
+        if checkpoint_metadata["environment"]["camera_calibration"]["available"]:
+            print(
+                "Training camera calibration: captured in checkpoint metadata",
+                flush=True,
+            )
+        print(
+            f"Domain randomization: {'enabled' if actual_randomization['domain_rand'] else 'disabled'}",
+            flush=True,
+        )
+        print(
+            f"Dynamics randomization: {'enabled' if actual_randomization['dynamics_rand'] else 'disabled'}",
+            flush=True,
+        )
+        print(
+            f"Camera randomization: {'enabled' if actual_randomization['camera_rand'] else 'disabled'}",
+            flush=True,
+        )
+        print(
+            f"Camera distortion: {'enabled' if actual_randomization['distortion'] else 'disabled'}",
+            flush=True,
+        )
+        print(f"Observation history: {args.observation_history_length} frames", flush=True)
+        print(f"Action history: {args.action_history_length} actions", flush=True)
+        print(
+            f"History model: {history_model_description(args.temporal_head_mode)}",
+            flush=True,
+        )
+        print(
+            "Policy CNN initialization: "
+            f"{checkpoint_metadata['model']['policy_encoder_initialization']}",
+            flush=True,
+        )
+        print(
+            "Value CNN initialization: "
+            f"{checkpoint_metadata['model']['value_encoder_initialization']}",
+            flush=True,
+        )
         print(f"Reward function: {args.reward_function}", flush=True)
         if args.reward_function == "vd2pp":
             print(
@@ -1312,18 +1801,18 @@ def main() -> None:
             training_start,
             training_start_defaults,
         )
+        history = initialize_history(
+            observation,
+            args,
+            transform,
+            action_control.policy_action_dim,
+        )
         if args.render_training:
             render_training_environment(env)
         if args.debug_initial_action:
             with torch.no_grad():
-                obs_tensor = preprocess(
-                    observation,
-                    args.crop_y_start,
-                    args.image_size,
-                    args.source_observation_channel_order,
-                    transform,
-                ).unsqueeze(0).to(device)
-                mean, log_std = policy(obs_tensor)
+                observation_history, action_history = history.batched(device)
+                mean, log_std = policy(observation_history, action_history)
                 deterministic_controls_tensor = torch.tanh(mean)
                 deterministic_controls = (
                     deterministic_controls_tensor.squeeze(0).cpu().numpy()
@@ -1339,7 +1828,9 @@ def main() -> None:
                 reference_action = None
                 if args.imitation_checkpoint is not None:
                     reference_model = load_reference_imitation_model(args.imitation_checkpoint, device)
-                    reference_action = reference_model(obs_tensor).squeeze(0).cpu().numpy()
+                    reference_action = reference_model(
+                        observation_history[:, -1]
+                    ).squeeze(0).cpu().numpy()
             print(
                 "debug_initial_action "
                 f"action_mode={action_control.mode} "
@@ -1374,7 +1865,7 @@ def main() -> None:
         while global_step < args.total_steps:
             synchronize_device(device)
             rollout_started_at = perf_counter()
-            obs_buf, action_buf, raw_action_buf = [], [], []
+            obs_buf, action_history_buf, action_buf, raw_action_buf = [], [], [], []
             wheel_action_buf, deterministic_action_buf = [], []
             deterministic_wheel_action_buf = []
             logp_buf, reward_buf, done_buf, value_buf = [], [], [], []
@@ -1384,26 +1875,26 @@ def main() -> None:
             env_step_seconds = 0.0
             reward_and_reset_seconds = 0.0
             for _ in range(args.rollout_steps):
-                phase_started_at = perf_counter()
-                obs_tensor = preprocess(
-                    observation,
-                    args.crop_y_start,
-                    args.image_size,
-                    args.source_observation_channel_order,
-                    transform,
-                ).to(device)
-                preprocess_seconds += perf_counter() - phase_started_at
+                observation_history, action_history = history.snapshot()
 
                 phase_started_at = perf_counter()
+                observation_history_device = observation_history.unsqueeze(0).to(device)
+                action_history_device = action_history.unsqueeze(0).to(device)
                 with torch.no_grad():
                     action_tensor, raw_action_tensor, logp_tensor, deterministic_action_tensor = (
-                        policy.sample_with_raw(obs_tensor.unsqueeze(0))
+                        policy.sample_with_raw(
+                            observation_history_device,
+                            action_history_device,
+                        )
                     )
                     wheel_action_tensor = action_control.to_wheels_tensor(action_tensor)
                     deterministic_wheel_action_tensor = action_control.to_wheels_tensor(
                         deterministic_action_tensor
                     )
-                    value_tensor = value(obs_tensor.unsqueeze(0))
+                    value_tensor = value(
+                        observation_history_device,
+                        action_history_device,
+                    )
                 action = format_wheel_action(
                     wheel_action_tensor.squeeze(0).cpu().numpy()
                 )
@@ -1428,7 +1919,8 @@ def main() -> None:
                 reward = rollout_reward_components.add(reward_breakdown)
                 reward_and_reset_seconds += perf_counter() - phase_started_at
 
-                obs_buf.append(obs_tensor.cpu())
+                obs_buf.append(observation_history)
+                action_history_buf.append(action_history)
                 action_buf.append(action_tensor.squeeze(0).cpu())
                 raw_action_buf.append(raw_action_tensor.squeeze(0).cpu())
                 deterministic_action_buf.append(deterministic_action_tensor.squeeze(0).cpu())
@@ -1481,12 +1973,29 @@ def main() -> None:
                         training_start,
                         training_start_defaults,
                     )
+                    history = initialize_history(
+                        observation,
+                        args,
+                        transform,
+                        action_control.policy_action_dim,
+                    )
                     if args.render_training:
                         render_training_environment(env)
                     reward_and_reset_seconds += perf_counter() - phase_started_at
                     episode += 1
                     episode_return = 0.0
                     episode_length = 0
+                else:
+                    phase_started_at = perf_counter()
+                    next_frame = preprocess(
+                        observation,
+                        args.crop_y_start,
+                        args.image_size,
+                        args.source_observation_channel_order,
+                        transform,
+                    )
+                    history.append(action_tensor.squeeze(0), next_frame)
+                    preprocess_seconds += perf_counter() - phase_started_at
                 if global_step >= args.total_steps:
                     break
 
@@ -1502,7 +2011,12 @@ def main() -> None:
             rollout_overhead_seconds = max(0.0, rollout_seconds - measured_rollout_seconds)
             update_started_at = rollout_finished_at
 
-            obs = torch.stack(obs_buf).to(device)
+            # Histories stay on CPU and only PPO minibatches are transferred to
+            # the accelerator. A full 1024 x 5 x 224 x 224 float rollout is too
+            # large to duplicate eagerly in GPU memory.
+            obs = torch.stack(obs_buf)
+            action_histories = torch.stack(action_history_buf)
+            del obs_buf, action_history_buf
             actions = torch.stack(action_buf).to(device)
             wheel_actions = torch.stack(wheel_action_buf).to(device)
             raw_actions = torch.stack(raw_action_buf).to(device)
@@ -1515,44 +2029,62 @@ def main() -> None:
             dones = torch.tensor(done_buf, dtype=torch.float32, device=device)
             values = torch.stack(value_buf).to(device)
             with torch.no_grad():
-                last_obs = preprocess(
-                    observation,
-                    args.crop_y_start,
-                    args.image_size,
-                    args.source_observation_channel_order,
-                    transform,
-                ).unsqueeze(0).to(device)
-                last_value = value(last_obs).squeeze(0)
-                advantages, returns = compute_gae(rewards, dones, values, last_value, args.gamma, args.gae_lambda)
-                advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+                last_observations, last_action_history = history.batched(device)
+                last_value = value(
+                    last_observations,
+                    last_action_history,
+                ).squeeze(0)
+                advantages, returns = compute_gae(
+                    rewards,
+                    dones,
+                    values,
+                    last_value,
+                    args.gamma,
+                    args.gae_lambda,
+                )
+                advantages = (advantages - advantages.mean()) / (
+                    advantages.std(unbiased=False) + 1e-8
+                )
 
-                pre_update_distribution = policy.distribution(obs)
-                pre_update_actions = torch.tanh(raw_actions)
-                pre_update_logp = tanh_normal_log_prob(
-                    pre_update_distribution,
+                pre_update_logp = rollout_log_probabilities(
+                    policy,
+                    obs,
+                    action_histories,
                     raw_actions,
-                    pre_update_actions,
+                    args.batch_size,
+                    device,
                 )
                 pre_update_log_ratio = pre_update_logp - old_logp
                 pre_update_mean_abs_log_ratio = pre_update_log_ratio.abs().mean().item()
                 pre_update_max_abs_log_ratio = pre_update_log_ratio.abs().max().item()
 
             last_policy_loss = last_value_loss = last_entropy = 0.0
-            indices = torch.arange(obs.size(0), device=device)
+            indices = torch.arange(obs.size(0))
             for _ in range(args.epochs):
-                permutation = indices[torch.randperm(obs.size(0), device=device)]
+                permutation = indices[torch.randperm(obs.size(0))]
                 for start in range(0, obs.size(0), args.batch_size):
                     batch = permutation[start:start + args.batch_size]
-                    distribution = policy.distribution(obs[batch])
-                    batch_raw_actions = raw_actions[batch]
+                    device_batch = batch.to(device)
+                    batch_observations = obs[batch].to(device)
+                    batch_action_histories = action_histories[batch].to(device)
+                    distribution = policy.distribution(
+                        batch_observations,
+                        batch_action_histories,
+                    )
+                    batch_raw_actions = raw_actions[device_batch]
                     batch_actions = torch.tanh(batch_raw_actions)
                     logp = tanh_normal_log_prob(distribution, batch_raw_actions, batch_actions)
-                    ratio = torch.exp(logp - old_logp[batch])
-                    clipped = torch.clamp(ratio, 1.0 - args.clip_ratio, 1.0 + args.clip_ratio) * advantages[batch]
-                    policy_loss = -torch.min(ratio * advantages[batch], clipped).mean()
+                    ratio = torch.exp(logp - old_logp[device_batch])
+                    clipped = torch.clamp(
+                        ratio,
+                        1.0 - args.clip_ratio,
+                        1.0 + args.clip_ratio,
+                    ) * advantages[device_batch]
+                    policy_loss = -torch.min(
+                        ratio * advantages[device_batch],
+                        clipped,
+                    ).mean()
                     entropy = distribution.entropy().sum(dim=1).mean()
-                    values_pred = value(obs[batch])
-                    value_loss = nn.functional.mse_loss(values_pred, returns[batch])
 
                     policy_optimizer.zero_grad(set_to_none=True)
                     (policy_loss - args.entropy_coef * entropy).backward()
@@ -1561,6 +2093,16 @@ def main() -> None:
                     with torch.no_grad():
                         policy.log_std.clamp_(args.min_log_std, args.max_log_std)
 
+                    # Build the value graph after freeing the policy graph. With
+                    # five encoded frames this materially lowers peak GPU memory.
+                    values_pred = value(
+                        batch_observations,
+                        batch_action_histories,
+                    )
+                    value_loss = nn.functional.mse_loss(
+                        values_pred,
+                        returns[device_batch],
+                    )
                     value_optimizer.zero_grad(set_to_none=True)
                     (args.value_coef * value_loss).backward()
                     nn.utils.clip_grad_norm_(value.parameters(), args.max_grad_norm)
@@ -1568,9 +2110,14 @@ def main() -> None:
                     last_policy_loss, last_value_loss, last_entropy = policy_loss.item(), value_loss.item(), entropy.item()
 
             with torch.no_grad():
-                final_distribution = policy.distribution(obs)
-                final_actions = torch.tanh(raw_actions)
-                final_logp = tanh_normal_log_prob(final_distribution, raw_actions, final_actions)
+                final_logp = rollout_log_probabilities(
+                    policy,
+                    obs,
+                    action_histories,
+                    raw_actions,
+                    args.batch_size,
+                    device,
+                )
                 final_log_ratio = final_logp - old_logp
                 final_ratio = final_log_ratio.exp()
                 approx_kl = ((final_ratio - 1.0) - final_log_ratio).mean().item()
@@ -1668,7 +2215,16 @@ def main() -> None:
             rollout_reward_per_step = rollout_return / max(1, rollout_step_count)
             cycle_steps_per_second = rollout_step_count / max(rollout_update_seconds, 1e-12)
 
-            save_checkpoint(run_dir / "last.pt", policy, value, policy_optimizer, value_optimizer, config, global_step)
+            save_checkpoint(
+                run_dir / "last.pt",
+                policy,
+                value,
+                policy_optimizer,
+                value_optimizer,
+                config,
+                checkpoint_metadata,
+                global_step,
+            )
             metrics_recorded_at = perf_counter()
             elapsed_seconds = metrics_recorded_at - training_started_at
             completed_training_steps = global_step - training_start_step
@@ -1820,6 +2376,7 @@ def main() -> None:
                     policy_optimizer,
                     value_optimizer,
                     config,
+                    checkpoint_metadata,
                     global_step,
                 )
                 print(f"eval_checkpoint step={global_step} checkpoint={eval_checkpoint}", flush=True)
@@ -1834,6 +2391,7 @@ def main() -> None:
                         policy_optimizer,
                         value_optimizer,
                         config,
+                        checkpoint_metadata,
                         global_step,
                     )
                     print(
@@ -1855,6 +2413,7 @@ def main() -> None:
                         policy_optimizer,
                         value_optimizer,
                         config,
+                        checkpoint_metadata,
                         global_step,
                     )
                     print(

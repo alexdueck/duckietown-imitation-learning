@@ -4,8 +4,10 @@
 > preliminary research observations, not final benchmarks.
 
 This repository explores vision-based Duckietown control with imitation
-learning (IL) and reinforcement learning (RL). A camera image is the model
-input; continuous Duckiebot controls are the output.
+learning (IL) and reinforcement learning (RL). Camera observations are the
+primary model input; the current gym-duckietown PPO policy additionally uses a
+fixed history of its own recent controls. Continuous Duckiebot controls are the
+output.
 
 ## Current State
 

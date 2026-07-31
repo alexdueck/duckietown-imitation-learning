@@ -23,7 +23,7 @@ from dt_utils.gym_duckietown_start_config import (
     append_evaluation_pose,
     append_training_pose,
     apply_env_start_pose,
-    load_pose_file,
+    load_start_config,
     next_pose_name,
 )
 from dt_utils.duckietown_rewards import (
@@ -41,6 +41,7 @@ from dt_utils.velopose_reward import VD2PP_DISTANCE_SQUARED_WEIGHT
 
 SIDEBAR_WIDTH = 500
 MIN_VIEWER_HEIGHT = 860
+CONTROL_HELP_HEIGHT = 150
 MANUAL_REWARD_FUNCTIONS = ("velopose", "posepot")
 BACKGROUND = (18, 22, 26)
 SIDEBAR_BG = (27, 31, 36)
@@ -57,6 +58,16 @@ class CurrentPose:
     tile: tuple[int, int]
     local_position: tuple[float, float, float]
     angle: float
+
+
+@dataclass(frozen=True)
+class SelectableStartPose:
+    pose: TrainingPose
+    source: str
+
+    @property
+    def source_label(self) -> str:
+        return "train" if self.source == "training_poses" else "eval"
 
 
 @dataclass
@@ -151,10 +162,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dynamics-rand", action="store_true")
     parser.add_argument("--camera-rand", action="store_true")
     parser.add_argument(
-        "--start-pose-file",
+        "--start-poses",
         type=Path,
         default=None,
-        help="JSON file containing exactly one pose; startup and ordinary resets return to it.",
+        help=(
+            "Multi-map start config containing training_poses and evaluation_poses. "
+            "N/Shift+N browse poses for --map-name and G selects one by name."
+        ),
     )
     parser.add_argument(
         "--start-config",
@@ -419,6 +433,28 @@ def capture_training_pose(env) -> TrainingPose:
     )
 
 
+def load_selectable_start_poses(path: Path, map_name: str) -> tuple[SelectableStartPose, ...]:
+    config = load_start_config(
+        path,
+        None,
+        require_training_starts=False,
+        require_evaluation_scenarios=False,
+    )
+    entries = tuple(
+        SelectableStartPose(pose=pose, source=source)
+        for source, poses in (
+            ("training_poses", config.training_poses),
+            ("evaluation_poses", config.evaluation_poses),
+        )
+        for pose in poses
+        if pose.map_name == map_name
+    )
+    if not entries:
+        raise ValueError(f"config contains no start poses for map {map_name!r}")
+
+    return entries
+
+
 def draw_rect(x: float, y: float, width: float, height: float, color: tuple[int, int, int]) -> None:
     from pyglet import gl
 
@@ -514,7 +550,11 @@ def sidebar_lines(
     state: ViewerState,
     map_name: str,
     seed_input: str | None = None,
+    pose_name_input: str | None = None,
     pose_save_status: str | None = None,
+    selected_start_pose: SelectableStartPose | None = None,
+    selected_start_index: int | None = None,
+    start_pose_count: int = 0,
 ) -> list[tuple[str, int, tuple[int, int, int, int], bool]]:
     lane = state.lane_metrics
     pose = state.current_pose
@@ -523,6 +563,18 @@ def sidebar_lines(
         ("gym-duckietown rewards", 18, ACCENT, True),
         (f"map {map_name}", 13, MUTED, False),
         (f"reset seed {seed_label}", 13, MUTED, False),
+        (
+            (
+                f"start pose {selected_start_index + 1}/{start_pose_count} "
+                f"{selected_start_pose.pose.name or '<unnamed>'} "
+                f"[{selected_start_pose.source_label}]"
+                if selected_start_pose is not None and selected_start_index is not None
+                else "start pose simulator default"
+            ),
+            13,
+            ACCENT,
+            True,
+        ),
         (f"step {state.step_count}  t {state.timestamp:.2f}s", 13, MUTED, False),
         (
             f"pose world x {pose.position[0]:+.5f}  y {pose.position[1]:+.5f}  "
@@ -570,6 +622,8 @@ def sidebar_lines(
 
     if seed_input is not None:
         lines.insert(3, (f"new seed > {seed_input}_", 15, ACCENT, True))
+    if pose_name_input is not None:
+        lines.insert(3, (f"go to pose > {pose_name_input}_", 15, ACCENT, True))
     if pose_save_status is not None:
         lines.insert(3, (pose_save_status, 13, ACCENT, True))
 
@@ -596,7 +650,11 @@ def draw_sidebar(
     x: int,
     height: int,
     seed_input: str | None = None,
+    pose_name_input: str | None = None,
     pose_save_status: str | None = None,
+    selected_start_pose: SelectableStartPose | None = None,
+    selected_start_index: int | None = None,
+    start_pose_count: int = 0,
 ) -> None:
     draw_rect(x, 0, SIDEBAR_WIDTH, height, SIDEBAR_BG)
     cursor_y = height - 30
@@ -604,11 +662,35 @@ def draw_sidebar(
         state,
         map_name,
         seed_input,
+        pose_name_input,
         pose_save_status,
+        selected_start_pose,
+        selected_start_index,
+        start_pose_count,
     ):
         if text:
             draw_label(text, x + 18, cursor_y, font_size=font_size, color=color, bold=bold)
         cursor_y -= max(16, font_size + 8)
+
+
+def draw_control_help(camera_bottom: int) -> None:
+    lines = (
+        "W/A/S/D or arrows: drive    Space: stop    Shift: boost",
+        "P: save train pose    Shift+P: save eval pose",
+        "N: next start pose    Shift+N: previous start pose    G: go to pose name",
+        "R: reset with seed    Backspace or /: reset current start pose",
+        "Enter: screenshot    Esc: cancel input / exit",
+    )
+    cursor_y = camera_bottom - 24
+    for text in lines:
+        draw_label(
+            text,
+            12,
+            cursor_y,
+            font_size=11,
+            color=MUTED,
+        )
+        cursor_y -= 24
 
 
 def save_screenshot(window, path: Path) -> None:
@@ -623,27 +705,42 @@ def main() -> None:
     args = parse_args()
     configure_logging(args.log_level)
     try:
-        start_pose = (
-            load_pose_file(args.start_pose_file)
-            if args.start_pose_file is not None
-            else None
+        start_poses = (
+            load_selectable_start_poses(args.start_poses, args.map_name)
+            if args.start_poses is not None
+            else ()
         )
     except (OSError, ValueError) as error:
-        raise SystemExit(f"Could not load --start-pose-file: {error}") from error
+        raise SystemExit(f"Could not load --start-poses: {error}") from error
+    selected_start_index: int | None = 0 if start_poses else None
+
+    def selected_start_pose() -> SelectableStartPose | None:
+        if selected_start_index is None:
+            return None
+        return start_poses[selected_start_index]
+
     env = make_env(args)
     configure_logging(args.log_level)
     _, _, image_width, image_height = import_simulator()
-    viewer_height = max(image_height, MIN_VIEWER_HEIGHT)
+    viewer_height = max(image_height + 2 * CONTROL_HELP_HEIGHT, MIN_VIEWER_HEIGHT)
     image_y = (viewer_height - image_height) // 2
     calculators = create_reward_calculators(
         args.reward_functions,
         posepot_gamma=args.posepot_gamma,
         vd2pp_distance_weight=args.vd2pp_distance_weight,
     )
-    state = reset_env(env, calculators, seed=args.seed, start_pose=start_pose)
+    initial_start = selected_start_pose()
+    state = reset_env(
+        env,
+        calculators,
+        seed=args.seed,
+        start_pose=initial_start.pose if initial_start is not None else None,
+    )
     action_controller = ManualActionController()
     paused_due_to_done = False
     seed_input: str | None = None
+    pose_name_input: str | None = None
+    ignore_pose_prompt_text = False
     pose_save_status: str | None = None
 
     from pyglet import window as pyglet_window
@@ -658,23 +755,64 @@ def main() -> None:
     pressed_keys: set[int] = set()
 
     print("manual gym-duckietown reward viewer started", flush=True)
-    if start_pose is not None:
+    if initial_start is not None:
         print(
-            f"loaded start pose name={start_pose.name or '-'} tile={start_pose.tile} "
-            f"position={start_pose.position} angle={start_pose.angle:.10f} "
-            f"file={args.start_pose_file.expanduser()}",
+            f"loaded start pose name={initial_start.pose.name or '-'} "
+            f"source={initial_start.source_label} tile={initial_start.pose.tile} "
+            f"position={initial_start.pose.position} angle={initial_start.pose.angle:.10f} "
+            f"file={args.start_poses.expanduser()}",
             flush=True,
         )
     print(
-        "WASD drives, arrow keys also work, R enters a reset seed, "
-        "P saves a training pose, Shift+P saves an evaluation pose, space stops, "
-        "backspace or slash resets, enter saves a screenshot, escape exits",
+        "WASD or arrows drive; P/Shift+P save train/eval poses; "
+        "N/Shift+N select next/previous start pose; G selects by name; "
+        "R enters a reset seed; space stops; backspace or slash resets; "
+        "enter saves a screenshot; escape exits",
         flush=True,
     )
 
+    def reset_to_start_pose(index: int, reason: str) -> None:
+        nonlocal state, selected_start_index, paused_due_to_done, pose_save_status
+        selected_start_index = index % len(start_poses)
+        entry = start_poses[selected_start_index]
+        state = reset_env(env, calculators, start_pose=entry.pose)
+        action_controller.reset()
+        pressed_keys.clear()
+        paused_due_to_done = False
+        pose_save_status = (
+            f"{reason}: {entry.pose.name or '<unnamed>'} [{entry.source_label}]"
+        )
+        print(
+            f"selected start_pose={selected_start_index + 1}/{len(start_poses)} "
+            f"name={entry.pose.name or '-'} source={entry.source_label} "
+            f"map={entry.pose.map_name}",
+            flush=True,
+        )
+
     @window.event
     def on_key_press(symbol, modifiers):
-        nonlocal state, paused_due_to_done, seed_input, pose_save_status
+        nonlocal state, paused_due_to_done, seed_input, pose_name_input
+        nonlocal ignore_pose_prompt_text, pose_save_status
+        if pose_name_input is not None:
+            if symbol == key.BACKSPACE:
+                pose_name_input = pose_name_input[:-1]
+            elif symbol in (key.ENTER, key.RETURN) and pose_name_input:
+                matches = [
+                    index
+                    for index, entry in enumerate(start_poses)
+                    if entry.pose.name == pose_name_input
+                ]
+                requested_name = pose_name_input
+                pose_name_input = None
+                if matches:
+                    reset_to_start_pose(matches[0], "selected")
+                else:
+                    pose_save_status = f"pose not found: {requested_name}"
+                    print(f"No start pose named {requested_name!r}", flush=True)
+            elif symbol == key.ESCAPE:
+                pose_name_input = None
+            return
+
         if seed_input is not None:
             if symbol == key.BACKSPACE:
                 seed_input = seed_input[:-1]
@@ -684,7 +822,10 @@ def main() -> None:
                     env,
                     calculators,
                     seed=seed,
-                    start_pose=start_pose,
+                    start_pose=(
+                        selected_start_pose().pose
+                        if selected_start_pose() is not None else None
+                    ),
                 )
                 action_controller.reset()
                 pressed_keys.clear()
@@ -699,6 +840,30 @@ def main() -> None:
             seed_input = ""
             action_controller.reset()
             pressed_keys.clear()
+            return
+
+        if symbol == key.G:
+            if not start_poses:
+                pose_save_status = "no start poses loaded"
+                print("Cannot select a pose without --start-poses", flush=True)
+            else:
+                pose_name_input = ""
+                ignore_pose_prompt_text = True
+                action_controller.reset()
+                pressed_keys.clear()
+            return
+
+        if symbol == key.N:
+            if symbol in pressed_keys:
+                return
+            pressed_keys.add(symbol)
+            if not start_poses or selected_start_index is None:
+                pose_save_status = "no start poses loaded"
+                print("Cannot browse poses without --start-poses", flush=True)
+            else:
+                direction = -1 if modifiers & key.MOD_SHIFT else 1
+                reset_to_start_pose(selected_start_index + direction, "selected")
+                pressed_keys.add(symbol)
             return
 
         if symbol == key.P:
@@ -744,7 +909,12 @@ def main() -> None:
 
         pressed_keys.add(symbol)
         if symbol in (key.BACKSPACE, key.SLASH):
-            state = reset_env(env, calculators, start_pose=start_pose)
+            active_start = selected_start_pose()
+            state = reset_env(
+                env,
+                calculators,
+                start_pose=active_start.pose if active_start is not None else None,
+            )
             action_controller.reset()
             paused_due_to_done = False
             print("reset", flush=True)
@@ -757,10 +927,21 @@ def main() -> None:
 
     @window.event
     def on_text(text):
-        nonlocal seed_input
+        nonlocal seed_input, pose_name_input, ignore_pose_prompt_text
         if seed_input is not None:
             digits = "".join(character for character in text if character.isdigit())
             seed_input = (seed_input + digits)[:20]
+        elif pose_name_input is not None:
+            if ignore_pose_prompt_text:
+                ignore_pose_prompt_text = False
+                if text.lower() == "g":
+                    return
+            printable = "".join(
+                character
+                for character in text
+                if character.isprintable() and character not in "\r\n"
+            )
+            pose_name_input = (pose_name_input + printable)[:100]
 
     @window.event
     def on_key_release(symbol, modifiers):
@@ -773,18 +954,24 @@ def main() -> None:
         window.clear()
         draw_rect(0, 0, image_width + SIDEBAR_WIDTH, viewer_height, BACKGROUND)
         draw_rgb(rgb, 0, image_y, image_width, image_height)
+        draw_control_help(image_y)
+        active_start = selected_start_pose()
         draw_sidebar(
             state,
             args.map_name,
             image_width,
             viewer_height,
             seed_input,
+            pose_name_input,
             pose_save_status,
+            active_start,
+            selected_start_index,
+            len(start_poses),
         )
 
     def update(dt):
         nonlocal state, paused_due_to_done
-        if paused_due_to_done or seed_input is not None:
+        if paused_due_to_done or seed_input is not None or pose_name_input is not None:
             return
 
         action = action_controller.update(pressed_keys, key, args, dt)
@@ -802,7 +989,12 @@ def main() -> None:
         if done:
             print(f"done step={state.step_count} reason={state.done_reason}", flush=True)
             if args.auto_reset:
-                state = reset_env(env, calculators, start_pose=start_pose)
+                active_start = selected_start_pose()
+                state = reset_env(
+                    env,
+                    calculators,
+                    start_pose=active_start.pose if active_start is not None else None,
+                )
                 action_controller.reset()
             else:
                 action_controller.reset()

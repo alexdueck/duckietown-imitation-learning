@@ -15,6 +15,7 @@ A run contains:
 | --- | --- |
 | `config.json` | Complete resolved run configuration and start metadata |
 | `history.csv` | Completed training episodes |
+| `start_sampling_history.csv` | Adaptive hard/random and per-pose EMA statistics and probabilities |
 | `rollout_history.csv` | PPO rollout, timing, throughput, progress, and loss metrics |
 | `ppo_diagnostics.csv` | Probability ratios, KL, exploration, actions, and saturation |
 | `reward_components_history.csv` | Flattened reward components for train/eval phases |
@@ -128,6 +129,7 @@ A PPO checkpoint stores:
 - actor and value state dictionaries
 - actor and value optimizer state dictionaries
 - full training configuration
+- adaptive start-sampler EMAs, pose statistics, and RNG state
 - backend identifier
 - action-space semantics
 - ImageNet normalization constants

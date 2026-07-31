@@ -27,6 +27,7 @@ mostly create two places for facts to become outdated.
 - [Actions](methodology/actions.md)
 - [Rewards](methodology/rewards.md)
 - [PPO](methodology/ppo.md)
+- [Adaptive start sampling](methodology/adaptive-start-sampling.md)
 - [Evaluation](methodology/evaluation.md)
 - [Related work and provenance](methodology/related-work.md)
 - [Preliminary result summary](results/summary.md)

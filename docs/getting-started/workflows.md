@@ -50,6 +50,9 @@ python manual_control_gym_duckietown.py \
 Press `P` to append the current pose to `training_poses`; press `Shift+P` to
 append it to `evaluation_poses`.
 
+To inspect the saved poses, add `--start-poses` with the same config path.
+Use `N` and `Shift+N` to browse them or `G` to select one by name.
+
 The local `configs/*.json` files are ignored by Git. The templates remain
 versioned.
 
@@ -121,10 +124,10 @@ python train_rl_ppo_gym_duckietown.py \
   --total-steps 1000000
 ```
 
-At each training reset, a configured training pose is selected with the
-requested probability. Other resets use the simulator's normal random start.
-
-When a start config is supplied, its evaluation poses replace `--eval-seeds`.
+The requested probability is used during cold start. Once hard and random
+starts both have outcomes, their EMA failure rates adapt the hard-start
+probability and the individual pose weights. When a start config is supplied,
+its evaluation poses replace `--eval-seeds`.
 
 ## Overfit One Scenario Deliberately
 

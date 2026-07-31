@@ -72,36 +72,36 @@ come exclusively from `evaluation_poses`; `--eval-seeds` is not used.
 
 ## Training Start Sampling
 
-At every training episode reset:
+When a start config is present, the trainer adapts two distributions after
+every completed episode:
 
-```text
-with probability hard_start_probability:
-    choose uniformly from training_poses
-otherwise:
-    use the simulator's normal random start
-```
+1. Hard versus random starts are weighted from their relative EMA failure
+   rates.
+2. Hard poses are weighted from their individual EMA failure rates.
 
-A configured pose receives a fresh reset seed for the simulator's other
+Both use `lambda=0.15`. `--hard-start-probability` is only the cold-start
+probability until hard and random starts have each produced an outcome. A
+configured pose receives a fresh reset seed for the simulator's other
 randomized reset state.
 
-`--hard-start-probability 1.0` always uses curated starts. This is useful for
-an intentional overfitting test.
+See [Adaptive start sampling](../methodology/adaptive-start-sampling.md) for
+the formulas, constants, success definition, logging, and resume behavior.
 
-## Single Pose File
+## Browsing Configured Poses
 
-`configs/gym_duckietown_pose.json.template` documents the file accepted by
-the manual viewer's `--start-pose-file`:
+The manual viewer reads the same multi-map config as the trainer:
 
-```json
-{
-  "name": "curve_start",
-  "tile": [1, 1],
-  "position": [0.149, 0.0, 0.094],
-  "angle": 1.442
-}
+```bash
+python manual_control_gym_duckietown.py \
+  --map-name loop_empty \
+  --start-poses configs/gym_duckietown_start_poses.json
 ```
 
-This file contains exactly one pose. Ordinary resets return to it.
+Only poses matching `--map-name` are available. Press `N` or `Shift+N` to
+select the next or previous pose, and press `G` to enter a pose name directly.
+The sidebar shows the active pose name and whether it came from
+`training_poses` or `evaluation_poses`. Ordinary resets return to the active
+pose.
 
 ## Capturing a Pose
 

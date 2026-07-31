@@ -47,7 +47,9 @@ inside a rollout, and an unfinished episode may continue into the next
 rollout. The value estimate bootstraps GAE at a non-terminal rollout boundary.
 
 `--max-episode-steps` is a separate training time limit. It resets and logs an
-episode but does not force a PPO update.
+episode but does not force a PPO update. Episode outcomes also update the
+[adaptive start sampler](adaptive-start-sampling.md) when curated starts are
+configured.
 
 ## GAE
 

@@ -28,6 +28,12 @@ from PIL import Image
 from torch import nn
 from torchvision import transforms
 
+from dt_utils.adaptive_start_sampling import (
+    AdaptiveStartSampler,
+    START_SUCCESS_EMA_LAMBDA,
+    adaptive_start_sampling_configuration,
+    episode_was_successful,
+)
 from dt_utils.duckietown_rewards import (
     GymDuckietownRewardCalculator,
     MAX_STEPS_DONE_CODE,
@@ -48,7 +54,6 @@ from dt_utils.gym_duckietown_start_config import (
     TrainingPose,
     TrainingStart,
     apply_env_start_pose,
-    choose_training_start,
     load_start_config,
 )
 from dt_utils.rl_models import TanhGaussianPolicy, load_imitation_actor, tanh_normal_log_prob
@@ -75,6 +80,24 @@ from dt_utils.velopose_reward import (
 
 
 DEFAULT_MAP_NAMES = ("loop_empty", "small_loop", "zigzag_dists")
+START_SAMPLING_FIELDS = [
+    "step",
+    "episode",
+    "completed_start_type",
+    "completed_start_name",
+    "completed_start_map",
+    "done_reason",
+    "success",
+    "hard_start_probability_next",
+    "hard_success_ema",
+    "hard_observations",
+    "random_success_ema",
+    "random_observations",
+    "completed_pose_success_ema",
+    "completed_pose_sampling_probability",
+    "pose_success_ema_json",
+    "pose_sampling_probability_json",
+]
 
 
 @dataclass
@@ -99,6 +122,7 @@ class PPOConfig:
     reset_random_action_scale: float
     start_config: str | None
     hard_start_probability: float
+    adaptive_start_sampling: dict[str, Any]
     training_start_poses: tuple[TrainingPose, ...]
     evaluation_start_poses: tuple[TrainingPose, ...]
     eval_interval_rollouts: int
@@ -288,7 +312,10 @@ def parse_args() -> argparse.Namespace:
         "--hard-start-probability",
         type=parse_probability,
         default=0.5,
-        help="Probability of selecting a configured training pose at each episode reset.",
+        help=(
+            "Initial hard-start probability used until both hard and random starts "
+            "have an observed outcome; adaptive sampling then uses its EMA formula."
+        ),
     )
     parser.add_argument("--eval-interval-rollouts", type=int, default=10)
     parser.add_argument(
@@ -1196,6 +1223,47 @@ def write_training_episode(
         })
 
 
+def write_start_sampling_episode(
+    path: Path,
+    step: int,
+    episode: int,
+    reason: str,
+    success: bool,
+    training_start: TrainingStart,
+    map_name: str,
+    sampler: AdaptiveStartSampler,
+) -> None:
+    pose_probabilities = sampler.hard_pose_probabilities()
+    pose_success = {
+        key: statistic.value
+        for key, statistic in sampler.pose_success.items()
+    }
+    with path.open("a", newline="") as file:
+        csv.DictWriter(file, fieldnames=START_SAMPLING_FIELDS).writerow({
+            "step": step,
+            "episode": episode,
+            "completed_start_type": training_start.kind,
+            "completed_start_name": training_start.name,
+            "completed_start_map": map_name,
+            "done_reason": reason,
+            "success": int(success),
+            "hard_start_probability_next": sampler.hard_start_probability(),
+            "hard_success_ema": sampler.hard_success.value,
+            "hard_observations": sampler.hard_success.observations,
+            "random_success_ema": sampler.random_success.value,
+            "random_observations": sampler.random_success.observations,
+            "completed_pose_success_ema": sampler.pose_success_rate(training_start),
+            "completed_pose_sampling_probability": (
+                sampler.pose_sampling_probability(training_start)
+            ),
+            "pose_success_ema_json": json.dumps(pose_success, sort_keys=True),
+            "pose_sampling_probability_json": json.dumps(
+                pose_probabilities,
+                sort_keys=True,
+            ),
+        })
+
+
 def evaluate_policy(
     env,
     policy: TemporalTanhGaussianPolicy,
@@ -1380,6 +1448,7 @@ def save_checkpoint(
     value_optimizer,
     config,
     metadata,
+    start_sampler_state,
     step,
 ):
     action_control = DuckietownActionControl(
@@ -1396,6 +1465,7 @@ def save_checkpoint(
         "value_optimizer_state_dict": value_optimizer.state_dict(),
         "config": asdict(config),
         "metadata": deepcopy(metadata),
+        "adaptive_start_sampler_state": deepcopy(start_sampler_state),
         "env_backend": "gym-duckietown",
         "action_space": {
             "mode": action_control.mode,
@@ -1442,6 +1512,7 @@ def main() -> None:
     explicit_options = explicit_cli_options(sys.argv[1:])
     resumed_configuration_keys: list[str] = []
     previous_checkpoint_metadata = None
+    resume_start_sampler_state = None
     if args.vd2pp_distance_weight < 0.0:
         raise ValueError("--vd2pp-distance-weight must be non-negative")
     if args.resume_checkpoint is not None and args.imitation_checkpoint is not None:
@@ -1459,6 +1530,9 @@ def main() -> None:
         )
         previous_checkpoint_metadata = deepcopy(
             resume_preview.get("metadata")
+        )
+        resume_start_sampler_state = deepcopy(
+            resume_preview.get("adaptive_start_sampler_state")
         )
         del resume_preview
     validate_history_lengths(
@@ -1493,6 +1567,16 @@ def main() -> None:
     set_seed(args.seed)
     reset_rng = np.random.default_rng(args.seed + 1)
     start_rng = np.random.default_rng(args.seed + 2)
+    start_sampler = AdaptiveStartSampler(
+        start_config,
+        start_rng,
+        initial_hard_start_probability=args.hard_start_probability,
+    )
+    sampler_resume_changes = None
+    if resume_start_sampler_state is not None:
+        sampler_resume_changes = start_sampler.load_state_dict(
+            resume_start_sampler_state
+        )
     device = resolve_device(args.device)
     run_name = datetime.now().strftime("%Y%m%d_%H%M%S_ppo_gym_duckietown")
     if args.exp_name is not None:
@@ -1504,6 +1588,9 @@ def main() -> None:
         for k, v in vars(args).items()
         if k != "device"
     }
+    config_values["adaptive_start_sampling"] = (
+        adaptive_start_sampling_configuration()
+    )
     config_values["training_start_poses"] = (
         start_config.training_poses if start_config is not None else ()
     )
@@ -1580,7 +1667,8 @@ def main() -> None:
                 str(start_config.source_path) if start_config is not None else None
             ),
             "format": "map_specific_poses",
-            "hard_start_probability": args.hard_start_probability,
+            "initial_hard_start_probability": args.hard_start_probability,
+            "adaptive_sampling": adaptive_start_sampling_configuration(),
             "training_poses": (
                 [pose.as_json() for pose in start_config.training_poses]
                 if start_config is not None
@@ -1678,6 +1766,9 @@ def main() -> None:
     ]
     with metrics_file.open("w", newline="") as file:
         csv.DictWriter(file, fieldnames=metrics_fields).writeheader()
+    start_sampling_file = run_dir / "start_sampling_history.csv"
+    with start_sampling_file.open("w", newline="") as file:
+        csv.DictWriter(file, fieldnames=START_SAMPLING_FIELDS).writeheader()
     rollout_metrics_file = run_dir / "rollout_history.csv"
     rollout_metrics_fields = [
         "step",
@@ -1904,11 +1995,35 @@ def main() -> None:
         )
         if start_config is not None:
             print(
-                f"Hard starts: poses={len(start_config.training_poses)} "
-                f"probability={args.hard_start_probability:.3f} "
+                f"Adaptive hard starts: poses={len(start_config.training_poses)} "
+                f"initial_probability={args.hard_start_probability:.3f} "
+                f"ema_lambda={START_SUCCESS_EMA_LAMBDA:.3f} "
                 f"config={start_config.source_path}",
                 flush=True,
             )
+            if sampler_resume_changes is not None:
+                print(
+                    "Adaptive sampler restored: "
+                    f"known_poses={len(sampler_resume_changes['restored'])} "
+                    f"new_poses={len(sampler_resume_changes['added'])} "
+                    f"removed_poses={len(sampler_resume_changes['removed'])}",
+                    flush=True,
+                )
+                if sampler_resume_changes["configuration_changes"]:
+                    print(
+                        "Adaptive sampler settings changed for resumed run: "
+                        + ", ".join(
+                            sampler_resume_changes["configuration_changes"]
+                        )
+                        + ". Saved success statistics were retained.",
+                        flush=True,
+                    )
+            elif args.resume_checkpoint is not None:
+                print(
+                    "Adaptive sampler: checkpoint has no sampler state; "
+                    "starting with neutral EMA estimates",
+                    flush=True,
+                )
         evaluation_pose_count = (
             len(start_config.evaluation_poses) if start_config is not None else 0
         )
@@ -1930,11 +2045,7 @@ def main() -> None:
         if start_config is None:
             training_start = TrainingStart(kind="random", seed=args.seed)
         else:
-            training_start = choose_training_start(
-                start_config,
-                args.hard_start_probability,
-                start_rng,
-            )
+            training_start = start_sampler.choose()
         observation, info, current_training_map = reset_training_environment(
             env,
             args,
@@ -2083,6 +2194,18 @@ def main() -> None:
 
                 if done:
                     reason = done_reason(terminated, truncated, time_limit_done, info)
+                    success = episode_was_successful(reason)
+                    start_sampler.update(training_start, success)
+                    write_start_sampling_episode(
+                        start_sampling_file,
+                        global_step,
+                        episode,
+                        reason,
+                        success,
+                        training_start,
+                        current_training_map,
+                        start_sampler,
+                    )
                     write_training_episode(
                         metrics_file,
                         metrics_fields,
@@ -2100,15 +2223,12 @@ def main() -> None:
                         f"done_reason={reason} start_type={training_start.kind} "
                         f"map={current_training_map} "
                         f"start_seed={training_start.seed if training_start.seed is not None else 'continued_rng'} "
-                        f"start_name={training_start.name or '-'}",
+                        f"start_name={training_start.name or '-'} success={int(success)} "
+                        f"next_hard_probability={start_sampler.hard_start_probability():.3f}",
                         flush=True,
                     )
                     phase_started_at = perf_counter()
-                    training_start = choose_training_start(
-                        start_config,
-                        args.hard_start_probability,
-                        start_rng,
-                    )
+                    training_start = start_sampler.choose()
                     observation, info, current_training_map = reset_training_environment(
                         env,
                         args,
@@ -2367,6 +2487,7 @@ def main() -> None:
                 value_optimizer,
                 config,
                 checkpoint_metadata,
+                start_sampler.state_dict(),
                 global_step,
             )
             metrics_recorded_at = perf_counter()
@@ -2521,6 +2642,7 @@ def main() -> None:
                     value_optimizer,
                     config,
                     checkpoint_metadata,
+                    start_sampler.state_dict(),
                     global_step,
                 )
                 print(f"eval_checkpoint step={global_step} checkpoint={eval_checkpoint}", flush=True)
@@ -2536,6 +2658,7 @@ def main() -> None:
                         value_optimizer,
                         config,
                         checkpoint_metadata,
+                        start_sampler.state_dict(),
                         global_step,
                     )
                     print(
@@ -2558,6 +2681,7 @@ def main() -> None:
                         value_optimizer,
                         config,
                         checkpoint_metadata,
+                        start_sampler.state_dict(),
                         global_step,
                     )
                     print(

@@ -281,7 +281,7 @@ python manual_control_gym_duckietown.py \
 | --- | --- | --- |
 | Environment | `--map-name`, `--seed`, `--max-steps`, `--frame-rate`, `--frame-skip`, `--camera-width`, `--camera-height`, `--robot-speed`, `--accept-start-angle-deg` | Configure simulator execution |
 | Rendering/randomization | `--draw-curve`, `--draw-bbox`, `--domain-rand`, `--distortion`, `--dynamics-rand`, `--camera-rand` | Enable diagnostics and domain variation |
-| Starts | `--start-pose-file`, `--start-config`, `--auto-reset` | Fix a pose, collect training/evaluation poses, or reset automatically |
+| Starts | `--start-poses`, `--start-config`, `--auto-reset` | Browse named poses, collect training/evaluation poses, or reset automatically |
 | Keyboard response | `--forward-target`, `--backward-target`, `--turn-target`, `--throttle-rate`, `--steering-rate`, `--auto-center-rate`, `--boost-multiplier` | Tune manual control ramps and limits |
 | Rewards | `--reward-functions`, `--posepot-gamma`, `--vd2pp-distance-weight` | Select displayed reward breakdowns |
 | Output/logging | `--screenshot-path`, `--log-level` | Configure screenshots and logs |

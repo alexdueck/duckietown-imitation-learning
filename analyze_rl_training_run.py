@@ -6,13 +6,14 @@ from __future__ import annotations
 import argparse
 import csv
 import html
+import json
 import math
 import webbrowser
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from statistics import fmean
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from dt_utils.cli_completion import parse_args_with_completion
 
@@ -24,6 +25,10 @@ REQUIRED_FILES = (
     "ppo_diagnostics.csv",
     "reward_components_history.csv",
     "rollout_history.csv",
+)
+
+OPTIONAL_FILES = (
+    "start_sampling_history.csv",
 )
 
 COLORS = ("#147d92", "#d1495b", "#2d6a4f", "#e09f3e", "#6d597a", "#577590")
@@ -251,13 +256,41 @@ def svg_grouped_bars(
     return "".join(parts)
 
 
-def scenario_statistics(rows: Sequence[dict[str, str]], window: int) -> list[dict[str, float]]:
+def scenario_identity(row: dict[str, str]) -> tuple[str, str]:
+    scenario_type = row.get("scenario_type") or "unknown"
+    map_name = row.get("map_name") or "unknown-map"
+    scenario_name = row.get("scenario_name") or ""
+    seed = row.get("scenario_seed") or "unknown-seed"
+    if scenario_type == "eval_pose":
+        if scenario_name:
+            identity = f"{scenario_type}:{map_name}:{scenario_name}"
+            label = scenario_name
+        else:
+            pose_values = tuple(
+                row.get(key, "")
+                for key in ("start_x", "start_y", "start_z", "start_angle")
+            )
+            pose_key = ",".join(pose_values)
+            identity = f"{scenario_type}:{map_name}:{pose_key}"
+            label = f"unnamed pose ({pose_key})"
+        return identity, label
+    if scenario_type == "eval_seed":
+        return f"{scenario_type}:{map_name}:{seed}", f"seed {seed}"
+    stable_name = scenario_name or f"seed {seed}"
+    return f"{scenario_type}:{map_name}:{stable_name}", stable_name
+
+
+def scenario_statistics(
+    rows: Sequence[dict[str, str]], window: int
+) -> list[dict[str, Any]]:
     groups: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in rows:
-        groups[row["scenario_seed"]].append(row)
+        identity, _ = scenario_identity(row)
+        groups[identity].append(row)
     result = []
-    for seed, group in groups.items():
+    for identity, group in groups.items():
         group.sort(key=lambda row: integer(row, "eval_index"))
+        _, label = scenario_identity(group[0])
         size = min(window, len(group))
         first = group[:size]
         last = group[-size:]
@@ -266,7 +299,11 @@ def scenario_statistics(rows: Sequence[dict[str, str]], window: int) -> list[dic
         slope, r_squared = linear_trend(xs, ys)
         result.append(
             {
-                "seed": float(seed),
+                "identity": identity,
+                "label": label,
+                "type": group[0].get("scenario_type") or "unknown",
+                "map": group[0].get("map_name") or "unknown-map",
+                "seed": group[0].get("scenario_seed") or "-",
                 "count": float(len(group)),
                 "mean": average(ys),
                 "first": average(number(row, "scenario_return") for row in first),
@@ -276,12 +313,74 @@ def scenario_statistics(rows: Sequence[dict[str, str]], window: int) -> list[dic
                 "complete": 100.0 * average(1.0 if integer(row, "terminated") == 0 else 0.0 for row in group),
                 "first_complete": 100.0 * average(1.0 if integer(row, "terminated") == 0 else 0.0 for row in first),
                 "last_complete": 100.0 * average(1.0 if integer(row, "terminated") == 0 else 0.0 for row in last),
+                "invalid_pct": 100.0 * average(
+                    1.0 if row.get("done_reason") == "invalid-pose" else 0.0
+                    for row in group
+                ),
+                "first_invalid_pct": 100.0 * average(
+                    1.0 if row.get("done_reason") == "invalid-pose" else 0.0
+                    for row in first
+                ),
+                "last_invalid_pct": 100.0 * average(
+                    1.0 if row.get("done_reason") == "invalid-pose" else 0.0
+                    for row in last
+                ),
                 "mean_steps": average(number(row, "scenario_steps") for row in group),
                 "minimum": min(ys),
                 "maximum": max(ys),
             }
         )
-    return sorted(result, key=lambda item: item["seed"])
+    return sorted(result, key=lambda item: (item["map"], item["label"]))
+
+
+def evaluation_map_statistics(
+    rows: Sequence[dict[str, str]], window: int
+) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[int, list[dict[str, str]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for row in rows:
+        grouped[row.get("map_name") or "unknown-map"][
+            integer(row, "eval_index")
+        ].append(row)
+
+    result = []
+    for map_name, evaluations in grouped.items():
+        summaries = []
+        for eval_index, group in sorted(evaluations.items()):
+            summaries.append({
+                "eval_index": float(eval_index),
+                "return": average(number(row, "scenario_return") for row in group),
+                "complete": 100.0 * average(
+                    1.0 if integer(row, "terminated") == 0 else 0.0
+                    for row in group
+                ),
+                "invalid": 100.0 * average(
+                    1.0 if row.get("done_reason") == "invalid-pose" else 0.0
+                    for row in group
+                ),
+                "steps": average(number(row, "scenario_steps") for row in group),
+            })
+        size = min(window, len(summaries))
+        first = summaries[:size]
+        last = summaries[-size:]
+        result.append({
+            "map": map_name,
+            "evaluations": float(len(summaries)),
+            "first_return": average(item["return"] for item in first),
+            "last_return": average(item["return"] for item in last),
+            "first_complete": average(item["complete"] for item in first),
+            "last_complete": average(item["complete"] for item in last),
+            "first_invalid": average(item["invalid"] for item in first),
+            "last_invalid": average(item["invalid"] for item in last),
+            "first_steps": average(item["steps"] for item in first),
+            "last_steps": average(item["steps"] for item in last),
+            "points": [
+                (item["eval_index"], item["return"])
+                for item in summaries
+            ],
+        })
+    return sorted(result, key=lambda item: item["map"])
 
 
 def start_label(row: dict[str, str]) -> str:
@@ -310,12 +409,52 @@ def start_statistics(rows: Sequence[dict[str, str]]) -> dict[str, dict[str, floa
     return result
 
 
+def training_map_statistics(
+    rows: Sequence[dict[str, str]],
+) -> dict[str, dict[str, float]]:
+    groups: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        groups[row.get("map_name") or "unknown-map"].append(row)
+    total_steps = sum(number(row, "episode_length", 0.0) for row in rows)
+    result = {}
+    for map_name, group in groups.items():
+        steps = sum(number(row, "episode_length", 0.0) for row in group)
+        result[map_name] = {
+            "episodes": float(len(group)),
+            "invalid_pct": 100.0 * average(
+                1.0 if row.get("done_reason") == "invalid-pose" else 0.0
+                for row in group
+            ),
+            "mean_length": average(number(row, "episode_length") for row in group),
+            "step_share_pct": (
+                100.0 * steps / total_steps if total_steps > 0.0 else math.nan
+            ),
+            "reward_per_step": average(
+                number(row, "episode_return_per_step") for row in group
+            ),
+        }
+    return result
+
+
 def start_sort_key(label: str) -> tuple[int, object]:
     if label.startswith("seed "):
         return 0, int(label.split()[1])
     if label.startswith("pose "):
         return 1, label
     return 2, label
+
+
+def json_number_mapping(row: dict[str, str], key: str) -> dict[str, float]:
+    raw = row.get(key, "")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {str(name): float(value) for name, value in parsed.items()}
 
 
 def metric_window_table(
@@ -370,6 +509,7 @@ def build_report(
     diagnostics: list[dict[str, str]],
     reward_components: list[dict[str, str]],
     rollouts: list[dict[str, str]],
+    start_sampling: list[dict[str, str]],
     args: argparse.Namespace,
 ) -> str:
     eval_history.sort(key=lambda row: integer(row, "eval_index"))
@@ -377,6 +517,7 @@ def build_report(
     history.sort(key=lambda row: integer(row, "episode"))
     diagnostics.sort(key=lambda row: integer(row, "rollout"))
     rollouts.sort(key=lambda row: integer(row, "rollout"))
+    start_sampling.sort(key=lambda row: integer(row, "episode"))
 
     eval_size = min(args.eval_window, len(eval_history))
     first_eval = eval_history[:eval_size]
@@ -391,12 +532,17 @@ def build_report(
     best_eval = max(eval_history, key=lambda row: number(row, "eval_mean_scenario_return"))
     latest_eval = eval_history[-1]
     scenario_stats = scenario_statistics(eval_scenarios, args.eval_window)
+    eval_map_stats = evaluation_map_statistics(eval_scenarios, args.eval_window)
 
     overall_starts = start_statistics(history)
     episode_size = min(args.episode_window, len(history))
     first_starts = start_statistics(history[:episode_size])
     last_starts = start_statistics(history[-episode_size:])
     start_labels = sorted(set(overall_starts) | set(first_starts) | set(last_starts), key=start_sort_key)
+    overall_training_maps = training_map_statistics(history)
+    first_training_maps = training_map_statistics(history[:episode_size])
+    last_training_maps = training_map_statistics(history[-episode_size:])
+    training_map_names = sorted(overall_training_maps)
 
     eval_points = [(number(row, "eval_index"), number(row, "eval_mean_scenario_return")) for row in eval_history]
     eval_chart = svg_line_chart(
@@ -405,21 +551,42 @@ def build_report(
             (f"Rolling mean ({args.rolling_window})", rolling_points(eval_points, args.rolling_window), COLORS[0]),
         )
     )
-    scenario_groups: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    scenario_groups: dict[str, dict[str, Any]] = {}
     for row in eval_scenarios:
-        scenario_groups[row["scenario_seed"]].append(
+        identity, label = scenario_identity(row)
+        scenario_group = scenario_groups.setdefault(
+            identity, {"label": label, "map": row.get("map_name") or "unknown-map", "points": []}
+        )
+        scenario_group["points"].append(
             (number(row, "eval_index"), number(row, "scenario_return"))
         )
     scenario_chart = svg_line_chart(
         tuple(
-            (f"Seed {seed}", points, COLORS[index % len(COLORS)])
-            for index, (seed, points) in enumerate(sorted(scenario_groups.items(), key=lambda item: int(item[0])))
+            (f"{group['label']} [{group['map']}]", group["points"], COLORS[index % len(COLORS)])
+            for index, group in enumerate(
+                sorted(scenario_groups.values(), key=lambda item: (item["map"], item["label"]))
+            )
         )
     )
+    eval_map_chart = svg_line_chart(tuple(
+        (item["map"], item["points"], COLORS[index % len(COLORS)])
+        for index, item in enumerate(eval_map_stats)
+    ))
     completion_points = [
         (number(row, "eval_index"), number(row, "eval_safe_scenarios")) for row in eval_history
     ]
     completion_chart = svg_line_chart((("Completed scenarios", completion_points, COLORS[2]),), height=260)
+    eval_scenario_labels = [
+        f"{item['label']} [{item['map']}]"
+        for item in scenario_stats
+    ]
+    eval_invalid_chart = svg_grouped_bars(
+        eval_scenario_labels,
+        [item["first_invalid_pct"] for item in scenario_stats],
+        [item["last_invalid_pct"] for item in scenario_stats],
+        f"First {eval_size} evaluations",
+        f"Last {eval_size} evaluations",
+    )
     invalid_chart = svg_grouped_bars(
         start_labels,
         [first_starts.get(label, {}).get("invalid_pct", math.nan) for label in start_labels],
@@ -454,18 +621,55 @@ def build_report(
     for item in scenario_stats:
         scenario_rows.append(
             [
-                str(int(item["seed"])),
+                item["label"],
+                item["map"],
+                item["type"],
+                item["seed"],
                 fmt(item["first"]),
                 fmt(item["last"]),
                 fmt(item["last"] - item["first"]),
                 fmt(item["first_complete"], 1, "%"),
                 fmt(item["last_complete"], 1, "%"),
+                fmt(item["invalid_pct"], 1, "%"),
+                fmt(item["first_invalid_pct"], 1, "%"),
+                fmt(item["last_invalid_pct"], 1, "%"),
                 fmt(item["slope_per_million"]),
                 fmt(item["r_squared"], 3),
                 fmt(item["minimum"]),
                 fmt(item["maximum"]),
             ]
         )
+
+    eval_map_rows = [
+        [
+            item["map"],
+            str(int(item["evaluations"])),
+            fmt(item["first_return"]),
+            fmt(item["last_return"]),
+            fmt(item["last_return"] - item["first_return"]),
+            fmt(item["first_complete"], 1, "%"),
+            fmt(item["last_complete"], 1, "%"),
+            fmt(item["first_invalid"], 1, "%"),
+            fmt(item["last_invalid"], 1, "%"),
+            fmt(item["first_steps"], 1),
+            fmt(item["last_steps"], 1),
+        ]
+        for item in eval_map_stats
+    ]
+    training_map_rows = []
+    for map_name in training_map_names:
+        overall = overall_training_maps.get(map_name, {})
+        first = first_training_maps.get(map_name, {})
+        last = last_training_maps.get(map_name, {})
+        training_map_rows.append([
+            map_name,
+            str(int(overall.get("episodes", 0))),
+            fmt(overall.get("invalid_pct", math.nan), 1, "%"),
+            f"{fmt(first.get('invalid_pct', math.nan), 1, '%')} -> {fmt(last.get('invalid_pct', math.nan), 1, '%')}",
+            f"{fmt(first.get('mean_length', math.nan), 1)} -> {fmt(last.get('mean_length', math.nan), 1)}",
+            f"{fmt(first.get('step_share_pct', math.nan), 1, '%')} -> {fmt(last.get('step_share_pct', math.nan), 1, '%')}",
+            f"{fmt(first.get('reward_per_step', math.nan), 3)} -> {fmt(last.get('reward_per_step', math.nan), 3)}",
+        ])
 
     start_overall_rows = []
     start_comparison_rows = []
@@ -530,6 +734,81 @@ def build_report(
         for label, value in cards
     )
 
+    if start_sampling:
+        latest_sampling = start_sampling[-1]
+        sampling_window = min(args.episode_window, len(start_sampling))
+        current_hard_probability = number(
+            latest_sampling, "hard_start_probability_next"
+        )
+        pose_probabilities = json_number_mapping(
+            latest_sampling, "pose_sampling_probability_json"
+        )
+        pose_success = json_number_mapping(
+            latest_sampling, "pose_success_ema_json"
+        )
+        pose_rows = [
+            [
+                pose_name,
+                fmt(pose_success.get(pose_name, math.nan), 3),
+                fmt(probability * 100.0, 2, "%"),
+                fmt(current_hard_probability * probability * 100.0, 2, "%"),
+            ]
+            for pose_name, probability in sorted(
+                pose_probabilities.items(), key=lambda item: item[1], reverse=True
+            )
+        ]
+        sampling_chart = svg_line_chart(
+            (
+                (
+                    "P(hard)",
+                    [(number(row, "episode"), number(row, "hard_start_probability_next")) for row in start_sampling],
+                    COLORS[0],
+                ),
+                (
+                    "Hard success EMA",
+                    [(number(row, "episode"), number(row, "hard_success_ema")) for row in start_sampling],
+                    COLORS[1],
+                ),
+                (
+                    "Random success EMA",
+                    [(number(row, "episode"), number(row, "random_success_ema")) for row in start_sampling],
+                    COLORS[2],
+                ),
+            ),
+            height=300,
+        )
+        sampling_metrics = (
+            ("hard_start_probability_next", "P(hard)"),
+            ("hard_success_ema", "Hard success EMA"),
+            ("random_success_ema", "Random success EMA"),
+        )
+        adaptive_section = f"""
+<h2 id="adaptive-start-sampling">Adaptive start sampling</h2>
+<p>The first/last comparison uses {sampling_window} completed episodes. Pose
+probabilities are conditional on selecting a hard start; the final column also
+includes the current hard-start probability.</p>
+{html_table(("Metric", f"First {sampling_window}", f"Last {sampling_window}", "Change"), metric_window_table(start_sampling, sampling_metrics, args.episode_window))}
+<h3>Sampler history</h3>{sampling_chart}
+<h3>Current hard-pose distribution</h3>
+{html_table(("Pose", "Success EMA", "P(pose | hard)", "P(pose next)"), pose_rows)}
+"""
+    else:
+        adaptive_section = """
+<h2 id="adaptive-start-sampling">Adaptive start sampling</h2>
+<p class='muted'>No start_sampling_history.csv is available for this run.</p>
+"""
+
+    provenance_rows = [(name, str(count)) for name, count in (
+        ("eval_history.csv", len(eval_history)),
+        ("eval_scenarios.csv", len(eval_scenarios)),
+        ("history.csv", len(history)),
+        ("ppo_diagnostics.csv", len(diagnostics)),
+        ("reward_components_history.csv", len(reward_components)),
+        ("rollout_history.csv", len(rollouts)),
+    )]
+    if start_sampling:
+        provenance_rows.append(("start_sampling_history.csv", str(len(start_sampling))))
+
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -550,6 +829,12 @@ p {{ max-width:900px; }}
 .card {{ border:1px solid var(--line); border-radius:6px; padding:13px 15px; background:var(--panel); }}
 .card-label {{ color:var(--muted); font-size:12px; text-transform:uppercase; }}
 .card-value {{ margin-top:3px; font-size:20px; font-weight:650; }}
+.toc {{ margin:24px 0 34px; padding:14px 16px; border:1px solid var(--line); border-radius:6px; background:var(--panel); }}
+.toc strong {{ display:block; margin-bottom:7px; }}
+.toc-links {{ display:flex; flex-wrap:wrap; gap:7px 18px; }}
+.toc a {{ color:var(--accent); text-decoration:none; }}
+.toc a:hover {{ text-decoration:underline; }}
+html {{ scroll-behavior:smooth; }}
 .table-wrap {{ overflow-x:auto; border:1px solid var(--line); border-radius:5px; }}
 table {{ border-collapse:collapse; width:100%; min-width:720px; }}
 th,td {{ padding:8px 10px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap; }}
@@ -568,7 +853,19 @@ code {{ background:var(--panel); padding:2px 5px; border-radius:3px; }}
 <p class="muted"><code>{html.escape(str(run_dir))}</code><br>Generated {datetime.now().astimezone().isoformat(timespec='seconds')}</p>
 <div class="cards">{card_html}</div>
 
-<h2>Evaluation</h2>
+<nav class="toc" aria-label="Report contents">
+<strong>Contents</strong>
+<div class="toc-links">
+<a href="#evaluation">Evaluation</a>
+<a href="#training-starts">Training starts</a>
+<a href="#adaptive-start-sampling">Adaptive start sampling</a>
+<a href="#rollouts-and-ppo">Rollouts and PPO</a>
+<a href="#reward-components">Reward components</a>
+<a href="#data-provenance">Data provenance</a>
+</div>
+</nav>
+
+<h2 id="evaluation">Evaluation</h2>
 <p>The first/last comparison uses {eval_size} evaluations. The linear trend is
 <strong>{fmt(eval_slope * 1_000_000)}</strong> mean-scenario-return per million training steps
 with R-squared <strong>{fmt(eval_r_squared, 3)}</strong>. This is descriptive; sequential evaluations are not independent samples.</p>
@@ -578,34 +875,40 @@ with R-squared <strong>{fmt(eval_r_squared, 3)}</strong>. This is descriptive; s
     ("Mean scenario length", fmt(average(number(row, 'eval_mean_scenario_length') for row in first_eval), 1), fmt(average(number(row, 'eval_mean_scenario_length') for row in last_eval), 1), fmt(average(number(row, 'eval_mean_scenario_length') for row in last_eval)-average(number(row, 'eval_mean_scenario_length') for row in first_eval), 1)),
 ))}
 <h3>Aggregate return</h3>{eval_chart}
+<p>Configured <code>eval_pose</code> starts and seeded <code>eval_seed</code>
+starts are reported as separate scenarios. Invalid-pose rates count only the
+explicit <code>invalid-pose</code> termination reason.</p>
 <h3>Per-scenario return</h3>{scenario_chart}
-{html_table(("Seed", f"Return first {eval_size}", f"Return last {eval_size}", "Change", "Complete first", "Complete last", "Slope / 1M", "R-squared", "Minimum", "Maximum"), scenario_rows)}
+{html_table(("Scenario", "Map", "Type", "Seed", f"Return first {eval_size}", f"Return last {eval_size}", "Change", "Complete first", "Complete last", "Invalid overall", "Invalid first", "Invalid last", "Slope / 1M", "R-squared", "Minimum", "Maximum"), scenario_rows)}
+<h3>Invalid pose by evaluation scenario</h3>{eval_invalid_chart}
 <h3>Completed scenarios per evaluation</h3>{completion_chart}
+<h3>Evaluation by map</h3>{eval_map_chart}
+{html_table(("Map", "Evaluations", f"Return first {eval_size}", f"Return last {eval_size}", "Change", "Complete first", "Complete last", "Invalid first", "Invalid last", "Steps first", "Steps last"), eval_map_rows)}
 
-<h2>Training starts</h2>
+<h2 id="training-starts">Training starts</h2>
 <p>The comparison uses the chronologically first and last {episode_size} completed training episodes. Step shares use all steps inside the respective period, exposing the difference between reset probability and actual PPO sample probability.</p>
 {html_table(("Start", "Episodes", "Invalid pose", "Mean length", "Step share", "Reward / step"), start_overall_rows)}
 <h3>First versus last episodes</h3>
 {html_table(("Start", "Episodes first / last", "Invalid pose", "Mean length", "Step share"), start_comparison_rows)}
 {invalid_chart}
+<h3>Training by map</h3>
+{html_table(("Map", "Episodes", "Invalid overall", "Invalid first -> last", "Mean length first -> last", "Step share first -> last", "Reward/step first -> last"), training_map_rows)}
 
-<h2>Rollouts and PPO</h2>
+{adaptive_section}
+
+<h2 id="rollouts-and-ppo">Rollouts and PPO</h2>
 <h3>Rollout reward</h3>{rollout_chart}
 {html_table(("Metric", f"First {min(args.diagnostic_window, len(rollouts))}", f"Last {min(args.diagnostic_window, len(rollouts))}", "Change"), metric_window_table(rollouts, rollout_metrics, args.diagnostic_window))}
 <h3>PPO diagnostics</h3>
 {html_table(("Metric", f"First {min(args.diagnostic_window, len(diagnostics))}", f"Last {min(args.diagnostic_window, len(diagnostics))}", "Change"), metric_window_table(diagnostics, diagnostic_metrics, args.diagnostic_window))}
 <h3>Policy exploration</h3>{std_chart}
 
-<h2>Reward components</h2>
+<h2 id="reward-components">Reward components</h2>
 <p>Means are calculated per rollout step. Missing terminal penalties are treated as zero.</p>
 {html_table(("Component", f"First {min(args.diagnostic_window, len(rollouts))}", f"Last {min(args.diagnostic_window, len(rollouts))}", "Change"), reward_component_means(reward_components, 'train_rollout', args.diagnostic_window))}
 
-<h2>Data provenance</h2>
-{html_table(("File", "Rows"), tuple((name, str(count)) for name, count in (
-    ('eval_history.csv', len(eval_history)), ('eval_scenarios.csv', len(eval_scenarios)),
-    ('history.csv', len(history)), ('ppo_diagnostics.csv', len(diagnostics)),
-    ('reward_components_history.csv', len(reward_components)), ('rollout_history.csv', len(rollouts)),
-)))}
+<h2 id="data-provenance">Data provenance</h2>
+{html_table(("File", "Rows"), provenance_rows)}
 <p class="muted">The report is self-contained: charts are inline SVG and no network connection is required.</p>
 </main></body></html>"""
 
@@ -618,6 +921,10 @@ def main() -> None:
         raise FileNotFoundError(
             f"{run_dir} is missing required files: {', '.join(missing)}"
         )
+    optional_rows = {
+        name: read_csv_rows(run_dir / name) if (run_dir / name).is_file() else []
+        for name in OPTIONAL_FILES
+    }
     output = args.output.expanduser() if args.output is not None else run_dir / "training_report.html"
     if not output.is_absolute():
         output = Path.cwd() / output
@@ -629,6 +936,7 @@ def main() -> None:
         read_csv_rows(run_dir / "ppo_diagnostics.csv"),
         read_csv_rows(run_dir / "reward_components_history.csv"),
         read_csv_rows(run_dir / "rollout_history.csv"),
+        optional_rows["start_sampling_history.csv"],
         args,
     )
     output.parent.mkdir(parents=True, exist_ok=True)

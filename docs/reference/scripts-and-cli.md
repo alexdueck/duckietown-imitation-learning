@@ -374,7 +374,12 @@ Use `D` and `A` to move to the next and previous image.
 
 Reads the CSV logs in one PPO run directory and creates a self-contained HTML
 report with embedded SVG charts. By default it writes
-`training_report.html` into the run directory and opens it.
+`training_report.html` into the run directory and opens it. Evaluation poses
+are identified by scenario type, map, and pose name (or exact pose values when
+unnamed), while seeds remain reproducibility metadata. The report includes
+per-map training and evaluation summaries and, when available, adaptive-start
+probabilities from `start_sampling_history.csv`. Evaluation tables and charts
+compare explicit `invalid-pose` rates per scenario and map.
 
 ```bash
 python analyze_rl_training_run.py \

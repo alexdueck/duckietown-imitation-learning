@@ -211,9 +211,12 @@ python analyze_rl_training_run.py "$RUN_DIR"
 ```
 
 The script writes `training_report.html` into the run directory. It contains
-evaluation trends, per-scenario returns, training-start frequencies and
-failure rates, PPO diagnostics, reward components, and runtime measurements.
-Charts are embedded as SVG, so the report needs neither a server nor an
+evaluation trends, pose-aware per-scenario returns, per-map summaries,
+per-scenario and per-map invalid-pose trends, training-start frequencies and
+failure rates, PPO diagnostics, reward
+components, and runtime measurements. Runs containing
+`start_sampling_history.csv` also show adaptive hard-start and per-pose
+probabilities. Charts are embedded as SVG, so the report needs neither a server nor an
 internet connection. The report opens in the default browser after generation;
 pass `--no-open` when running over SSH or on another headless system. Use
 `--eval-window`, `--episode-window`, and `--diagnostic-window` to change the

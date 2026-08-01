@@ -260,7 +260,7 @@ class ResumeConfigurationTests(unittest.TestCase):
             restore_resume_configuration(
                 args,
                 checkpoint,
-                {"--observation-history-length"},
+                {"observation_history_length"},
             )
 
 
@@ -275,7 +275,7 @@ class ResumeConfigurationTests(unittest.TestCase):
             restore_resume_configuration(
                 args,
                 checkpoint,
-                {"--temporal-head-mode"},
+                {"temporal_head_mode"},
             )
 
     def test_explicit_map_names_override_checkpoint_maps(self) -> None:
@@ -286,7 +286,7 @@ class ResumeConfigurationTests(unittest.TestCase):
         restore_resume_configuration(
             args,
             {"map_names": ("loop_empty",)},
-            {"--map-name"},
+            {"map_names"},
         )
 
         self.assertEqual(args.map_names, ("small_loop", "zigzag_dists"))

@@ -2,6 +2,7 @@ venv/
 checkpoints/
 __pycache__/
 configs/*.json
+!configs/*.template.json
 .python-version
 venv39_gymdt/
 duckiebot_captures/

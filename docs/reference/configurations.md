@@ -24,6 +24,46 @@
 Use CLI output-directory flags to override these locations for a particular
 run.
 
+## Training Configuration
+
+The PPO trainer accepts every training option either on the command line or in
+a JSON configuration. Create the local default from the complete versioned
+template:
+
+```bash
+cp configs/train_config.template.json configs/train_config.json
+```
+
+`train_rl_ppo_gym_duckietown.py` loads `configs/train_config.json`
+automatically when it exists. A different file can be selected with:
+
+```bash
+python train_rl_ppo_gym_duckietown.py \
+  --train-config configs/my_experiment.json
+```
+
+Values are resolved in this order:
+
+```text
+explicit command-line option > selected JSON config > built-in default
+```
+
+For example, `--epochs 2` overrides `"epochs": 4` in the JSON. Repeated
+`--map-name` options replace `map_names` from the JSON rather than extending
+it. Boolean values use JSON booleans; command-line `--no-domain-rand` and
+similar negative flags override `true` from the file.
+
+The JSON uses argparse destination names in `snake_case`. Repeated maps and
+evaluation seeds are represented as JSON lists. `--train-config` itself is the
+only bootstrap option not stored inside the selected file, avoiding configs
+that recursively select other configs. Unknown options and invalid types are
+rejected before the environment is created.
+
+The default file is optional: when it does not exist, built-in defaults are
+used. A path supplied explicitly with `--train-config` must exist. The complete
+template intentionally contains every supported setting, so it doubles as a
+fairly large but honest menu.
+
 ## Start Configuration
 
 Create a local file from the versioned template:
@@ -79,10 +119,14 @@ every completed episode:
    rates.
 2. Hard poses are weighted from their individual EMA failure rates.
 
-Both use `lambda=0.15`. `--hard-start-probability` is only the cold-start
-probability until hard and random starts have each produced an outcome. A
-configured pose receives a fresh reset seed for the simulator's other
-randomized reset state.
+Both use `lambda=0.15` by default. `--hard-start-probability` is only the
+cold-start probability until hard and random starts have each produced an
+outcome. The EMA and adaptive probability bounds are regular training options,
+including `--hard-start-probability-min` and
+`--hard-start-probability-max`. Setting both bounds to `1.0` forces curated
+starts immediately and after sampler statistics are restored from a
+checkpoint. A configured pose receives a fresh reset seed for the simulator's
+other randomized reset state.
 
 See [Adaptive start sampling](../methodology/adaptive-start-sampling.md) for
 the formulas, constants, success definition, logging, and resume behavior.
@@ -131,6 +175,7 @@ It tracks:
 
 ```text
 configs/*.json.template
+configs/*.template.json
 ```
 
 This keeps machine-specific experiment selections local while preserving an
@@ -141,6 +186,10 @@ executable schema example.
 Every PPO run writes `config.json` and stores the same training configuration
 inside each checkpoint. It includes model, environment, action, reward,
 preprocessing, PPO, evaluation, start, seed, and device settings.
+
+The saved values are fully resolved after applying command-line, JSON, default,
+and checkpoint compatibility rules. `configuration_sources` records where each
+effective value came from, while `train_config` records the loaded JSON path.
 
 Use the run-local config when reconstructing an experiment. The command in
 shell history is helpful; the saved config is less likely to remember only

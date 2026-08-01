@@ -8,10 +8,10 @@ import unittest
 import numpy as np
 
 from dt_utils.adaptive_start_sampling import (
+    AdaptiveStartSamplingSettings,
     AdaptiveStartSampler,
     HARD_POSE_DIFFICULTY_STRENGTH,
     HARD_START_PROBABILITY_MIN,
-    START_SUCCESS_EMA_LAMBDA,
     EmaSuccessRate,
     episode_was_successful,
     training_pose_key,
@@ -49,13 +49,28 @@ class AdaptiveStartSamplingTests(unittest.TestCase):
         self.assertFalse(episode_was_successful("terminated"))
 
     def test_ema_uses_configured_lambda(self) -> None:
-        statistic = EmaSuccessRate()
+        statistic = EmaSuccessRate(ema_lambda=0.25)
         statistic.update(True)
         self.assertAlmostEqual(
             statistic.value,
-            0.5 * (1.0 - START_SUCCESS_EMA_LAMBDA) + START_SUCCESS_EMA_LAMBDA,
+            0.5 * (1.0 - 0.25) + 0.25,
         )
         self.assertEqual(statistic.observations, 1)
+
+    def test_equal_probability_bounds_force_only_hard_starts(self) -> None:
+        hard_pose = pose("curve")
+        sampler = AdaptiveStartSampler(
+            config(hard_pose),
+            np.random.default_rng(1),
+            initial_hard_start_probability=0.5,
+            settings=AdaptiveStartSamplingSettings(
+                hard_probability_min=1.0,
+                hard_probability_max=1.0,
+            ),
+        )
+
+        self.assertEqual(sampler.hard_start_probability(), 1.0)
+        self.assertTrue(all(sampler.choose().kind == "hard_pose" for _ in range(20)))
 
     def test_initial_probability_is_used_until_both_types_are_observed(self) -> None:
         sampler = AdaptiveStartSampler(

@@ -37,6 +37,11 @@ written in readable form to `config.json`. Resume restores architecture,
 preprocessing, action semantics, and randomization settings; explicit
 incompatible overrides fail before model construction.
 
+The resolved config also stores the loaded `train_config` path and a
+`configuration_sources` mapping. Consequently, checkpoint values reflect the
+actual command-line-over-JSON-over-default resolution rather than merely a copy
+of the input JSON.
+
 When camera distortion is active, metadata also contains the exact training
 environment `camera_matrix`, `distortion_coefs`, derived
 `new_camera_matrix`, and calibration dimensions. A flat

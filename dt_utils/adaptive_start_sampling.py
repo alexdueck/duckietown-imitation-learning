@@ -40,16 +40,47 @@ SUCCESSFUL_EPISODE_DONE_REASONS = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class AdaptiveStartSamplingSettings:
+    """Resolved per-run settings for adaptive curated-start sampling."""
+
+    ema_lambda: float = START_SUCCESS_EMA_LAMBDA
+    initial_success_rate: float = INITIAL_SUCCESS_RATE
+    hard_probability_min: float = HARD_START_PROBABILITY_MIN
+    hard_probability_max: float = HARD_START_PROBABILITY_MAX
+    pose_difficulty_strength: float = HARD_POSE_DIFFICULTY_STRENGTH
+    relative_difficulty_epsilon: float = RELATIVE_DIFFICULTY_EPSILON
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.ema_lambda <= 1.0:
+            raise ValueError("adaptive start EMA lambda must be in (0, 1]")
+        if not 0.0 <= self.initial_success_rate <= 1.0:
+            raise ValueError("initial start success rate must be in [0, 1]")
+        if not 0.0 <= self.hard_probability_min <= 1.0:
+            raise ValueError("minimum hard-start probability must be in [0, 1]")
+        if not 0.0 <= self.hard_probability_max <= 1.0:
+            raise ValueError("maximum hard-start probability must be in [0, 1]")
+        if self.hard_probability_min > self.hard_probability_max:
+            raise ValueError(
+                "minimum hard-start probability must not exceed the maximum"
+            )
+        if self.pose_difficulty_strength < 0.0:
+            raise ValueError("hard-pose difficulty strength must be non-negative")
+        if self.relative_difficulty_epsilon <= 0.0:
+            raise ValueError("relative-difficulty epsilon must be positive")
+
+
 @dataclass
 class EmaSuccessRate:
     value: float = INITIAL_SUCCESS_RATE
     observations: int = 0
+    ema_lambda: float = START_SUCCESS_EMA_LAMBDA
 
     def update(self, success: bool) -> None:
         outcome = float(bool(success))
         self.value = (
-            (1.0 - START_SUCCESS_EMA_LAMBDA) * self.value
-            + START_SUCCESS_EMA_LAMBDA * outcome
+            (1.0 - self.ema_lambda) * self.value
+            + self.ema_lambda * outcome
         )
         self.observations += 1
 
@@ -70,15 +101,19 @@ class EmaSuccessRate:
         self.observations = observations
 
 
-def adaptive_start_sampling_configuration() -> dict[str, Any]:
+def adaptive_start_sampling_configuration(
+    settings: AdaptiveStartSamplingSettings | None = None,
+) -> dict[str, Any]:
+    settings = settings or AdaptiveStartSamplingSettings()
     return {
         "enabled_with_start_config": True,
         "successful_done_reasons": sorted(SUCCESSFUL_EPISODE_DONE_REASONS),
-        "ema_lambda": START_SUCCESS_EMA_LAMBDA,
-        "initial_success_rate": INITIAL_SUCCESS_RATE,
-        "hard_start_probability_min": HARD_START_PROBABILITY_MIN,
-        "hard_start_probability_max": HARD_START_PROBABILITY_MAX,
-        "hard_pose_difficulty_strength": HARD_POSE_DIFFICULTY_STRENGTH,
+        "ema_lambda": settings.ema_lambda,
+        "initial_success_rate": settings.initial_success_rate,
+        "hard_start_probability_min": settings.hard_probability_min,
+        "hard_start_probability_max": settings.hard_probability_max,
+        "hard_pose_difficulty_strength": settings.pose_difficulty_strength,
+        "relative_difficulty_epsilon": settings.relative_difficulty_epsilon,
         "hard_probability_formula": (
             "p_min + (p_max - p_min) * max(0, "
             "(hard_failure - random_failure) / "
@@ -108,14 +143,20 @@ class AdaptiveStartSampler:
         config: StartConfig | None,
         rng: np.random.Generator,
         initial_hard_start_probability: float,
+        settings: AdaptiveStartSamplingSettings | None = None,
     ) -> None:
         if not 0.0 <= initial_hard_start_probability <= 1.0:
             raise ValueError("initial hard-start probability must be in [0, 1]")
         self.config = config
         self.rng = rng
+        self.settings = settings or AdaptiveStartSamplingSettings()
         self.initial_hard_start_probability = float(initial_hard_start_probability)
-        self.hard_success = EmaSuccessRate()
-        self.random_success = EmaSuccessRate()
+        statistic_defaults = {
+            "value": self.settings.initial_success_rate,
+            "ema_lambda": self.settings.ema_lambda,
+        }
+        self.hard_success = EmaSuccessRate(**statistic_defaults)
+        self.random_success = EmaSuccessRate(**statistic_defaults)
         self.poses = tuple(config.training_poses) if config is not None else ()
         self.pose_keys = tuple(training_pose_key(pose) for pose in self.poses)
         if len(set(self.pose_keys)) != len(self.pose_keys):
@@ -123,7 +164,7 @@ class AdaptiveStartSampler:
                 "training pose identities must be unique; assign unique names within each map"
             )
         self.pose_success = {
-            pose_key: EmaSuccessRate()
+            pose_key: EmaSuccessRate(**statistic_defaults)
             for pose_key in self.pose_keys
         }
 
@@ -134,6 +175,8 @@ class AdaptiveStartSampler:
     def hard_start_probability(self) -> float:
         if not self.enabled:
             return 0.0
+        if self.settings.hard_probability_min == self.settings.hard_probability_max:
+            return self.settings.hard_probability_min
         if self.hard_success.observations == 0 or self.random_success.observations == 0:
             return self.initial_hard_start_probability
 
@@ -142,22 +185,29 @@ class AdaptiveStartSampler:
         relative_excess_failure = max(
             0.0,
             (hard_failure - random_failure)
-            / (hard_failure + random_failure + RELATIVE_DIFFICULTY_EPSILON),
+            / (
+                hard_failure
+                + random_failure
+                + self.settings.relative_difficulty_epsilon
+            ),
         )
-        probability = HARD_START_PROBABILITY_MIN + (
-            HARD_START_PROBABILITY_MAX - HARD_START_PROBABILITY_MIN
+        probability = self.settings.hard_probability_min + (
+            self.settings.hard_probability_max
+            - self.settings.hard_probability_min
         ) * relative_excess_failure
         return float(np.clip(
             probability,
-            HARD_START_PROBABILITY_MIN,
-            HARD_START_PROBABILITY_MAX,
+            self.settings.hard_probability_min,
+            self.settings.hard_probability_max,
         ))
 
     def hard_pose_probabilities(self) -> dict[str, float]:
         if not self.enabled:
             return {}
         weights = np.asarray([
-            1.0 + HARD_POSE_DIFFICULTY_STRENGTH * (1.0 - self.pose_success[key].value)
+            1.0
+            + self.settings.pose_difficulty_strength
+            * (1.0 - self.pose_success[key].value)
             for key in self.pose_keys
         ], dtype=np.float64)
         probabilities = weights / weights.sum()
@@ -211,7 +261,7 @@ class AdaptiveStartSampler:
     def state_dict(self) -> dict[str, Any]:
         return {
             "schema_version": SAMPLER_STATE_SCHEMA_VERSION,
-            "configuration": adaptive_start_sampling_configuration(),
+            "configuration": adaptive_start_sampling_configuration(self.settings),
             "initial_hard_start_probability": self.initial_hard_start_probability,
             "hard_success": self.hard_success.as_dict(),
             "random_success": self.random_success.as_dict(),
@@ -230,7 +280,7 @@ class AdaptiveStartSampler:
                 f"expected {SAMPLER_STATE_SCHEMA_VERSION}"
             )
         saved_configuration = state.get("configuration", {})
-        current_configuration = adaptive_start_sampling_configuration()
+        current_configuration = adaptive_start_sampling_configuration(self.settings)
         configuration_changes = sorted(
             key
             for key in set(saved_configuration) | set(current_configuration)

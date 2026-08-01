@@ -29,7 +29,13 @@ from torch import nn
 from torchvision import transforms
 
 from dt_utils.adaptive_start_sampling import (
+    AdaptiveStartSamplingSettings,
     AdaptiveStartSampler,
+    HARD_POSE_DIFFICULTY_STRENGTH,
+    HARD_START_PROBABILITY_MAX,
+    HARD_START_PROBABILITY_MIN,
+    INITIAL_SUCCESS_RATE,
+    RELATIVE_DIFFICULTY_EPSILON,
     START_SUCCESS_EMA_LAMBDA,
     adaptive_start_sampling_configuration,
     episode_was_successful,
@@ -67,6 +73,11 @@ from dt_utils.temporal_rl import (
     history_model_description,
     validate_history_lengths,
 )
+from dt_utils.train_config import (
+    apply_json_defaults,
+    explicit_cli_destinations,
+    load_json_object,
+)
 from train_imitation_learning import IMAGENET_MEAN, IMAGENET_STD, build_model, resolve_device, set_seed
 from dt_utils.velopose_reward import (
     POSEPOT_SHAPING_WEIGHT,
@@ -80,6 +91,7 @@ from dt_utils.velopose_reward import (
 
 
 DEFAULT_MAP_NAMES = ("loop_empty", "small_loop", "zigzag_dists")
+DEFAULT_TRAIN_CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "train_config.json"
 START_SAMPLING_FIELDS = [
     "step",
     "episode",
@@ -103,6 +115,8 @@ START_SAMPLING_FIELDS = [
 @dataclass
 class PPOConfig:
     output_dir: str
+    train_config: str | None
+    configuration_sources: dict[str, str]
     exp_name: str | None
     map_name: str
     map_names: tuple[str, ...]
@@ -122,6 +136,12 @@ class PPOConfig:
     reset_random_action_scale: float
     start_config: str | None
     hard_start_probability: float
+    start_success_ema_lambda: float
+    initial_start_success_rate: float
+    hard_start_probability_min: float
+    hard_start_probability_max: float
+    hard_pose_difficulty_strength: float
+    relative_difficulty_epsilon: float
     adaptive_start_sampling: dict[str, Any]
     training_start_poses: tuple[TrainingPose, ...]
     evaluation_start_poses: tuple[TrainingPose, ...]
@@ -215,8 +235,18 @@ def normalize_map_names(map_names: list[str] | tuple[str, ...]) -> tuple[str, ..
     return normalized
 
 
-def parse_args() -> argparse.Namespace:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train PPO in gym-duckietown.")
+    parser.add_argument(
+        "--train-config",
+        type=Path,
+        default=None,
+        help=(
+            "JSON file providing training defaults. If omitted, "
+            f"{DEFAULT_TRAIN_CONFIG_PATH} is loaded when it exists. Explicit "
+            "command-line options override JSON values."
+        ),
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -317,6 +347,42 @@ def parse_args() -> argparse.Namespace:
             "have an observed outcome; adaptive sampling then uses its EMA formula."
         ),
     )
+    parser.add_argument(
+        "--start-success-ema-lambda",
+        type=float,
+        default=START_SUCCESS_EMA_LAMBDA,
+        help="EMA update coefficient for hard/random and per-pose success rates.",
+    )
+    parser.add_argument(
+        "--initial-start-success-rate",
+        type=parse_probability,
+        default=INITIAL_SUCCESS_RATE,
+        help="Neutral success estimate before a start type or pose has outcomes.",
+    )
+    parser.add_argument(
+        "--hard-start-probability-min",
+        type=parse_probability,
+        default=HARD_START_PROBABILITY_MIN,
+        help="Minimum adaptive probability of selecting a curated training pose.",
+    )
+    parser.add_argument(
+        "--hard-start-probability-max",
+        type=parse_probability,
+        default=HARD_START_PROBABILITY_MAX,
+        help="Maximum adaptive probability of selecting a curated training pose.",
+    )
+    parser.add_argument(
+        "--hard-pose-difficulty-strength",
+        type=float,
+        default=HARD_POSE_DIFFICULTY_STRENGTH,
+        help="Extra raw sampling weight assigned to an entirely unsuccessful pose.",
+    )
+    parser.add_argument(
+        "--relative-difficulty-epsilon",
+        type=float,
+        default=RELATIVE_DIFFICULTY_EPSILON,
+        help="Positive denominator epsilon in adaptive hard-start sampling.",
+    )
     parser.add_argument("--eval-interval-rollouts", type=int, default=10)
     parser.add_argument(
         "--eval-steps",
@@ -330,7 +396,18 @@ def parse_args() -> argparse.Namespace:
         default=(10042, 10043, 10044, 10045),
         help="Comma-separated reset seeds defining the fixed evaluation scenarios.",
     )
-    parser.add_argument("--eval-stochastic", action="store_false", dest="eval_deterministic")
+    parser.add_argument(
+        "--eval-deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use deterministic policy means during evaluation.",
+    )
+    parser.add_argument(
+        "--eval-stochastic",
+        action="store_false",
+        dest="eval_deterministic",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--initial-log-std", type=float, default=None)
     parser.add_argument("--min-log-std", type=float, default=-5.0)
     parser.add_argument("--max-log-std", type=float, default=-1.0)
@@ -419,7 +496,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-height", type=int, default=480)
     parser.add_argument(
         "--render-training",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Open gym-duckietown's human-view window and update it after every training step.",
     )
     parser.add_argument(
@@ -428,23 +506,83 @@ def parse_args() -> argparse.Namespace:
         default="INFO",
         help="Logging level for gym-duckietown and its Duckietown dependencies.",
     )
-    parser.add_argument("--debug-initial-action", action="store_true")
+    parser.add_argument(
+        "--debug-initial-action",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    argv = sys.argv[1:]
+    parser = build_arg_parser()
+    built_in_defaults = {
+        action.dest: action.default
+        for action in parser._actions
+        if action.dest not in (argparse.SUPPRESS, "help", "train_config")
+    }
+
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--train-config", type=Path, default=DEFAULT_TRAIN_CONFIG_PATH)
+    bootstrap_args, _ = bootstrap.parse_known_args(argv)
+    train_config_was_explicit = any(
+        argument == "--train-config" or argument.startswith("--train-config=")
+        for argument in argv
+    )
+    selected_config_path = bootstrap_args.train_config.expanduser().resolve()
+    configured_destinations: set[str] = set()
+    if selected_config_path.exists():
+        try:
+            configured_destinations = apply_json_defaults(
+                parser,
+                load_json_object(selected_config_path),
+                aliases={"map_name": "map_names"},
+            )
+        except ValueError as error:
+            parser.error(str(error))
+        parser.set_defaults(train_config=selected_config_path)
+    elif train_config_was_explicit:
+        parser.error(f"Training config does not exist: {selected_config_path}")
+
+    explicit_destinations = explicit_cli_destinations(parser, argv)
+    if "map_names" in explicit_destinations:
+        # argparse append actions otherwise append CLI maps to the JSON default.
+        parser.set_defaults(map_names=None)
     args = parse_args_with_completion(parser)
+    if selected_config_path.exists():
+        args.train_config = selected_config_path
     args.map_names = normalize_map_names(args.map_names or DEFAULT_MAP_NAMES)
     args.map_name = args.map_names[0]
+    parameter_destinations = set(built_in_defaults) | configured_destinations
+    args.configuration_sources = {
+        destination: (
+            "command_line"
+            if destination in explicit_destinations
+            else "train_config"
+            if destination in configured_destinations
+            else "default"
+        )
+        for destination in sorted(parameter_destinations)
+    }
+    args.configuration_sources["map_name"] = "derived_from_map_names"
+    args.configuration_sources["train_config"] = (
+        "command_line"
+        if train_config_was_explicit
+        else "default_path"
+        if args.train_config is not None
+        else "not_loaded"
+    )
+    args.configured_destinations = configured_destinations | explicit_destinations
     return args
-
-
-def explicit_cli_options(argv: list[str]) -> set[str]:
-    return {argument.split("=", 1)[0] for argument in argv if argument.startswith("--")}
 
 
 def restore_resume_configuration(
     args: argparse.Namespace,
     checkpoint_config: dict[str, Any],
-    explicit_options: set[str],
+    configured_destinations: set[str],
 ) -> list[str]:
     legacy_history_length = int(checkpoint_config.get("observation_history_length", 1))
     restored_map_configuration = False
@@ -473,22 +611,16 @@ def restore_resume_configuration(
             args.source_observation_channel_order,
         ),
     }
-    option_names = {
-        key: "--" + key.replace("_", "-")
-        for key in restored
-    }
     for key, checkpoint_value in restored.items():
         current_value = getattr(args, key)
-        option = option_names[key]
-        negative_option = "--no-" + option.removeprefix("--")
-        option_was_explicit = option in explicit_options or negative_option in explicit_options
-        if option_was_explicit and current_value != checkpoint_value:
+        option = "--" + key.replace("_", "-")
+        if key in configured_destinations and current_value != checkpoint_value:
             raise ValueError(
                 f"{option}={current_value!r} is incompatible with the resumed checkpoint "
                 f"value {checkpoint_value!r}. Remove the option or use a compatible checkpoint."
             )
         setattr(args, key, checkpoint_value)
-    if "--map-name" not in explicit_options:
+    if "map_names" not in configured_destinations:
         checkpoint_map_names = checkpoint_config.get("map_names")
         if checkpoint_map_names is None:
             checkpoint_map_names = (
@@ -1509,7 +1641,8 @@ def load_reference_imitation_model(checkpoint_path: Path, device: torch.device):
 
 def main() -> None:
     args = parse_args()
-    explicit_options = explicit_cli_options(sys.argv[1:])
+    configured_destinations = args.configured_destinations
+    del args.configured_destinations
     resumed_configuration_keys: list[str] = []
     previous_checkpoint_metadata = None
     resume_start_sampler_state = None
@@ -1526,8 +1659,11 @@ def main() -> None:
         resumed_configuration_keys = restore_resume_configuration(
             args,
             resume_config,
-            explicit_options,
+            configured_destinations,
         )
+        for key in resumed_configuration_keys:
+            if key not in configured_destinations:
+                args.configuration_sources[key] = "checkpoint"
         previous_checkpoint_metadata = deepcopy(
             resume_preview.get("metadata")
         )
@@ -1543,6 +1679,14 @@ def main() -> None:
         raise ValueError("--temporal-hidden-dim must be positive")
     if args.camera_rand and not args.distortion:
         raise ValueError("--camera-rand requires --distortion in gym-duckietown 6.2.0")
+    adaptive_settings = AdaptiveStartSamplingSettings(
+        ema_lambda=args.start_success_ema_lambda,
+        initial_success_rate=args.initial_start_success_rate,
+        hard_probability_min=args.hard_start_probability_min,
+        hard_probability_max=args.hard_start_probability_max,
+        pose_difficulty_strength=args.hard_pose_difficulty_strength,
+        relative_difficulty_epsilon=args.relative_difficulty_epsilon,
+    )
     action_control = DuckietownActionControl(
         mode=args.action_mode,
         fixed_throttle=args.fixed_throttle,
@@ -1559,6 +1703,7 @@ def main() -> None:
         start_config = load_start_config(args.start_config, args.map_names)
         args.start_config = start_config.source_path
         args.eval_seeds = ()
+        args.configuration_sources["eval_seeds"] = "replaced_by_start_config"
     configure_gym_duckietown_logging(args.log_level)
     ensure_gym_duckietown_available()
     configure_gym_duckietown_logging(args.log_level)
@@ -1571,6 +1716,7 @@ def main() -> None:
         start_config,
         start_rng,
         initial_hard_start_probability=args.hard_start_probability,
+        settings=adaptive_settings,
     )
     sampler_resume_changes = None
     if resume_start_sampler_state is not None:
@@ -1584,12 +1730,12 @@ def main() -> None:
     run_dir = args.output_dir.expanduser() / run_name
     run_dir.mkdir(parents=True, exist_ok=False)
     config_values = {
-        k: str(v) if isinstance(v, Path) else v
+        k: str(v.expanduser()) if isinstance(v, Path) else v
         for k, v in vars(args).items()
         if k != "device"
     }
     config_values["adaptive_start_sampling"] = (
-        adaptive_start_sampling_configuration()
+        adaptive_start_sampling_configuration(adaptive_settings)
     )
     config_values["training_start_poses"] = (
         start_config.training_poses if start_config is not None else ()
@@ -1668,7 +1814,9 @@ def main() -> None:
             ),
             "format": "map_specific_poses",
             "initial_hard_start_probability": args.hard_start_probability,
-            "adaptive_sampling": adaptive_start_sampling_configuration(),
+            "adaptive_sampling": adaptive_start_sampling_configuration(
+                adaptive_settings
+            ),
             "training_poses": (
                 [pose.as_json() for pose in start_config.training_poses]
                 if start_config is not None
@@ -1929,6 +2077,11 @@ def main() -> None:
             )
         run_mode = "resumed checkpoint" if args.resume_checkpoint is not None else "new training run"
         print(f"Training mode: {run_mode}", flush=True)
+        print(
+            "Training config: "
+            + (str(args.train_config) if args.train_config is not None else "built-in defaults"),
+            flush=True,
+        )
         if resumed_configuration_keys:
             print(
                 "Checkpoint configuration restored: "
@@ -1997,7 +2150,9 @@ def main() -> None:
             print(
                 f"Adaptive hard starts: poses={len(start_config.training_poses)} "
                 f"initial_probability={args.hard_start_probability:.3f} "
-                f"ema_lambda={START_SUCCESS_EMA_LAMBDA:.3f} "
+                f"adaptive_range=[{adaptive_settings.hard_probability_min:.3f}, "
+                f"{adaptive_settings.hard_probability_max:.3f}] "
+                f"ema_lambda={adaptive_settings.ema_lambda:.3f} "
                 f"config={start_config.source_path}",
                 flush=True,
             )

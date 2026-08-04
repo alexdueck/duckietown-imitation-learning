@@ -57,6 +57,7 @@ from dt_utils.temporal_rl import FixedHistory, TemporalTanhGaussianPolicy
 from train_imitation_learning import resolve_device
 from train_rl_ppo_gym_duckietown import (
     initialize_history,
+    load_environment_map,
     make_transform,
     preprocess,
     reset_raw,
@@ -65,6 +66,7 @@ from train_rl_ppo_gym_duckietown import (
 
 SIDEBAR_WIDTH = 480
 MIN_VIEWER_HEIGHT = 900
+CONTROL_HELP_HEIGHT = 110
 
 
 @dataclass
@@ -113,13 +115,16 @@ def parse_args() -> argparse.Namespace:
         "--start-config",
         type=Path,
         default=None,
-        help="Start config containing the evaluation_poses available to this viewer.",
+        help=(
+            "Start config whose evaluation_poses are cycled after resets and "
+            "with N/Shift+N."
+        ),
     )
     parser.add_argument(
         "--eval-pose-index",
         type=int,
         default=0,
-        help="Zero-based evaluation_poses index selected from --start-config.",
+        help="Zero-based initial evaluation_poses index from --start-config.",
     )
     parser.add_argument(
         "--max-steps",
@@ -326,9 +331,9 @@ def apply_checkpoint_defaults(args: argparse.Namespace, config: dict[str, Any]) 
     args.draw_bbox = False
 
 
-def load_evaluation_pose(args: argparse.Namespace) -> TrainingPose | None:
+def load_evaluation_poses(args: argparse.Namespace) -> tuple[TrainingPose, ...]:
     if args.start_config is None:
-        return None
+        return ()
     if args.eval_pose_index < 0:
         raise ValueError("--eval-pose-index must be non-negative")
 
@@ -347,7 +352,23 @@ def load_evaluation_pose(args: argparse.Namespace) -> TrainingPose | None:
             f"{len(start_config.evaluation_poses)} evaluation pose(s)"
         )
     args.start_config = start_config.source_path
-    return start_config.evaluation_poses[args.eval_pose_index]
+    return start_config.evaluation_poses
+
+
+def cycle_pose_index(index: int, count: int, delta: int) -> int:
+    if count <= 0:
+        raise ValueError("pose count must be positive")
+    return (int(index) + int(delta)) % int(count)
+
+
+def draw_distinct_reset_seed(
+    rng: np.random.Generator,
+    previous_seed: int | None,
+) -> int:
+    seed = int(rng.integers(0, np.iinfo(np.int32).max))
+    while seed == previous_seed:
+        seed = int(rng.integers(0, np.iinfo(np.int32).max))
+    return seed
 
 
 @torch.no_grad()
@@ -398,7 +419,8 @@ def draw_sidebar(
     ]
     if args.start_config is not None:
         lines.append((
-            f"eval pose {args.eval_pose_index}: {args.eval_pose_name or 'unnamed'}",
+            f"eval pose {args.eval_pose_index + 1}/{args.eval_pose_count}: "
+            f"{args.eval_pose_name or 'unnamed'}",
             12,
             MUTED,
             False,
@@ -471,6 +493,29 @@ def draw_sidebar(
         cursor_y -= max(16, font_size + 8)
 
 
+def draw_control_help(
+    camera_bottom: int,
+    image_width: int,
+    has_evaluation_poses: bool,
+) -> None:
+    panel_y = camera_bottom - CONTROL_HELP_HEIGHT
+    draw_rect(0, panel_y, image_width, CONTROL_HELP_HEIGHT, SIDEBAR_BG)
+    navigation_help = (
+        "N: next pose    Shift+N: previous pose"
+        if has_evaluation_poses
+        else "N or Shift+N: reset to a new random start"
+    )
+    lines = (
+        "Space: pause / resume    Backspace: reset and advance",
+        navigation_help,
+        "Enter: screenshot    Esc: exit",
+    )
+    cursor_y = camera_bottom - 26
+    for text in lines:
+        draw_label(text, 14, cursor_y, font_size=11, color=MUTED)
+        cursor_y -= 26
+
+
 def default_returns_path() -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return RL_GYM_DUCKIETOWN_EVALUATION_DIR / f"{timestamp}_returns.csv"
@@ -512,10 +557,18 @@ def main() -> None:
         device,
     )
     apply_checkpoint_defaults(args, checkpoint_config)
-    evaluation_pose = load_evaluation_pose(args)
-    args.eval_pose_name = evaluation_pose.name if evaluation_pose is not None else None
-    if evaluation_pose is not None and evaluation_pose.map_name is not None:
-        args.map_name = evaluation_pose.map_name
+    evaluation_poses = load_evaluation_poses(args)
+    selected_pose_index: int | None = args.eval_pose_index if evaluation_poses else None
+    args.eval_pose_count = len(evaluation_poses)
+    args.eval_pose_name = (
+        evaluation_poses[selected_pose_index].name
+        if selected_pose_index is not None
+        else None
+    )
+    if selected_pose_index is not None:
+        initial_pose_map = evaluation_poses[selected_pose_index].map_name
+        if initial_pose_map is not None:
+            args.map_name = initial_pose_map
 
     if args.max_steps <= 0:
         raise ValueError("--max-steps must be positive")
@@ -530,16 +583,77 @@ def main() -> None:
     env = make_env(args)
     configure_logging(args.log_level)
     _, _, image_width, image_height = import_simulator()
-    viewer_height = max(image_height, MIN_VIEWER_HEIGHT)
+    viewer_height = max(
+        image_height + 2 * CONTROL_HELP_HEIGHT,
+        MIN_VIEWER_HEIGHT,
+    )
     image_y = (viewer_height - image_height) // 2
     reward_calculator = GymDuckietownRewardCalculator(
         args.reward_function,
         gamma=float(checkpoint_config.get("gamma", 0.99)),
         vd2pp_distance_weight=args.vd2pp_distance_weight,
     )
-    if evaluation_pose is not None:
-        apply_env_start_pose(env, evaluation_pose)
-    observation, _ = reset_raw(env, seed=args.seed)
+    random_reset_rng = np.random.default_rng(args.seed)
+    last_random_reset_seed: int | None = None
+
+    def selected_evaluation_pose() -> TrainingPose | None:
+        if selected_pose_index is None:
+            return None
+        return evaluation_poses[selected_pose_index]
+
+    def next_random_reset_seed(initial: bool = False) -> int:
+        nonlocal last_random_reset_seed
+        if initial:
+            reset_seed = int(args.seed)
+        else:
+            reset_seed = draw_distinct_reset_seed(
+                random_reset_rng,
+                last_random_reset_seed,
+            )
+        last_random_reset_seed = reset_seed
+        return reset_seed
+
+    def reset_policy_environment(
+        *,
+        pose_delta: int = 0,
+        initial: bool = False,
+    ) -> np.ndarray:
+        nonlocal selected_pose_index
+        pose = selected_evaluation_pose()
+        if pose is not None:
+            selected_pose_index = cycle_pose_index(
+                selected_pose_index,
+                len(evaluation_poses),
+                pose_delta,
+            )
+            pose = selected_evaluation_pose()
+            args.eval_pose_index = selected_pose_index
+            args.eval_pose_name = pose.name
+            if pose.map_name is not None:
+                raw_env = getattr(env, "unwrapped", env)
+                if getattr(raw_env, "map_name", None) != pose.map_name:
+                    load_environment_map(env, pose.map_name)
+                args.map_name = pose.map_name
+            apply_env_start_pose(env, pose)
+            reset_seed = int(args.seed)
+        else:
+            reset_seed = next_random_reset_seed(initial=initial)
+
+        observation, _ = reset_raw(env, seed=reset_seed)
+        if pose is not None:
+            print(
+                f"evaluation_pose={selected_pose_index + 1}/{len(evaluation_poses)} "
+                f"name={pose.name or '-'} map={args.map_name} seed={reset_seed}",
+                flush=True,
+            )
+        else:
+            print(
+                f"random_start map={args.map_name} seed={reset_seed}",
+                flush=True,
+            )
+        return observation
+
+    observation = reset_policy_environment(initial=True)
     reward_calculator.reset(env)
     history = initialize_history(
         observation,
@@ -606,13 +720,17 @@ def main() -> None:
         f"{args.action_history_length} actions",
         flush=True,
     )
-    if evaluation_pose is not None:
+    active_pose = selected_evaluation_pose()
+    if active_pose is not None:
         print(
-            f"Evaluation pose:  index={args.eval_pose_index} "
-            f"name={evaluation_pose.name or '-'} tile={evaluation_pose.tile} "
-            f"position={evaluation_pose.position} angle={evaluation_pose.angle:.10f}",
+            f"Evaluation poses: {len(evaluation_poses)}; initial index="
+            f"{args.eval_pose_index + 1} name={active_pose.name or '-'} "
+            f"tile={active_pose.tile} position={active_pose.position} "
+            f"angle={active_pose.angle:.10f}",
             flush=True,
         )
+    else:
+        print("Evaluation starts: random pose on every reset", flush=True)
     print(
         "Preprocess:       "
         f"channel_order={args.source_observation_channel_order}, "
@@ -620,7 +738,16 @@ def main() -> None:
         flush=True,
     )
     print(f"Returns CSV:      {recorder.path}", flush=True)
-    print("space pauses, backspace resets, enter saves screenshot, escape exits", flush=True)
+    navigation_help = (
+        "N/Shift+N selects next/previous pose"
+        if evaluation_poses
+        else "N/Shift+N selects a new random start"
+    )
+    print(
+        f"space pauses; backspace resets and advances; {navigation_help}; "
+        "enter saves screenshot; escape exits",
+        flush=True,
+    )
 
     def record_current_episode(status: str, reason: str) -> None:
         nonlocal current_episode_recorded
@@ -643,12 +770,10 @@ def main() -> None:
             flush=True,
         )
 
-    def start_next_episode() -> None:
+    def start_next_episode(pose_delta: int = 1) -> None:
         nonlocal observation, episode, episode_length, selected_return, env_return
         nonlocal current_episode_recorded, state
-        if evaluation_pose is not None:
-            apply_env_start_pose(env, evaluation_pose)
-        observation, _ = reset_raw(env, seed=args.seed)
+        observation = reset_policy_environment(pose_delta=pose_delta)
         reward_calculator.reset(env)
         history.reset(
             preprocess(
@@ -681,6 +806,11 @@ def main() -> None:
             record_current_episode("manual_reset", "manual-reset")
             start_next_episode()
             print("reset", flush=True)
+        elif symbol == key.N:
+            direction = -1 if modifiers & key.MOD_SHIFT else 1
+            reason = "previous-pose" if direction < 0 else "next-pose"
+            record_current_episode("manual_reset", reason)
+            start_next_episode(pose_delta=direction)
         elif symbol == key.RETURN:
             save_screenshot(window, args.screenshot_path)
         elif symbol == key.ESCAPE:
@@ -695,6 +825,7 @@ def main() -> None:
         window.clear()
         draw_rect(0, 0, image_width + SIDEBAR_WIDTH, viewer_height, BACKGROUND)
         draw_rgb(rgb, 0, image_y, image_width, image_height)
+        draw_control_help(image_y, image_width, bool(evaluation_poses))
         draw_sidebar(state, args, checkpoint_step, image_width, viewer_height)
 
     def update(dt):

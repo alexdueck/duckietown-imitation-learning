@@ -1,10 +1,8 @@
 venv/
 checkpoints/
 __pycache__/
-configs/*.json
-!configs/*.template.json
+configs/
 .python-version
 venv39_gymdt/
 duckiebot_captures/
 .DS_Store
-configs/train_run_commands.sh

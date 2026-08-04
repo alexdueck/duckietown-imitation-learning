@@ -73,7 +73,7 @@ lane.
 velopose = velocity + pose_quality
 ```
 
-An `invalid-pose` termination adds `-20` to the transition reward.
+An `invalid-pose` termination adds `-1000` to the transition reward.
 
 This direct state reward makes a good pose valuable at every step, including
 while stationary. In practice it has nevertheless produced the strongest

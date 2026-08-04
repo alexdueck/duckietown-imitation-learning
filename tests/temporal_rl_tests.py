@@ -263,6 +263,24 @@ class ResumeConfigurationTests(unittest.TestCase):
                 {"observation_history_length"},
             )
 
+    def test_explicit_environment_randomization_override_is_allowed(self) -> None:
+        args = self.args()
+        args.domain_rand = False
+
+        restored = restore_resume_configuration(
+            args,
+            {
+                "observation_history_length": 5,
+                "action_history_length": 4,
+                "temporal_head_mode": TEMPORAL_HEAD_MODE_MLP,
+                "domain_rand": True,
+            },
+            {"domain_rand"},
+        )
+
+        self.assertFalse(args.domain_rand)
+        self.assertNotIn("domain_rand", restored)
+
 
     def test_explicit_incompatible_temporal_mode_is_rejected(self) -> None:
         args = self.args()

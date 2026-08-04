@@ -611,15 +611,30 @@ def restore_resume_configuration(
             args.source_observation_channel_order,
         ),
     }
+    environment_override_keys = {
+        "domain_rand",
+        "dynamics_rand",
+        "camera_rand",
+        "distortion",
+    }
+    restored_keys = []
     for key, checkpoint_value in restored.items():
         current_value = getattr(args, key)
         option = "--" + key.replace("_", "-")
         if key in configured_destinations and current_value != checkpoint_value:
+            if key in environment_override_keys:
+                print(
+                    f"Checkpoint environment override: {option}={current_value!r} "
+                    f"(checkpoint used {checkpoint_value!r})",
+                    flush=True,
+                )
+                continue
             raise ValueError(
                 f"{option}={current_value!r} is incompatible with the resumed checkpoint "
                 f"value {checkpoint_value!r}. Remove the option or use a compatible checkpoint."
             )
         setattr(args, key, checkpoint_value)
+        restored_keys.append(key)
     if "map_names" not in configured_destinations:
         checkpoint_map_names = checkpoint_config.get("map_names")
         if checkpoint_map_names is None:
@@ -629,7 +644,7 @@ def restore_resume_configuration(
         args.map_names = normalize_map_names(tuple(checkpoint_map_names))
         args.map_name = args.map_names[0]
         restored_map_configuration = True
-    restored_keys = sorted(restored)
+    restored_keys = sorted(restored_keys)
     if restored_map_configuration:
         restored_keys.append("map_names")
     return restored_keys

@@ -26,6 +26,7 @@ from dt_utils.gym_duckietown_start_config import (
     load_start_config,
     next_pose_name,
 )
+from dt_utils.gym_duckietown_rendering import prepare_reset_render_context
 from dt_utils.duckietown_rewards import (
     REWARD_FUNCTION_CHOICES,
     compute_reward_breakdowns,
@@ -391,6 +392,7 @@ def reset_env(
         apply_env_start_pose(env, start_pose)
     if seed is not None:
         env.seed(seed)
+    prepare_reset_render_context(env)
     env.reset()
     if manual_trim_override is not None:
         apply_manual_trim_override(env, manual_trim_override)

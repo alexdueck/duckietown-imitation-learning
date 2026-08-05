@@ -62,6 +62,7 @@ from dt_utils.gym_duckietown_start_config import (
     apply_env_start_pose,
     load_start_config,
 )
+from dt_utils.gym_duckietown_rendering import prepare_reset_render_context
 from dt_utils.rl_models import TanhGaussianPolicy, load_imitation_actor, tanh_normal_log_prob
 from dt_utils.temporal_rl import (
     FixedHistory,
@@ -1148,6 +1149,7 @@ def make_env(args: argparse.Namespace, seed: int | None = None):
 
 
 def reset_raw(env, seed: int | None = None):
+    prepare_reset_render_context(env)
     try:
         result = env.reset(seed=seed)
     except TypeError:

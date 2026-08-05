@@ -52,6 +52,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of first/last evaluations used for comparisons.",
     )
     parser.add_argument(
+        "--train-pose-window",
+        type=int,
+        default=50,
+        help="Number of first/last episodes per training pose used for comparisons.",
+    )
+    parser.add_argument(
         "--episode-window",
         type=int,
         default=500,
@@ -75,7 +81,13 @@ def parse_args() -> argparse.Namespace:
         help="Do not open the generated report in the default browser.",
     )
     args = parse_args_with_completion(parser)
-    for name in ("eval_window", "episode_window", "diagnostic_window", "rolling_window"):
+    for name in (
+        "eval_window",
+        "train_pose_window",
+        "episode_window",
+        "diagnostic_window",
+        "rolling_window",
+    ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     return args
@@ -142,6 +154,24 @@ def fmt(value: float, digits: int = 2, suffix: str = "") -> str:
     return f"{value:.{digits}f}{suffix}"
 
 
+def axis_decimal_places(tick_step: float) -> int:
+    """Choose readable precision from the distance between adjacent ticks."""
+    step = abs(tick_step)
+    if not math.isfinite(step) or step >= 1.0:
+        return 0
+    if step >= 0.1:
+        return 1
+    if step >= 0.01:
+        return 2
+    if step >= 0.001:
+        return 3
+    return min(6, max(4, int(math.ceil(-math.log10(step))) + 1))
+
+
+def format_axis_tick(value: float, tick_step: float) -> str:
+    return f"{value:.{axis_decimal_places(tick_step)}f}"
+
+
 def format_step(value: float) -> str:
     return f"{int(value):,}".replace(",", " ") if math.isfinite(value) else "-"
 
@@ -159,8 +189,18 @@ def svg_line_chart(
     *,
     width: int = 980,
     height: int = 340,
+    filter_group: str | None = None,
+    series_keys: Sequence[str] | None = None,
+    show_legend: bool = True,
 ) -> str:
-    all_points = [point for _, points, _ in series for point in points if all(math.isfinite(v) for v in point)]
+    if series_keys is not None and len(series_keys) != len(series):
+        raise ValueError("series_keys must contain one key per chart series")
+    all_points = [
+        point
+        for _, points, _ in series
+        for point in points
+        if all(math.isfinite(value) for value in point)
+    ]
     if not all_points:
         return "<p class='muted'>No chart data available.</p>"
     xs = [point[0] for point in all_points]
@@ -185,29 +225,56 @@ def svg_line_chart(
     def sy(value: float) -> float:
         return top + (max_y - value) / (max_y - min_y) * plot_height
 
-    parts = [f"<svg viewBox='0 0 {width} {height}' role='img' class='chart'>"]
+    x_tick_step = (max_x - min_x) / 5
+    y_tick_step = (max_y - min_y) / 5
+    parts = [
+        f"<svg viewBox='0 0 {width} {height}' role='img' "
+        f"class='chart interactive-chart' tabindex='0' "
+        f"data-chart-x-min='{min_x:.17g}' data-chart-x-max='{max_x:.17g}' "
+        f"data-chart-y-min='{min_y:.17g}' data-chart-y-max='{max_y:.17g}'>"
+    ]
     for index in range(6):
         fraction = index / 5
         y_value = max_y - fraction * (max_y - min_y)
         y = top + fraction * plot_height
-        parts.append(f"<line x1='{left}' y1='{y:.1f}' x2='{width-right}' y2='{y:.1f}' class='grid'/>")
-        parts.append(f"<text x='{left-9}' y='{y+4:.1f}' text-anchor='end' class='tick'>{y_value:.2f}</text>")
+        parts.append(f"<line x1='{left}' y1='{y:.1f}' x2='{width-right}' y2='{y:.1f}' class='grid y-grid'/>")
+        parts.append(
+            f"<text x='{left-9}' y='{y+4:.1f}' text-anchor='end' "
+            f"class='tick y-tick'>{format_axis_tick(y_value, y_tick_step)}</text>"
+        )
     for index in range(6):
         fraction = index / 5
         x_value = min_x + fraction * (max_x - min_x)
         x = left + fraction * plot_width
-        parts.append(f"<text x='{x:.1f}' y='{height-31}' text-anchor='middle' class='tick'>{x_value:.0f}</text>")
+        parts.append(
+            f"<text x='{x:.1f}' y='{height-31}' text-anchor='middle' "
+            f"class='tick x-tick'>{format_axis_tick(x_value, x_tick_step)}</text>"
+        )
     parts.append(f"<line x1='{left}' y1='{top}' x2='{left}' y2='{height-bottom}' class='axis'/>")
     parts.append(f"<line x1='{left}' y1='{height-bottom}' x2='{width-right}' y2='{height-bottom}' class='axis'/>")
-    for name, points, color in series:
+    parts.append(
+        f"<rect x='{left}' y='{top}' width='{plot_width}' height='{plot_height}' "
+        "class='interaction-surface'/>"
+    )
+    for index, (name, points, color) in enumerate(series):
         clean = [(x, y) for x, y in points if math.isfinite(x) and math.isfinite(y)]
         coordinates = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in clean)
-        parts.append(f"<polyline points='{coordinates}' fill='none' stroke='{color}' stroke-width='2'/>")
-    legend_x = left + 8
-    for index, (name, _, color) in enumerate(series):
-        y = 15 + index * 18
-        parts.append(f"<line x1='{legend_x}' y1='{y}' x2='{legend_x+22}' y2='{y}' stroke='{color}' stroke-width='3'/>")
-        parts.append(f"<text x='{legend_x+28}' y='{y+4}' class='legend'>{html.escape(name)}</text>")
+        filter_attributes = ""
+        if filter_group is not None and series_keys is not None:
+            filter_attributes = (
+                f" data-filter-group='{html.escape(filter_group, quote=True)}'"
+                f" data-filter-key='{html.escape(series_keys[index], quote=True)}'"
+            )
+        parts.append(
+            f"<polyline points='{coordinates}' fill='none' stroke='{color}' "
+            f"stroke-width='2'{filter_attributes}/>"
+        )
+    if show_legend:
+        legend_x = left + 8
+        for index, (name, _, color) in enumerate(series):
+            y = 15 + index * 18
+            parts.append(f"<line x1='{legend_x}' y1='{y}' x2='{legend_x+22}' y2='{y}' stroke='{color}' stroke-width='3'/>")
+            parts.append(f"<text x='{legend_x+28}' y='{y+4}' class='legend'>{html.escape(name)}</text>")
     parts.append("</svg>")
     return "".join(parts)
 
@@ -221,16 +288,23 @@ def svg_grouped_bars(
     *,
     width: int = 980,
     height: int = 390,
+    filter_group: str | None = None,
+    category_keys: Sequence[str] | None = None,
 ) -> str:
     if not categories:
         return "<p class='muted'>No chart data available.</p>"
+    if category_keys is not None and len(category_keys) != len(categories):
+        raise ValueError("category_keys must contain one key per bar category")
     left, right, top, bottom = 64, 20, 35, 110
     plot_width = width - left - right
     plot_height = height - top - bottom
     max_value = max([100.0, *finite(first_values), *finite(last_values)])
     group_width = plot_width / len(categories)
     bar_width = min(26.0, group_width * 0.32)
-    parts = [f"<svg viewBox='0 0 {width} {height}' role='img' class='chart'>"]
+    parts = [
+        f"<svg viewBox='0 0 {width} {height}' role='img' "
+        "class='chart' tabindex='0'>"
+    ]
     for index in range(6):
         value = max_value * index / 5
         y = top + plot_height - value / max_value * plot_height
@@ -238,7 +312,17 @@ def svg_grouped_bars(
         parts.append(f"<text x='{left-8}' y='{y+4:.1f}' text-anchor='end' class='tick'>{value:.0f}%</text>")
     for index, category in enumerate(categories):
         center = left + (index + 0.5) * group_width
-        for offset, value, color in ((-bar_width, first_values[index], COLORS[0]), (0, last_values[index], COLORS[1])):
+        filter_attributes = ""
+        if filter_group is not None and category_keys is not None:
+            filter_attributes = (
+                f" data-filter-group='{html.escape(filter_group, quote=True)}'"
+                f" data-filter-key='{html.escape(category_keys[index], quote=True)}'"
+            )
+        parts.append(f"<g{filter_attributes}>")
+        for offset, value, color in (
+            (-bar_width, first_values[index], COLORS[0]),
+            (0, last_values[index], COLORS[1]),
+        ):
             if not math.isfinite(value):
                 continue
             bar_height = value / max_value * plot_height
@@ -250,10 +334,44 @@ def svg_grouped_bars(
             f"<text x='{center:.1f}' y='{height-bottom+19}' transform='rotate(38 {center:.1f} {height-bottom+19})' "
             f"text-anchor='start' class='tick'>{html.escape(category)}</text>"
         )
+        parts.append("</g>")
     parts.append(f"<rect x='{left}' y='8' width='12' height='12' fill='{COLORS[0]}'/><text x='{left+18}' y='19' class='legend'>{html.escape(first_label)}</text>")
     parts.append(f"<rect x='{left+180}' y='8' width='12' height='12' fill='{COLORS[1]}'/><text x='{left+198}' y='19' class='legend'>{html.escape(last_label)}</text>")
     parts.append("</svg>")
     return "".join(parts)
+
+
+def series_filter_controls(
+    filter_group: str,
+    options: Sequence[tuple[str, str, str]],
+) -> str:
+    if not options:
+        return ""
+    escaped_group = html.escape(filter_group, quote=True)
+    checkboxes = []
+    for key, label, color in options:
+        checkboxes.append(
+            "<label class='series-filter-option'>"
+            f"<input type='checkbox' checked data-filter-control-group='{escaped_group}' "
+            f"data-filter-control-key='{html.escape(key, quote=True)}' "
+            "onchange='setReportSeriesVisible(this.dataset.filterControlGroup, "
+            "this.dataset.filterControlKey, this.checked)'>"
+            f"<span class='series-swatch' style='background:{html.escape(color, quote=True)}'></span>"
+            f"<span>{html.escape(label)}</span></label>"
+        )
+    return (
+        f"<div class='series-filter' data-filter-panel='{escaped_group}'>"
+        "<div class='series-filter-actions'>"
+        f"<button type='button' data-filter-action-group='{escaped_group}' "
+        "onclick='setReportGroupVisible(this.dataset.filterActionGroup, true)'>"
+        "Select all</button>"
+        f"<button type='button' data-filter-action-group='{escaped_group}' "
+        "onclick='setReportGroupVisible(this.dataset.filterActionGroup, false)'>"
+        "Select none</button>"
+        "</div>"
+        f"<div class='series-filter-options'>{''.join(checkboxes)}</div>"
+        "</div>"
+    )
 
 
 def scenario_identity(row: dict[str, str]) -> tuple[str, str]:
@@ -326,6 +444,80 @@ def scenario_statistics(
                     for row in last
                 ),
                 "mean_steps": average(number(row, "scenario_steps") for row in group),
+                "minimum": min(ys),
+                "maximum": max(ys),
+            }
+        )
+    return sorted(result, key=lambda item: (item["map"], item["label"]))
+
+
+def training_pose_identity(row: dict[str, str]) -> tuple[str, str] | None:
+    if row.get("start_type") != "hard_pose":
+        return None
+    map_name = row.get("map_name") or "unknown-map"
+    pose_name = row.get("start_name") or "unnamed pose"
+    return f"hard_pose:{map_name}:{pose_name}", pose_name
+
+
+def training_pose_statistics(
+    rows: Sequence[dict[str, str]],
+    window: int,
+) -> list[dict[str, Any]]:
+    groups: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        identity_and_label = training_pose_identity(row)
+        if identity_and_label is None:
+            continue
+        identity, _ = identity_and_label
+        groups[identity].append(row)
+
+    result = []
+    for identity, group in groups.items():
+        group.sort(key=lambda row: integer(row, "episode"))
+        _, label = training_pose_identity(group[0]) or (identity, identity)
+        size = min(window, len(group))
+        first = group[:size]
+        last = group[-size:]
+        xs = [number(row, "step") for row in group]
+        ys = [number(row, "episode_return") for row in group]
+        slope, r_squared = linear_trend(xs, ys)
+
+        def invalid_percentage(selected: Sequence[dict[str, str]]) -> float:
+            return 100.0 * average(
+                1.0 if row.get("done_reason") == "invalid-pose" else 0.0
+                for row in selected
+            )
+
+        result.append(
+            {
+                "identity": identity,
+                "label": label,
+                "map": group[0].get("map_name") or "unknown-map",
+                "count": float(len(group)),
+                "first_count": float(len(first)),
+                "last_count": float(len(last)),
+                "mean": average(ys),
+                "first": average(number(row, "episode_return") for row in first),
+                "last": average(number(row, "episode_return") for row in last),
+                "first_reward_per_step": average(
+                    number(row, "episode_return_per_step") for row in first
+                ),
+                "last_reward_per_step": average(
+                    number(row, "episode_return_per_step") for row in last
+                ),
+                "first_length": average(
+                    number(row, "episode_length") for row in first
+                ),
+                "last_length": average(
+                    number(row, "episode_length") for row in last
+                ),
+                "first_safe": 100.0 - invalid_percentage(first),
+                "last_safe": 100.0 - invalid_percentage(last),
+                "invalid_pct": invalid_percentage(group),
+                "first_invalid_pct": invalid_percentage(first),
+                "last_invalid_pct": invalid_percentage(last),
+                "slope_per_million": slope * 1_000_000,
+                "r_squared": r_squared,
                 "minimum": min(ys),
                 "maximum": max(ys),
             }
@@ -533,6 +725,7 @@ def build_report(
     latest_eval = eval_history[-1]
     scenario_stats = scenario_statistics(eval_scenarios, args.eval_window)
     eval_map_stats = evaluation_map_statistics(eval_scenarios, args.eval_window)
+    training_pose_stats = training_pose_statistics(history, args.train_pose_window)
 
     overall_starts = start_statistics(history)
     episode_size = min(args.episode_window, len(history))
@@ -555,18 +748,46 @@ def build_report(
     for row in eval_scenarios:
         identity, label = scenario_identity(row)
         scenario_group = scenario_groups.setdefault(
-            identity, {"label": label, "map": row.get("map_name") or "unknown-map", "points": []}
+            identity,
+            {
+                "identity": identity,
+                "label": label,
+                "map": row.get("map_name") or "unknown-map",
+                "points": [],
+            },
         )
         scenario_group["points"].append(
             (number(row, "eval_index"), number(row, "scenario_return"))
         )
+    sorted_scenario_groups = sorted(
+        scenario_groups.values(),
+        key=lambda item: (item["map"], item["label"]),
+    )
+    eval_filter_group = "evaluation-scenarios"
+    eval_filter_options = [
+        (
+            group["identity"],
+            f"{group['label']} [{group['map']}]",
+            COLORS[index % len(COLORS)],
+        )
+        for index, group in enumerate(sorted_scenario_groups)
+    ]
+    eval_scenario_controls = series_filter_controls(
+        eval_filter_group,
+        eval_filter_options,
+    )
     scenario_chart = svg_line_chart(
         tuple(
-            (f"{group['label']} [{group['map']}]", group["points"], COLORS[index % len(COLORS)])
-            for index, group in enumerate(
-                sorted(scenario_groups.values(), key=lambda item: (item["map"], item["label"]))
+            (
+                f"{group['label']} [{group['map']}]",
+                group["points"],
+                COLORS[index % len(COLORS)],
             )
-        )
+            for index, group in enumerate(sorted_scenario_groups)
+        ),
+        filter_group=eval_filter_group,
+        series_keys=tuple(group["identity"] for group in sorted_scenario_groups),
+        show_legend=False,
     )
     eval_map_chart = svg_line_chart(tuple(
         (item["map"], item["points"], COLORS[index % len(COLORS)])
@@ -586,6 +807,8 @@ def build_report(
         [item["last_invalid_pct"] for item in scenario_stats],
         f"First {eval_size} evaluations",
         f"Last {eval_size} evaluations",
+        filter_group=eval_filter_group,
+        category_keys=[item["identity"] for item in scenario_stats],
     )
     invalid_chart = svg_grouped_bars(
         start_labels,
@@ -593,6 +816,68 @@ def build_report(
         [last_starts.get(label, {}).get("invalid_pct", math.nan) for label in start_labels],
         f"First {episode_size} episodes",
         f"Last {episode_size} episodes",
+    )
+    training_pose_groups: dict[str, dict[str, Any]] = {}
+    for row in history:
+        identity_and_label = training_pose_identity(row)
+        if identity_and_label is None:
+            continue
+        identity, label = identity_and_label
+        group = training_pose_groups.setdefault(
+            identity,
+            {
+                "identity": identity,
+                "label": label,
+                "map": row.get("map_name") or "unknown-map",
+                "points": [],
+            },
+        )
+        group["points"].append(
+            (number(row, "episode"), number(row, "episode_return"))
+        )
+    sorted_training_pose_groups = sorted(
+        training_pose_groups.values(),
+        key=lambda item: (item["map"], item["label"]),
+    )
+    training_filter_group = "training-poses"
+    training_filter_options = [
+        (
+            group["identity"],
+            f"{group['label']} [{group['map']}]",
+            COLORS[index % len(COLORS)],
+        )
+        for index, group in enumerate(sorted_training_pose_groups)
+    ]
+    training_pose_controls = series_filter_controls(
+        training_filter_group,
+        training_filter_options,
+    )
+    training_pose_chart = svg_line_chart(
+        tuple(
+            (
+                f"{group['label']} [{group['map']}]",
+                group["points"],
+                COLORS[index % len(COLORS)],
+            )
+            for index, group in enumerate(sorted_training_pose_groups)
+        ),
+        filter_group=training_filter_group,
+        series_keys=tuple(
+            group["identity"] for group in sorted_training_pose_groups
+        ),
+        show_legend=False,
+    )
+    training_pose_invalid_chart = svg_grouped_bars(
+        [
+            f"{item['label']} [{item['map']}]"
+            for item in training_pose_stats
+        ],
+        [item["first_invalid_pct"] for item in training_pose_stats],
+        [item["last_invalid_pct"] for item in training_pose_stats],
+        f"First {args.train_pose_window} episodes per pose",
+        f"Last {args.train_pose_window} episodes per pose",
+        filter_group=training_filter_group,
+        category_keys=[item["identity"] for item in training_pose_stats],
     )
     rollout_points = [(number(row, "rollout"), number(row, "rollout_reward_per_step")) for row in rollouts]
     rollout_chart = svg_line_chart(
@@ -639,6 +924,31 @@ def build_report(
                 fmt(item["maximum"]),
             ]
         )
+
+    training_pose_rows = [
+        [
+            item["label"],
+            item["map"],
+            str(int(item["count"])),
+            fmt(item["first"]),
+            fmt(item["last"]),
+            fmt(item["last"] - item["first"]),
+            fmt(item["first_reward_per_step"], 3),
+            fmt(item["last_reward_per_step"], 3),
+            fmt(item["first_length"], 1),
+            fmt(item["last_length"], 1),
+            fmt(item["first_safe"], 1, "%"),
+            fmt(item["last_safe"], 1, "%"),
+            fmt(item["invalid_pct"], 1, "%"),
+            fmt(item["first_invalid_pct"], 1, "%"),
+            fmt(item["last_invalid_pct"], 1, "%"),
+            fmt(item["slope_per_million"]),
+            fmt(item["r_squared"], 3),
+            fmt(item["minimum"]),
+            fmt(item["maximum"]),
+        ]
+        for item in training_pose_stats
+    ]
 
     eval_map_rows = [
         [
@@ -842,10 +1152,24 @@ th:first-child,td:first-child {{ text-align:left; }}
 th {{ background:var(--panel); font-size:12px; text-transform:uppercase; }}
 tbody tr:last-child td {{ border-bottom:0; }}
 .chart {{ display:block; width:100%; height:auto; border:1px solid var(--line); border-radius:5px; background:white; }}
+.interactive-chart {{ cursor:grab; touch-action:none; user-select:none; -webkit-user-select:none; }}
+.interactive-chart.dragging {{ cursor:grabbing; }}
+.chart-interaction-host {{ width:100%; cursor:grab; user-select:none; -webkit-user-select:none; }}
+.chart-interaction-host.dragging {{ cursor:grabbing; }}
+.interaction-surface {{ fill:transparent; pointer-events:all; }}
+.chart-controls {{ display:flex; align-items:center; gap:10px; margin:6px 0; color:var(--muted); font-size:12px; }}
+.chart-controls button {{ padding:4px 9px; border:1px solid #aeb8bd; border-radius:4px; background:white; cursor:pointer; }}
 .grid {{ stroke:#e7ebed; stroke-width:1; }} .axis {{ stroke:#67747b; stroke-width:1; }}
 .tick,.legend {{ fill:#536169; font-size:11px; }}
+.series-filter {{ margin:10px 0; padding:10px; border:1px solid var(--line); border-radius:5px; background:var(--panel); }}
+.series-filter-actions {{ display:flex; gap:8px; margin-bottom:8px; }}
+.series-filter-actions button {{ padding:4px 9px; border:1px solid #aeb8bd; border-radius:4px; background:white; cursor:pointer; }}
+.series-filter-options {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:5px 12px; max-height:190px; overflow:auto; }}
+.series-filter-option {{ display:flex; align-items:center; gap:7px; min-width:0; }}
+.series-filter-option span:last-child {{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+.series-swatch {{ flex:0 0 12px; width:12px; height:4px; border-radius:2px; }}
 code {{ background:var(--panel); padding:2px 5px; border-radius:3px; }}
-@media print {{ main {{ max-width:none; padding:0; }} .chart {{ break-inside:avoid; }} h2 {{ break-before:page; }} }}
+@media print {{ main {{ max-width:none; padding:0; }} .chart {{ break-inside:avoid; }} h2 {{ break-before:page; }} .series-filter {{ display:none; }} }}
 </style>
 </head>
 <body><main>
@@ -878,7 +1202,10 @@ with R-squared <strong>{fmt(eval_r_squared, 3)}</strong>. This is descriptive; s
 <p>Configured <code>eval_pose</code> starts and seeded <code>eval_seed</code>
 starts are reported as separate scenarios. Invalid-pose rates count only the
 explicit <code>invalid-pose</code> termination reason.</p>
-<h3>Per-scenario return</h3>{scenario_chart}
+<h3>Per-scenario return</h3>
+<p class="muted">Use the scenario selector to show only the poses or seeds you want to compare. The same selection also controls the invalid-pose chart below.</p>
+{eval_scenario_controls}
+{scenario_chart}
 {html_table(("Scenario", "Map", "Type", "Seed", f"Return first {eval_size}", f"Return last {eval_size}", "Change", "Complete first", "Complete last", "Invalid overall", "Invalid first", "Invalid last", "Slope / 1M", "R-squared", "Minimum", "Maximum"), scenario_rows)}
 <h3>Invalid pose by evaluation scenario</h3>{eval_invalid_chart}
 <h3>Completed scenarios per evaluation</h3>{completion_chart}
@@ -891,6 +1218,16 @@ explicit <code>invalid-pose</code> termination reason.</p>
 <h3>First versus last episodes</h3>
 {html_table(("Start", "Episodes first / last", "Invalid pose", "Mean length", "Step share"), start_comparison_rows)}
 {invalid_chart}
+<h3>Per-training-pose return</h3>
+<p>Each pose is compared using its own first and last
+{args.train_pose_window} occurrences, independent of how frequently other starts
+were sampled. Random starts are excluded because they do not represent stable,
+repeatable poses.</p>
+{training_pose_controls}
+{training_pose_chart}
+{html_table(("Pose", "Map", "Episodes", f"Return first {args.train_pose_window}", f"Return last {args.train_pose_window}", "Change", "Reward/step first", "Reward/step last", "Length first", "Length last", "Safe first", "Safe last", "Invalid overall", "Invalid first", "Invalid last", "Slope / 1M", "R-squared", "Minimum", "Maximum"), training_pose_rows)}
+<h3>Invalid pose by training pose</h3>
+{training_pose_invalid_chart}
 <h3>Training by map</h3>
 {html_table(("Map", "Episodes", "Invalid overall", "Invalid first -> last", "Mean length first -> last", "Step share first -> last", "Reward/step first -> last"), training_map_rows)}
 
@@ -909,7 +1246,263 @@ explicit <code>invalid-pose</code> termination reason.</p>
 
 <h2 id="data-provenance">Data provenance</h2>
 {html_table(("File", "Rows"), provenance_rows)}
-<p class="muted">The report is self-contained: charts are inline SVG and no network connection is required.</p>
+<p class="muted">The report is self-contained: charts are inline SVG and no network connection is required. Use the mouse wheel or the buttons to zoom the X-axis, drag to pan along X, and “Reset view” to restore a chart.</p>
+<script>
+function reportAxisDecimals(step) {{
+  step = Math.abs(step);
+  if (!isFinite(step) || step >= 1) return 0;
+  if (step >= 0.1) return 1;
+  if (step >= 0.01) return 2;
+  if (step >= 0.001) return 3;
+  return Math.min(6, Math.max(4, Math.ceil(-Math.log10(step)) + 1));
+}}
+function reportAxisTick(value, step) {{
+  return value.toFixed(reportAxisDecimals(step));
+}}
+function renderInteractiveChart(chart) {{
+  var state = chart._reportChartState;
+  var width = chart.viewBox.baseVal.width;
+  var height = chart.viewBox.baseVal.height;
+  var left = 74;
+  var right = 24;
+  var top = 24;
+  var bottom = 58;
+  var plotWidth = width - left - right;
+  var plotHeight = height - top - bottom;
+  var visibleSeries = Array.from(chart.querySelectorAll("polyline"))
+    .filter(function(polyline) {{ return polyline.style.display !== "none"; }});
+  var visiblePoints = [];
+  visibleSeries.forEach(function(polyline) {{
+    if (!polyline._reportPoints) {{
+      var initialYMin = Number(chart.dataset.chartYMin);
+      var initialYMax = Number(chart.dataset.chartYMax);
+      var initialPlotWidth = width - left - right;
+      var initialPlotHeight = height - top - bottom;
+      polyline._reportPoints = polyline.getAttribute("points").trim().split(/\s+/)
+        .filter(function(pair) {{ return pair.length > 0; }})
+        .map(function(pair) {{
+          var coordinates = pair.split(",").map(Number);
+          return [
+            Number(chart.dataset.chartXMin) +
+              (coordinates[0] - left) / initialPlotWidth *
+              (Number(chart.dataset.chartXMax) - Number(chart.dataset.chartXMin)),
+            initialYMax -
+              (coordinates[1] - top) / initialPlotHeight *
+              (initialYMax - initialYMin)
+          ];
+        }});
+    }}
+    polyline._reportPoints.forEach(function(point) {{
+      if (point[0] >= state.xMin && point[0] <= state.xMax) visiblePoints.push(point);
+    }});
+  }});
+  if (visiblePoints.length === 0) {{
+    visibleSeries.forEach(function(polyline) {{
+      polyline._reportPoints.forEach(function(point) {{ visiblePoints.push(point); }});
+    }});
+  }}
+  var yValues = visiblePoints.map(function(point) {{ return point[1]; }});
+  var yMin = Math.min.apply(null, yValues);
+  var yMax = Math.max.apply(null, yValues);
+  if (yMin === yMax) {{
+    yMin -= 1;
+    yMax += 1;
+  }}
+  var yPadding = 0.06 * (yMax - yMin);
+  yMin -= yPadding;
+  yMax += yPadding;
+  function sx(value) {{
+    return left + (value - state.xMin) / (state.xMax - state.xMin) * plotWidth;
+  }}
+  function sy(value) {{
+    return top + (yMax - value) / (yMax - yMin) * plotHeight;
+  }}
+  visibleSeries.forEach(function(polyline) {{
+    var points = polyline._reportPoints.filter(function(point) {{
+      return point[0] >= state.xMin && point[0] <= state.xMax;
+    }});
+    polyline.setAttribute("points", points.map(function(point) {{
+      return sx(point[0]).toFixed(1) + "," + sy(point[1]).toFixed(1);
+    }}).join(" "));
+  }});
+  var yStep = (yMax - yMin) / 5;
+  chart.querySelectorAll(".y-grid").forEach(function(line, index) {{
+    var fraction = index / 5;
+    var y = top + fraction * plotHeight;
+    var value = yMax - fraction * (yMax - yMin);
+    line.setAttribute("y1", y.toFixed(1));
+    line.setAttribute("y2", y.toFixed(1));
+    var label = chart.querySelectorAll(".y-tick")[index];
+    label.setAttribute("y", (y + 4).toFixed(1));
+    label.textContent = reportAxisTick(value, yStep);
+  }});
+  var xStep = (state.xMax - state.xMin) / 5;
+  chart.querySelectorAll(".x-tick").forEach(function(label, index) {{
+    var fraction = index / 5;
+    var x = left + fraction * plotWidth;
+    label.setAttribute("x", x.toFixed(1));
+    label.textContent = reportAxisTick(state.xMin + fraction * (state.xMax - state.xMin), xStep);
+  }});
+}}
+function setReportSeriesVisible(group, key, visible) {{
+  document.querySelectorAll("[data-filter-group]").forEach(function(element) {{
+    if (element.dataset.filterGroup === group && element.dataset.filterKey === key) {{
+      element.style.display = visible ? "" : "none";
+      var chart = element.closest("svg.interactive-chart");
+      if (chart) renderInteractiveChart(chart);
+    }}
+  }});
+}}
+function setReportGroupVisible(group, visible) {{
+  document.querySelectorAll("[data-filter-control-group]").forEach(function(control) {{
+    if (control.dataset.filterControlGroup === group) {{
+      control.checked = visible;
+      setReportSeriesVisible(group, control.dataset.filterControlKey, visible);
+    }}
+  }});
+}}
+function installInteractiveCharts() {{
+  document.querySelectorAll("svg.interactive-chart").forEach(function(chart) {{
+    var initialXMin = Number(chart.dataset.chartXMin);
+    var initialXMax = Number(chart.dataset.chartXMax);
+    chart._reportChartState = {{ xMin: initialXMin, xMax: initialXMax }};
+    var state = {{ dragging: false }};
+    var controls = document.createElement("div");
+    controls.className = "chart-controls";
+    var panLeft = document.createElement("button");
+    panLeft.type = "button";
+    panLeft.textContent = "←";
+    panLeft.title = "Pan left on the X-axis";
+    var zoomOut = document.createElement("button");
+    zoomOut.type = "button";
+    zoomOut.textContent = "−";
+    zoomOut.title = "Zoom out on the X-axis";
+    var zoomIn = document.createElement("button");
+    zoomIn.type = "button";
+    zoomIn.textContent = "+";
+    zoomIn.title = "Zoom in on the X-axis";
+    var panRight = document.createElement("button");
+    panRight.type = "button";
+    panRight.textContent = "→";
+    panRight.title = "Pan right on the X-axis";
+    var reset = document.createElement("button");
+    reset.type = "button";
+    reset.textContent = "Reset view";
+    var hint = document.createElement("span");
+    hint.textContent = "X-axis zoom · drag: pan";
+    controls.appendChild(panLeft);
+    controls.appendChild(zoomOut);
+    controls.appendChild(zoomIn);
+    controls.appendChild(panRight);
+    controls.appendChild(reset);
+    controls.appendChild(hint);
+    chart.parentNode.insertBefore(controls, chart);
+    var interactionHost = document.createElement("div");
+    interactionHost.className = "chart-interaction-host";
+    chart.parentNode.insertBefore(interactionHost, chart);
+    interactionHost.appendChild(chart);
+
+    function clampXRange(xMin, xMax) {{
+      var initialWidth = initialXMax - initialXMin;
+      var width = Math.min(initialWidth, Math.max(initialWidth / 20, xMax - xMin));
+      xMin = Math.max(initialXMin, Math.min(initialXMax - width, xMin));
+      return {{ xMin: xMin, xMax: xMin + width }};
+    }}
+    function zoomX(factor, center) {{
+      var current = chart._reportChartState;
+      var currentWidth = current.xMax - current.xMin;
+      var nextWidth = currentWidth * factor;
+      center = center === undefined ? (current.xMin + current.xMax) / 2 : center;
+      var next = clampXRange(
+        center - (center - current.xMin) * nextWidth / currentWidth,
+        center + (current.xMax - center) * nextWidth / currentWidth
+      );
+      chart._reportChartState = next;
+      renderInteractiveChart(chart);
+    }}
+    function panX(fraction) {{
+      var current = chart._reportChartState;
+      var shift = (current.xMax - current.xMin) * fraction;
+      chart._reportChartState = clampXRange(
+        current.xMin + shift,
+        current.xMax + shift
+      );
+      renderInteractiveChart(chart);
+    }}
+    function resetView() {{
+      chart._reportChartState = {{ xMin: initialXMin, xMax: initialXMax }};
+      renderInteractiveChart(chart);
+    }}
+    zoomIn.addEventListener("click", function() {{ zoomX(0.75); }});
+    zoomOut.addEventListener("click", function() {{ zoomX(1.33); }});
+    panLeft.addEventListener("click", function() {{ panX(-0.2); }});
+    panRight.addEventListener("click", function() {{ panX(0.2); }});
+    reset.addEventListener("click", resetView);
+    interactionHost.addEventListener("dblclick", resetView);
+    function positionToX(clientX) {{
+      var rect = chart.getBoundingClientRect();
+      var plotFraction = (clientX - rect.left - rect.width * left / width) /
+        (rect.width * plotWidth / width);
+      return Math.max(0, Math.min(1, plotFraction));
+    }}
+    function zoomFromWheel(event) {{
+      event.preventDefault();
+      var current = chart._reportChartState;
+      var plotFraction = positionToX(event.clientX);
+      var center = current.xMin + plotFraction * (current.xMax - current.xMin);
+      var deltaY = Number(event.deltaY);
+      if (!isFinite(deltaY) || deltaY === 0) {{
+        deltaY = event.wheelDelta ? -Number(event.wheelDelta) : 0;
+      }}
+      if (deltaY !== 0) zoomX(deltaY < 0 ? 0.75 : 1.33, center);
+    }}
+    interactionHost.addEventListener("wheel", zoomFromWheel, {{ passive: false }});
+
+    function startDrag(clientX) {{
+      state.dragging = true;
+      state.startX = clientX;
+      state.startRange = {{
+        xMin: chart._reportChartState.xMin,
+        xMax: chart._reportChartState.xMax
+      }};
+      chart.classList.add("dragging");
+      interactionHost.classList.add("dragging");
+    }}
+    function dragTo(clientX) {{
+      if (!state.dragging) return;
+      var rect = chart.getBoundingClientRect();
+      var range = state.startRange.xMax - state.startRange.xMin;
+      var delta = (clientX - state.startX) / (rect.width * plotWidth / width) * range;
+      chart._reportChartState = clampXRange(
+        state.startRange.xMin - delta,
+        state.startRange.xMax - delta
+      );
+      renderInteractiveChart(chart);
+    }}
+    function endDrag() {{
+      if (!state.dragging) return;
+      state.dragging = false;
+      chart.classList.remove("dragging");
+      interactionHost.classList.remove("dragging");
+    }}
+    interactionHost.addEventListener("mousedown", function(event) {{
+      if (event.button !== 0) return;
+      event.preventDefault();
+      startDrag(event.clientX);
+    }});
+    window.addEventListener("mousemove", function(event) {{
+      if (state.dragging && event.buttons === 0) {{
+        endDrag();
+        return;
+      }}
+      dragTo(event.clientX);
+    }});
+    window.addEventListener("mouseup", endDrag);
+    window.addEventListener("blur", endDrag);
+  }});
+}}
+installInteractiveCharts();
+</script>
 </main></body></html>"""
 
 

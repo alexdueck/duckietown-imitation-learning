@@ -65,8 +65,10 @@ from train_rl_ppo_gym_duckietown import (
 
 
 SIDEBAR_WIDTH = 480
-MIN_VIEWER_HEIGHT = 900
-CONTROL_HELP_HEIGHT = 110
+CONTROL_HELP_HEIGHT = 122
+RANDOMIZATION_PANEL_PADDING = 18
+RANDOMIZATION_PANEL_COLUMN_GAP = 28
+RANDOMIZATION_SECTION_GAP = 8
 
 
 @dataclass
@@ -401,14 +403,317 @@ def fmt(value: float | None, precision: int = 4) -> str:
     return f"{float(value):+.{precision}f}"
 
 
+def compact_randomization_value(value: Any, precision: int = 3) -> str:
+    if value is None:
+        return "n/a"
+    array = np.asarray(value)
+    if array.dtype.kind in "OUS":
+        return str(value)
+    if array.ndim == 0:
+        return f"{float(array):+.{precision}f}"
+    if array.ndim == 1:
+        return "[" + ", ".join(
+            f"{float(item):+.{precision}f}" for item in array
+        ) + "]"
+    return "[" + "; ".join(
+        "[" + ", ".join(f"{float(item):+.{precision}f}" for item in row) + "]"
+        for row in array
+    ) + "]"
+
+
+def capture_randomization_snapshot(
+    env,
+    args: argparse.Namespace,
+    manual_trim_override: float | None = None,
+) -> dict[str, Any]:
+    """Capture the effective flags and the values sampled by gym-duckietown."""
+    raw_env = getattr(env, "unwrapped", env)
+    settings = getattr(raw_env, "randomization_settings", {})
+    if not isinstance(settings, dict):
+        settings = {}
+
+    camera_model = getattr(raw_env, "camera_model", None)
+    camera = {
+        "available": camera_model is not None,
+        "camera_matrix": None,
+        "distortion_coefs": None,
+        "new_camera_matrix": None,
+        "width": None,
+        "height": None,
+    }
+    if camera_model is not None:
+        def camera_array(name: str):
+            value = getattr(camera_model, name, None)
+            return None if value is None else np.asarray(value).tolist()
+
+        camera.update(
+            {
+                "camera_matrix": camera_array("camera_matrix"),
+                "distortion_coefs": camera_array("distortion_coefs"),
+                "new_camera_matrix": camera_array("new_camera_matrix"),
+                "width": int(getattr(camera_model, "W", 0)) or None,
+                "height": int(getattr(camera_model, "H", 0)) or None,
+            }
+        )
+
+    return {
+        "parameters": {
+            "frame_rate": int(args.frame_rate),
+            "frame_skip": int(args.frame_skip),
+            "camera_width": int(args.camera_width),
+            "camera_height": int(args.camera_height),
+            "max_steps": int(args.max_steps),
+            "robot_speed": args.robot_speed,
+            "accept_start_angle_deg": float(args.accept_start_angle_deg),
+        },
+        "evaluation_flags": {
+            "domain_rand": bool(args.domain_rand),
+            "dynamics_rand": bool(args.dynamics_rand),
+            "camera_rand": bool(args.camera_rand),
+            "distortion": bool(args.distortion),
+        },
+        "environment_flags": {
+            "domain_rand": bool(getattr(raw_env, "domain_rand", False)),
+            "dynamics_rand": bool(getattr(raw_env, "dynamics_rand", False)),
+            "camera_rand": bool(getattr(raw_env, "camera_rand", False)),
+            "distortion": bool(getattr(raw_env, "distortion", False)),
+        },
+        "training_flags": dict(args.training_randomization),
+        "manual_overrides": {"trim": manual_trim_override},
+        "reset_settings": dict(settings),
+        "camera": camera,
+        "camera_pose": {
+            "height": getattr(raw_env, "cam_height", None),
+            "angle": getattr(raw_env, "cam_angle", None),
+            "fov_y": getattr(raw_env, "cam_fov_y", None),
+        },
+    }
+
+
+def randomization_panel_columns(
+    snapshot: dict[str, Any],
+) -> tuple[
+    list[tuple[str, int, tuple, bool]],
+    list[tuple[str, int, tuple, bool]],
+    list[tuple[str, int, tuple, bool]],
+]:
+    parameters = snapshot["parameters"]
+    evaluation_flags = snapshot["evaluation_flags"]
+    environment_flags = snapshot["environment_flags"]
+    training_flags = snapshot["training_flags"]
+    summary_lines = [
+        ("randomization", 13, ACCENT, True),
+        (
+            "eval args "
+            + " ".join(
+                f"{name}={'on' if enabled else 'off'}"
+                for name, enabled in evaluation_flags.items()
+            ),
+            12,
+            MUTED,
+            False,
+        ),
+        (
+            "checkpoint train "
+            + " ".join(
+                f"{name}={'on' if enabled else 'off'}"
+                for name, enabled in training_flags.items()
+            ),
+            12,
+            MUTED,
+            False,
+        ),
+        (
+            "env actual "
+            + " ".join(
+                f"{name}={'on' if enabled else 'off'}"
+                for name, enabled in environment_flags.items()
+            ),
+            12,
+            GOOD,
+            False,
+        ),
+        (
+            f"params {parameters['frame_rate']}Hz "
+            f"skip={parameters['frame_skip']} "
+            f"camera={parameters['camera_width']}x{parameters['camera_height']} "
+            f"max steps={parameters['max_steps']} "
+            f"robot speed={parameters['robot_speed']}",
+            12,
+            MUTED,
+            False,
+        ),
+    ]
+
+    reset_lines: list[tuple[str, int, tuple, bool]] = []
+    settings = snapshot["reset_settings"]
+    manual_trim_override = snapshot["manual_overrides"]["trim"]
+    if manual_trim_override is not None:
+        reset_lines.append(
+            (
+                "manual trim override "
+                + compact_randomization_value(manual_trim_override),
+                12,
+                ACCENT,
+                True,
+            )
+        )
+    if settings:
+        randomization_enabled = any(evaluation_flags.values())
+        reset_lines.append(
+            (
+                "reset samples" if randomization_enabled else "reset samples (inactive)",
+                12,
+                TEXT,
+                True,
+            )
+        )
+        setting_labels = (
+            ("trim", "trim"),
+            ("camera_height", "cam height"),
+            ("camera_angle", "cam angle"),
+            ("camera_fov_y", "cam fov"),
+            ("camera_noise", "cam noise"),
+            ("light_pos", "light"),
+            ("horz_mode", "horizon"),
+        )
+        for key, label in setting_labels:
+            if key in settings:
+                reset_lines.append(
+                    (
+                        f"{label} {compact_randomization_value(settings[key])}",
+                        12,
+                        MUTED,
+                        False,
+                    )
+                )
+
+    camera_lines: list[tuple[str, int, tuple, bool]] = []
+    camera = snapshot["camera"]
+    camera_pose = snapshot["camera_pose"]
+    if any(value is not None for value in camera_pose.values()):
+        camera_lines.extend(
+            [
+                ("camera pose (actual)", 12, TEXT, True),
+                (
+                    f"height {compact_randomization_value(camera_pose['height'])} "
+                    f"angle {compact_randomization_value(camera_pose['angle'])} "
+                    f"fov_y {compact_randomization_value(camera_pose['fov_y'])}",
+                    12,
+                    MUTED,
+                    False,
+                ),
+            ]
+        )
+    if camera["available"]:
+        camera_lines.extend(
+            [
+                ("camera calibration (fixed env)", 12, TEXT, True),
+                (
+                    f"K {camera['width']}x{camera['height']}",
+                    12,
+                    MUTED,
+                    False,
+                ),
+            ]
+        )
+        if camera["camera_matrix"] is not None:
+            camera_lines.append(
+                (
+                    "K " + compact_randomization_value(camera["camera_matrix"], precision=2),
+                    11,
+                    MUTED,
+                    False,
+                )
+            )
+        if camera["distortion_coefs"] is not None:
+            camera_lines.append(
+                (
+                    "D " + compact_randomization_value(camera["distortion_coefs"], precision=4),
+                    11,
+                    MUTED,
+                    False,
+                )
+            )
+        if camera["new_camera_matrix"] is not None:
+            camera_lines.append(
+                (
+                    "new K " + compact_randomization_value(
+                        camera["new_camera_matrix"],
+                        precision=2,
+                    ),
+                    11,
+                    MUTED,
+                    False,
+                )
+            )
+    else:
+        camera_lines.append(("camera calibration n/a", 12, MUTED, False))
+
+    return summary_lines, camera_lines, reset_lines
+
+
+def randomization_line_height(font_size: int) -> int:
+    return max(20, font_size + 10)
+
+
+def randomization_panel_height(snapshot: dict[str, Any]) -> int:
+    summary_lines, camera_lines, reset_lines = randomization_panel_columns(snapshot)
+    summary_height = sum(
+        randomization_line_height(font_size)
+        for _, font_size, _, _ in summary_lines
+    )
+    details_height = max(
+        sum(randomization_line_height(font_size) for _, font_size, _, _ in column)
+        for column in (camera_lines, reset_lines)
+    )
+    return (
+        summary_height
+        + RANDOMIZATION_SECTION_GAP
+        + details_height
+        + 2 * RANDOMIZATION_PANEL_PADDING
+    )
+
+
+def draw_randomization_panel(
+    snapshot: dict[str, Any],
+    width: int,
+    height: int,
+) -> None:
+    draw_rect(0, 0, width, height, SIDEBAR_BG)
+    summary_lines, left_lines, right_lines = randomization_panel_columns(snapshot)
+    cursor_y = height - RANDOMIZATION_PANEL_PADDING - 2
+    for text, font_size, color, bold in summary_lines:
+        draw_label(
+            text,
+            RANDOMIZATION_PANEL_PADDING,
+            cursor_y,
+            font_size=font_size,
+            color=color,
+            bold=bold,
+        )
+        cursor_y -= randomization_line_height(font_size)
+    cursor_y -= RANDOMIZATION_SECTION_GAP
+    column_positions = (
+        RANDOMIZATION_PANEL_PADDING,
+        width // 2 + RANDOMIZATION_PANEL_COLUMN_GAP // 2,
+    )
+    for lines, x in zip((left_lines, right_lines), column_positions):
+        column_y = cursor_y
+        for text, font_size, color, bold in lines:
+            draw_label(text, x, column_y, font_size=font_size, color=color, bold=bold)
+            column_y -= randomization_line_height(font_size)
+
+
 def draw_sidebar(
     state: ViewerState,
     args: argparse.Namespace,
     checkpoint_step: int,
     x: int,
     height: int,
+    bottom_y: int,
 ) -> None:
-    draw_rect(x, 0, SIDEBAR_WIDTH, height, SIDEBAR_BG)
+    draw_rect(x, bottom_y, SIDEBAR_WIDTH, height - bottom_y, SIDEBAR_BG)
     status = "paused" if state.paused else "running"
     mode = "stochastic" if args.stochastic else "deterministic"
     status_color = BAD if state.paused else GOOD
@@ -481,6 +786,8 @@ def draw_sidebar(
 
     cursor_y = height - 30
     for text, font_size, color, bold in lines:
+        if cursor_y < bottom_y + RANDOMIZATION_PANEL_PADDING:
+            break
         if text:
             draw_label(
                 text,
@@ -497,6 +804,7 @@ def draw_control_help(
     camera_bottom: int,
     image_width: int,
     has_evaluation_poses: bool,
+    trim_input: str | None,
 ) -> None:
     panel_y = camera_bottom - CONTROL_HELP_HEIGHT
     draw_rect(0, panel_y, image_width, CONTROL_HELP_HEIGHT, SIDEBAR_BG)
@@ -506,14 +814,28 @@ def draw_control_help(
         else "N or Shift+N: reset to a new random start"
     )
     lines = (
-        "Space: pause / resume    Backspace: reset and advance",
+        "Space: pause / resume    Backspace: reset current pose    T: set trim",
         navigation_help,
         "Enter: screenshot    Esc: exit",
     )
+    if trim_input is not None:
+        lines = (*lines, f"trim input: {trim_input or '_'}    Enter: apply    Esc: cancel")
     cursor_y = camera_bottom - 26
     for text in lines:
         draw_label(text, 14, cursor_y, font_size=11, color=MUTED)
         cursor_y -= 26
+
+
+def apply_manual_trim_override(env, trim: float) -> None:
+    """Rebuild the current reset state with an explicitly requested trim."""
+    import geometry
+    from duckietown_world import get_DB18_uncalibrated
+
+    raw_env = getattr(env, "unwrapped", env)
+    dynamics = get_DB18_uncalibrated(delay=0.15, trim=trim)
+    configuration = raw_env.cartesian_from_weird(raw_env.cur_pos, raw_env.cur_angle)
+    velocity = geometry.se2_from_linear_angular(np.zeros(2), 0)
+    raw_env.state = dynamics.initialize(c0=(configuration, velocity), t0=0)
 
 
 def default_returns_path() -> Path:
@@ -583,11 +905,6 @@ def main() -> None:
     env = make_env(args)
     configure_logging(args.log_level)
     _, _, image_width, image_height = import_simulator()
-    viewer_height = max(
-        image_height + 2 * CONTROL_HELP_HEIGHT,
-        MIN_VIEWER_HEIGHT,
-    )
-    image_y = (viewer_height - image_height) // 2
     reward_calculator = GymDuckietownRewardCalculator(
         args.reward_function,
         gamma=float(checkpoint_config.get("gamma", 0.99)),
@@ -595,6 +912,8 @@ def main() -> None:
     )
     random_reset_rng = np.random.default_rng(args.seed)
     last_random_reset_seed: int | None = None
+    randomization_snapshot: dict[str, Any] = {}
+    manual_trim_override: float | None = None
 
     def selected_evaluation_pose() -> TrainingPose | None:
         if selected_pose_index is None:
@@ -617,8 +936,9 @@ def main() -> None:
         *,
         pose_delta: int = 0,
         initial: bool = False,
+        repeat_current: bool = False,
     ) -> np.ndarray:
-        nonlocal selected_pose_index
+        nonlocal selected_pose_index, randomization_snapshot
         pose = selected_evaluation_pose()
         if pose is not None:
             selected_pose_index = cycle_pose_index(
@@ -637,9 +957,19 @@ def main() -> None:
             apply_env_start_pose(env, pose)
             reset_seed = int(args.seed)
         else:
-            reset_seed = next_random_reset_seed(initial=initial)
+            if repeat_current and last_random_reset_seed is not None:
+                reset_seed = last_random_reset_seed
+            else:
+                reset_seed = next_random_reset_seed(initial=initial)
 
         observation, _ = reset_raw(env, seed=reset_seed)
+        if manual_trim_override is not None:
+            apply_manual_trim_override(env, manual_trim_override)
+        randomization_snapshot = capture_randomization_snapshot(
+            env,
+            args,
+            manual_trim_override,
+        )
         if pose is not None:
             print(
                 f"evaluation_pose={selected_pose_index + 1}/{len(evaluation_poses)} "
@@ -655,6 +985,12 @@ def main() -> None:
 
     observation = reset_policy_environment(initial=True)
     reward_calculator.reset(env)
+    randomization_layout_snapshot = dict(randomization_snapshot)
+    randomization_layout_snapshot["manual_overrides"] = {"trim": 0.0}
+    randomization_height = randomization_panel_height(randomization_layout_snapshot)
+    main_viewer_height = image_height + CONTROL_HELP_HEIGHT
+    viewer_height = randomization_height + main_viewer_height
+    image_y = viewer_height - image_height
     history = initialize_history(
         observation,
         args,
@@ -673,6 +1009,9 @@ def main() -> None:
     current_episode_recorded = False
     paused = bool(args.start_paused)
     state = empty_state(episode, completed_returns, paused, learned_std)
+    trim_input_active = False
+    trim_input_text = ""
+    trim_input_ignore_next_text = False
 
     from pyglet import window as pyglet_window
     from pyglet.window import key
@@ -744,8 +1083,8 @@ def main() -> None:
         else "N/Shift+N selects a new random start"
     )
     print(
-        f"space pauses; backspace resets and advances; {navigation_help}; "
-        "enter saves screenshot; escape exits",
+        f"space pauses; backspace resets the current pose; {navigation_help}; "
+        "t sets trim; enter saves screenshot; escape exits",
         flush=True,
     )
 
@@ -770,10 +1109,16 @@ def main() -> None:
             flush=True,
         )
 
-    def start_next_episode(pose_delta: int = 1) -> None:
+    def start_next_episode(
+        pose_delta: int = 1,
+        repeat_current: bool = False,
+    ) -> None:
         nonlocal observation, episode, episode_length, selected_return, env_return
         nonlocal current_episode_recorded, state
-        observation = reset_policy_environment(pose_delta=pose_delta)
+        observation = reset_policy_environment(
+            pose_delta=pose_delta,
+            repeat_current=repeat_current,
+        )
         reward_calculator.reset(env)
         history.reset(
             preprocess(
@@ -793,10 +1138,40 @@ def main() -> None:
 
     @window.event
     def on_key_press(symbol, modifiers):
-        nonlocal paused, state
+        nonlocal paused, state, manual_trim_override
+        nonlocal trim_input_active, trim_input_text, trim_input_ignore_next_text
+        nonlocal randomization_snapshot
+        if trim_input_active:
+            if symbol in (key.ENTER, key.RETURN):
+                try:
+                    manual_trim_override = float(trim_input_text)
+                except ValueError:
+                    print(
+                        f"invalid trim value: {trim_input_text!r}",
+                        flush=True,
+                    )
+                    return
+                trim_input_active = False
+                trim_input_ignore_next_text = False
+                apply_manual_trim_override(env, manual_trim_override)
+                randomization_snapshot = capture_randomization_snapshot(
+                    env,
+                    args,
+                    manual_trim_override,
+                )
+                paused = True
+                state.paused = True
+                print(f"manual trim set to {manual_trim_override:+.6f}", flush=True)
+            elif symbol == key.BACKSPACE:
+                trim_input_text = trim_input_text[:-1]
+            elif symbol == key.ESCAPE:
+                trim_input_active = False
+                trim_input_ignore_next_text = False
+                print("trim input cancelled", flush=True)
+            return
         if symbol == key.SPACE:
             if state.done:
-                start_next_episode()
+                start_next_episode(pose_delta=0, repeat_current=True)
                 paused = False
             else:
                 paused = not paused
@@ -804,13 +1179,20 @@ def main() -> None:
             print("paused" if paused else "resumed", flush=True)
         elif symbol == key.BACKSPACE:
             record_current_episode("manual_reset", "manual-reset")
-            start_next_episode()
+            start_next_episode(pose_delta=0, repeat_current=True)
             print("reset", flush=True)
         elif symbol == key.N:
             direction = -1 if modifiers & key.MOD_SHIFT else 1
             reason = "previous-pose" if direction < 0 else "next-pose"
             record_current_episode("manual_reset", reason)
             start_next_episode(pose_delta=direction)
+        elif symbol == key.T:
+            paused = True
+            state.paused = True
+            trim_input_active = True
+            trim_input_text = ""
+            trim_input_ignore_next_text = True
+            print("trim input started", flush=True)
         elif symbol == key.RETURN:
             save_screenshot(window, args.screenshot_path)
         elif symbol == key.ESCAPE:
@@ -819,14 +1201,44 @@ def main() -> None:
             pyglet.app.exit()
 
     @window.event
+    def on_text(text):
+        nonlocal trim_input_text, trim_input_ignore_next_text
+        if not trim_input_active:
+            return
+        if trim_input_ignore_next_text and text.lower() == "t":
+            trim_input_ignore_next_text = False
+            return
+        trim_input_ignore_next_text = False
+        if text in "0123456789+-.eE":
+            trim_input_text += text
+
+    @window.event
     def on_draw():
         rgb = env.render(mode="rgb_array")
-        prepare_window_2d(window, image_width + SIDEBAR_WIDTH, viewer_height)
+        window_width = image_width + SIDEBAR_WIDTH
+        prepare_window_2d(window, window_width, viewer_height)
         window.clear()
-        draw_rect(0, 0, image_width + SIDEBAR_WIDTH, viewer_height, BACKGROUND)
+        draw_rect(0, 0, window_width, viewer_height, BACKGROUND)
         draw_rgb(rgb, 0, image_y, image_width, image_height)
-        draw_control_help(image_y, image_width, bool(evaluation_poses))
-        draw_sidebar(state, args, checkpoint_step, image_width, viewer_height)
+        draw_control_help(
+            image_y,
+            image_width,
+            bool(evaluation_poses),
+            trim_input_text if trim_input_active else None,
+        )
+        draw_sidebar(
+            state,
+            args,
+            checkpoint_step,
+            image_width,
+            viewer_height,
+            randomization_height,
+        )
+        draw_randomization_panel(
+            randomization_snapshot,
+            window_width,
+            randomization_height,
+        )
 
     def update(dt):
         del dt

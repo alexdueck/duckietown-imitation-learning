@@ -385,12 +385,15 @@ def reset_env(
     calculators,
     seed: int | None = None,
     start_pose: TrainingPose | None = None,
+    manual_trim_override: float | None = None,
 ) -> ViewerState:
     if start_pose is not None:
         apply_env_start_pose(env, start_pose)
     if seed is not None:
         env.seed(seed)
     env.reset()
+    if manual_trim_override is not None:
+        apply_manual_trim_override(env, manual_trim_override)
     raw_env = getattr(env, "unwrapped", env)
     if start_pose is not None and not raw_env._valid_pose(raw_env.cur_pos, raw_env.cur_angle):
         pose_label = start_pose.name or "unnamed"
@@ -406,6 +409,18 @@ def reset_env(
         {},
         reset_seed=seed,
     )
+
+
+def apply_manual_trim_override(env, trim: float) -> None:
+    """Rebuild the current reset state with an explicitly requested trim."""
+    import geometry
+    from duckietown_world import get_DB18_uncalibrated
+
+    raw_env = getattr(env, "unwrapped", env)
+    dynamics = get_DB18_uncalibrated(delay=0.15, trim=trim)
+    configuration = raw_env.cartesian_from_weird(raw_env.cur_pos, raw_env.cur_angle)
+    velocity = geometry.se2_from_linear_angular(np.zeros(2), 0)
+    raw_env.state = dynamics.initialize(c0=(configuration, velocity), t0=0)
 
 
 def capture_training_pose(env) -> TrainingPose:
@@ -551,6 +566,8 @@ def sidebar_lines(
     map_name: str,
     seed_input: str | None = None,
     pose_name_input: str | None = None,
+    trim_input: str | None = None,
+    manual_trim_override: float | None = None,
     pose_save_status: str | None = None,
     selected_start_pose: SelectableStartPose | None = None,
     selected_start_index: int | None = None,
@@ -563,6 +580,13 @@ def sidebar_lines(
         ("gym-duckietown rewards", 18, ACCENT, True),
         (f"map {map_name}", 13, MUTED, False),
         (f"reset seed {seed_label}", 13, MUTED, False),
+        (
+            "manual trim "
+            + (fmt(manual_trim_override, 6) if manual_trim_override is not None else "default"),
+            13,
+            ACCENT if manual_trim_override is not None else MUTED,
+            manual_trim_override is not None,
+        ),
         (
             (
                 f"start pose {selected_start_index + 1}/{start_pose_count} "
@@ -624,6 +648,8 @@ def sidebar_lines(
         lines.insert(3, (f"new seed > {seed_input}_", 15, ACCENT, True))
     if pose_name_input is not None:
         lines.insert(3, (f"go to pose > {pose_name_input}_", 15, ACCENT, True))
+    if trim_input is not None:
+        lines.insert(3, (f"trim > {trim_input}_", 15, ACCENT, True))
     if pose_save_status is not None:
         lines.insert(3, (pose_save_status, 13, ACCENT, True))
 
@@ -651,6 +677,8 @@ def draw_sidebar(
     height: int,
     seed_input: str | None = None,
     pose_name_input: str | None = None,
+    trim_input: str | None = None,
+    manual_trim_override: float | None = None,
     pose_save_status: str | None = None,
     selected_start_pose: SelectableStartPose | None = None,
     selected_start_index: int | None = None,
@@ -663,6 +691,8 @@ def draw_sidebar(
         map_name,
         seed_input,
         pose_name_input,
+        trim_input,
+        manual_trim_override,
         pose_save_status,
         selected_start_pose,
         selected_start_index,
@@ -673,14 +703,16 @@ def draw_sidebar(
         cursor_y -= max(16, font_size + 8)
 
 
-def draw_control_help(camera_bottom: int) -> None:
+def draw_control_help(camera_bottom: int, trim_input: str | None = None) -> None:
     lines = (
         "W/A/S/D or arrows: drive    Space: stop    Shift: boost",
         "P: save train pose    Shift+P: save eval pose",
         "N: next start pose    Shift+N: previous start pose    G: go to pose name",
-        "R: reset with seed    Backspace or /: reset current start pose",
+        "R: reset with seed    T: set trim    Backspace or /: reset current start pose",
         "Enter: screenshot    Esc: cancel input / exit",
     )
+    if trim_input is not None:
+        lines = (*lines, "trim input: Enter applies, Esc cancels")
     cursor_y = camera_bottom - 24
     for text in lines:
         draw_label(
@@ -738,9 +770,15 @@ def main() -> None:
     )
     action_controller = ManualActionController()
     paused_due_to_done = False
+    random_start_rng = np.random.default_rng(args.seed)
+    random_start_seeds = [int(args.seed)]
+    random_start_index = 0
     seed_input: str | None = None
     pose_name_input: str | None = None
+    trim_input: str | None = None
     ignore_pose_prompt_text = False
+    ignore_trim_prompt_text = False
+    manual_trim_override: float | None = None
     pose_save_status: str | None = None
 
     from pyglet import window as pyglet_window
@@ -765,8 +803,8 @@ def main() -> None:
         )
     print(
         "WASD or arrows drive; P/Shift+P save train/eval poses; "
-        "N/Shift+N select next/previous start pose; G selects by name; "
-        "R enters a reset seed; space stops; backspace or slash resets; "
+        "N/Shift+N select next/previous start; G selects a pose by name; "
+        "R enters a reset seed; T sets trim; space stops; backspace or slash resets; "
         "enter saves a screenshot; escape exits",
         flush=True,
     )
@@ -775,7 +813,12 @@ def main() -> None:
         nonlocal state, selected_start_index, paused_due_to_done, pose_save_status
         selected_start_index = index % len(start_poses)
         entry = start_poses[selected_start_index]
-        state = reset_env(env, calculators, start_pose=entry.pose)
+        state = reset_env(
+            env,
+            calculators,
+            start_pose=entry.pose,
+            manual_trim_override=manual_trim_override,
+        )
         action_controller.reset()
         pressed_keys.clear()
         paused_due_to_done = False
@@ -789,10 +832,74 @@ def main() -> None:
             flush=True,
         )
 
+    def reset_to_random_start(direction: int, reason: str) -> None:
+        nonlocal state, paused_due_to_done, pose_save_status, random_start_index
+        if direction < 0 and random_start_index > 0:
+            random_start_index -= 1
+        elif direction > 0:
+            if random_start_index + 1 == len(random_start_seeds):
+                while True:
+                    seed = int(random_start_rng.integers(0, np.iinfo(np.int32).max))
+                    if seed not in random_start_seeds:
+                        random_start_seeds.append(seed)
+                        break
+            random_start_index += 1
+
+        seed = random_start_seeds[random_start_index]
+        state = reset_env(
+            env,
+            calculators,
+            seed=seed,
+            manual_trim_override=manual_trim_override,
+        )
+        action_controller.reset()
+        pressed_keys.clear()
+        paused_due_to_done = False
+        pose_save_status = (
+            f"{reason}: random seed {seed} "
+            f"({random_start_index + 1}/{len(random_start_seeds)})"
+        )
+        print(
+            f"selected random_start={random_start_index + 1}/{len(random_start_seeds)} "
+            f"seed={seed}",
+            flush=True,
+        )
+
     @window.event
     def on_key_press(symbol, modifiers):
         nonlocal state, paused_due_to_done, seed_input, pose_name_input
-        nonlocal ignore_pose_prompt_text, pose_save_status
+        nonlocal trim_input, manual_trim_override
+        nonlocal ignore_pose_prompt_text, ignore_trim_prompt_text, pose_save_status
+        nonlocal random_start_seeds, random_start_index
+        if trim_input is not None:
+            if symbol == key.BACKSPACE:
+                trim_input = trim_input[:-1]
+            elif symbol in (key.ENTER, key.RETURN) and trim_input:
+                try:
+                    manual_trim_override = float(trim_input)
+                except ValueError:
+                    pose_save_status = "invalid trim; enter a number"
+                    print(f"Invalid trim value: {trim_input!r}", flush=True)
+                    return
+                trim_input = None
+                ignore_trim_prompt_text = False
+                apply_manual_trim_override(env, manual_trim_override)
+                action_controller.reset()
+                pressed_keys.clear()
+                state = replace(
+                    state,
+                    action=np.zeros(2, dtype=np.float32),
+                    lane_metrics=get_lane_metrics(env),
+                    current_pose=current_pose(env),
+                )
+                pose_save_status = f"manual trim set to {manual_trim_override:+.6f}"
+                print(f"manual trim set to {manual_trim_override:+.6f}", flush=True)
+            elif symbol == key.ESCAPE:
+                trim_input = None
+                ignore_trim_prompt_text = False
+                print("trim input cancelled", flush=True)
+            return
+
         if pose_name_input is not None:
             if symbol == key.BACKSPACE:
                 pose_name_input = pose_name_input[:-1]
@@ -826,10 +933,14 @@ def main() -> None:
                         selected_start_pose().pose
                         if selected_start_pose() is not None else None
                     ),
+                    manual_trim_override=manual_trim_override,
                 )
                 action_controller.reset()
                 pressed_keys.clear()
                 paused_due_to_done = False
+                if not start_poses:
+                    random_start_seeds = [seed]
+                    random_start_index = 0
                 seed_input = None
                 print(f"reset seed={seed}", flush=True)
             elif symbol == key.ESCAPE:
@@ -838,6 +949,13 @@ def main() -> None:
 
         if symbol == key.R:
             seed_input = ""
+            action_controller.reset()
+            pressed_keys.clear()
+            return
+
+        if symbol == key.T:
+            trim_input = ""
+            ignore_trim_prompt_text = True
             action_controller.reset()
             pressed_keys.clear()
             return
@@ -858,8 +976,8 @@ def main() -> None:
                 return
             pressed_keys.add(symbol)
             if not start_poses or selected_start_index is None:
-                pose_save_status = "no start poses loaded"
-                print("Cannot browse poses without --start-poses", flush=True)
+                direction = -1 if modifiers & key.MOD_SHIFT else 1
+                reset_to_random_start(direction, "selected")
             else:
                 direction = -1 if modifiers & key.MOD_SHIFT else 1
                 reset_to_start_pose(selected_start_index + direction, "selected")
@@ -913,7 +1031,9 @@ def main() -> None:
             state = reset_env(
                 env,
                 calculators,
+                seed=(state.reset_seed if active_start is None else None),
                 start_pose=active_start.pose if active_start is not None else None,
+                manual_trim_override=manual_trim_override,
             )
             action_controller.reset()
             paused_due_to_done = False
@@ -927,7 +1047,8 @@ def main() -> None:
 
     @window.event
     def on_text(text):
-        nonlocal seed_input, pose_name_input, ignore_pose_prompt_text
+        nonlocal seed_input, pose_name_input, trim_input
+        nonlocal ignore_pose_prompt_text, ignore_trim_prompt_text
         if seed_input is not None:
             digits = "".join(character for character in text if character.isdigit())
             seed_input = (seed_input + digits)[:20]
@@ -942,6 +1063,15 @@ def main() -> None:
                 if character.isprintable() and character not in "\r\n"
             )
             pose_name_input = (pose_name_input + printable)[:100]
+        elif trim_input is not None:
+            if ignore_trim_prompt_text:
+                ignore_trim_prompt_text = False
+                if text.lower() == "t":
+                    return
+            valid = "".join(
+                character for character in text if character in "0123456789+-.eE"
+            )
+            trim_input = (trim_input + valid)[:32]
 
     @window.event
     def on_key_release(symbol, modifiers):
@@ -954,24 +1084,31 @@ def main() -> None:
         window.clear()
         draw_rect(0, 0, image_width + SIDEBAR_WIDTH, viewer_height, BACKGROUND)
         draw_rgb(rgb, 0, image_y, image_width, image_height)
-        draw_control_help(image_y)
+        draw_control_help(image_y, trim_input)
         active_start = selected_start_pose()
         draw_sidebar(
             state,
             args.map_name,
             image_width,
             viewer_height,
-            seed_input,
-            pose_name_input,
-            pose_save_status,
-            active_start,
-            selected_start_index,
-            len(start_poses),
+            seed_input=seed_input,
+            pose_name_input=pose_name_input,
+            trim_input=trim_input,
+            manual_trim_override=manual_trim_override,
+            pose_save_status=pose_save_status,
+            selected_start_pose=active_start,
+            selected_start_index=selected_start_index,
+            start_pose_count=len(start_poses),
         )
 
     def update(dt):
         nonlocal state, paused_due_to_done
-        if paused_due_to_done or seed_input is not None or pose_name_input is not None:
+        if (
+            paused_due_to_done
+            or seed_input is not None
+            or pose_name_input is not None
+            or trim_input is not None
+        ):
             return
 
         action = action_controller.update(pressed_keys, key, args, dt)
@@ -990,12 +1127,16 @@ def main() -> None:
             print(f"done step={state.step_count} reason={state.done_reason}", flush=True)
             if args.auto_reset:
                 active_start = selected_start_pose()
-                state = reset_env(
-                    env,
-                    calculators,
-                    start_pose=active_start.pose if active_start is not None else None,
-                )
-                action_controller.reset()
+                if active_start is None:
+                    reset_to_random_start(1, "auto reset")
+                else:
+                    state = reset_env(
+                        env,
+                        calculators,
+                        start_pose=active_start.pose,
+                        manual_trim_override=manual_trim_override,
+                    )
+                    action_controller.reset()
             else:
                 action_controller.reset()
                 paused_due_to_done = True

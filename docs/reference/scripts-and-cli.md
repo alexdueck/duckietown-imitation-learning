@@ -47,6 +47,7 @@ Platform setup and complete workflows remain in the linked guides.
 | Script | Use it to | Runs in |
 | --- | --- | --- |
 | [`analyze_rl_training_run.py`](#analyze_rl_training_runpy) | Generate an HTML report from PPO CSV logs | Any environment with its analysis dependencies |
+| [`evaluate_trim_sensitivity.py`](#evaluate_trim_sensitivitypy) | Compare PPO policies over fixed poses and explicit Duckiebot trims | gym-duckietown environment |
 
 ## Data Collection and Inspection
 
@@ -395,6 +396,46 @@ python analyze_rl_training_run.py \
 | `--diagnostic-window` | Number of first/last PPO updates/rollouts compared |
 | `--rolling-window` | Smoothing window for chart lines |
 | `--no-open` | Generate without opening a browser |
+
+### `evaluate_trim_sensitivity.py`
+
+Runs one or more PPO checkpoints over the Cartesian product of configured
+start poses, explicit trim values, repeats, and optional temporal-history
+ablations. Each corresponding scenario uses the same reset seed for every
+checkpoint and trim, making the comparison paired rather than merely similar.
+
+```bash
+cp template_configs/trim_sensitivity_config.template.json \
+   configs/trim_sensitivity_config.json
+
+python evaluate_trim_sensitivity.py \
+  --config configs/trim_sensitivity_config.json
+```
+
+The JSON config controls the checkpoints, trim grid, start-pose config,
+selected pose sources or names, environment overrides, evaluation horizon,
+output directory, and report behavior. CLI options override their matching
+JSON values; repeat `--checkpoint NAME=PATH`, `--trim`, `--pose-name`, or
+`--history-mode` to replace the respective configured list.
+
+The default `native` history mode evaluates each policy normally. Temporal
+checkpoints can additionally use `zero_action_history`,
+`current_frame_zero_actions`, or `reversed_action_history` as diagnostic
+ablations. Single-frame checkpoints always use `native`.
+
+Outputs:
+
+- `episodes.csv`: one row per checkpoint/trim/pose/repeat, including signed
+  and absolute lane-distance drift rates
+- `steps.csv`: actions, rewards, lane state, and pose per step when enabled
+- `summary.csv`: aggregate metrics per checkpoint, history mode, and trim
+- `scenario_summary.csv`: the same metrics split by start pose
+- `trim_sensitivity_report.html`: standalone charts and result tables
+- `config.json`: fully resolved evaluator configuration
+
+`dynamics_rand` must remain false because the requested trim is installed
+explicitly after every reset. Visual and camera randomization can be enabled,
+but are off in the template so trim is isolated as the independent variable.
 
 ## Common CLI Conventions
 

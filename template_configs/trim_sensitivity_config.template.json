@@ -1,0 +1,59 @@
+{
+  "checkpoints": [
+    {
+      "name": "single_frame",
+      "path": "~/duckietown/checkpoints/rl_ppo_gym_duckietown/SINGLE_FRAME_RUN/best_return.pt"
+    },
+    {
+      "name": "temporal_mlp",
+      "path": "~/duckietown/checkpoints/rl_ppo_gym_duckietown/TEMPORAL_RUN/best_return.pt"
+    }
+  ],
+  "trims": [
+    -0.2,
+    -0.15,
+    -0.1,
+    -0.08,
+    -0.06,
+    -0.04,
+    -0.02,
+    0.0,
+    0.02,
+    0.04,
+    0.06,
+    0.08,
+    0.1,
+    0.15,
+    0.2
+  ],
+  "start_config": "configs/gym_duckietown_start_poses.json",
+  "pose_sources": [
+    "evaluation"
+  ],
+  "pose_names": [],
+  "history_modes": [
+    "native"
+  ],
+  "output_dir": "~/duckietown/data/evaluations/trim_sensitivity/single_vs_temporal",
+  "max_steps": 500,
+  "repeats": 1,
+  "seed": 42,
+  "device": "auto",
+  "reward_function": null,
+  "vd2pp_distance_weight": null,
+  "domain_rand": false,
+  "dynamics_rand": false,
+  "camera_rand": false,
+  "distortion": false,
+  "frame_rate": null,
+  "frame_skip": null,
+  "camera_width": null,
+  "camera_height": null,
+  "robot_speed": null,
+  "accept_start_angle_deg": null,
+  "stochastic": false,
+  "record_step_history": true,
+  "open_report": false,
+  "overwrite": false,
+  "log_level": "WARNING"
+}

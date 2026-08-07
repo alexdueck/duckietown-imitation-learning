@@ -97,6 +97,32 @@ python live_eval_rl_policy_gym_duckietown.py \
 The sidebar shows the reward used during training and its components by
 default. `--stop-on-done` preserves the final frame and return for inspection.
 
+## Trim Sensitivity
+
+Use `evaluate_trim_sensitivity.py` for a controlled sweep over explicit
+Duckiebot trim values. The evaluator uses exact configured poses and derives a
+stable reset seed from the master seed, pose index, and repeat. That seed is
+reused across all checkpoints and trim values for the same scenario.
+
+The primary comparisons are:
+
+- safe and invalid-pose rates versus trim
+- reward per step versus trim
+- mean and maximum absolute lane distance
+- lane-distance drift slope in meters per second
+- heading error and steering compensation
+
+Evaluate single-frame and temporal policies in the same config to compare
+robustness directly. For a temporal policy, history ablations can test whether
+performance really depends on previous frames and actions. In particular,
+`current_frame_zero_actions` removes both sources of temporal evidence while
+preserving the checkpoint architecture.
+
+Domain, camera, and distortion randomization are disabled in the template.
+This isolates trim sensitivity. A separate randomized sweep is useful later,
+but it answers a broader robustness question and generally needs multiple
+repeats.
+
 ## Reporting a Result
 
 At minimum report:

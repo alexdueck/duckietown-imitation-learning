@@ -110,6 +110,26 @@ Rules:
 When this config is supplied to the trainer, configured evaluation scenarios
 come exclusively from `evaluation_poses`; `--eval-seeds` is not used.
 
+## Trim-Sensitivity Configuration
+
+Create a local evaluator config from the versioned template:
+
+```bash
+cp template_configs/trim_sensitivity_config.template.json \
+   configs/trim_sensitivity_config.json
+```
+
+At minimum, replace the checkpoint paths, select the desired pose config, and
+choose a unique `output_dir`. The evaluator accepts most settings from this
+JSON file; explicit CLI options take precedence. An empty `pose_names` list
+means all poses from the configured `pose_sources` are used.
+
+The template deliberately sets all environment randomization flags to false.
+It then varies only the explicitly configured trim while keeping reset seeds
+paired across checkpoints and trim values. `dynamics_rand=true` is rejected,
+because a random trim and an explicit trim in the same episode would make the
+experimental variable ambiguous.
+
 ## Training Start Sampling
 
 When a start config is present, the trainer adapts two distributions after

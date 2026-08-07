@@ -53,6 +53,15 @@ GOOD = (132, 210, 142, 255)
 BAD = (238, 118, 118, 255)
 
 
+def environment_step_interval_seconds(frame_rate: float, frame_skip: int) -> float:
+    """Return wall time per env.step() for real-time simulator playback."""
+    if frame_rate <= 0:
+        raise ValueError("--frame-rate must be positive")
+    if frame_skip <= 0:
+        raise ValueError("--frame-skip must be positive")
+    return float(frame_skip) / float(frame_rate)
+
+
 @dataclass(frozen=True)
 class CurrentPose:
     position: tuple[float, float, float]
@@ -738,6 +747,10 @@ def save_screenshot(window, path: Path) -> None:
 def main() -> None:
     args = parse_args()
     configure_logging(args.log_level)
+    environment_step_interval = environment_step_interval_seconds(
+        args.frame_rate,
+        args.frame_skip,
+    )
     try:
         start_poses = (
             load_selectable_start_poses(args.start_poses, args.map_name)
@@ -1143,7 +1156,7 @@ def main() -> None:
                 action_controller.reset()
                 paused_due_to_done = True
 
-    pyglet.clock.schedule_interval(update, 1.0 / float(args.frame_rate))
+    pyglet.clock.schedule_interval(update, environment_step_interval)
     try:
         pyglet.app.run()
     finally:

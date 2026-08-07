@@ -48,6 +48,7 @@ from manual_control_gym_duckietown import (
     draw_label,
     draw_rect,
     draw_rgb,
+    environment_step_interval_seconds,
     import_simulator,
     make_env,
     prepare_window_2d,
@@ -896,8 +897,10 @@ def main() -> None:
         raise ValueError("--max-steps must be positive")
     if args.episodes < 0:
         raise ValueError("--episodes must be non-negative")
-    if args.frame_rate <= 0:
-        raise ValueError("--frame-rate must be positive")
+    environment_step_interval = environment_step_interval_seconds(
+        args.frame_rate,
+        args.frame_skip,
+    )
 
     transform = make_transform()
     returns_path = args.returns_file or default_returns_path()
@@ -1321,7 +1324,7 @@ def main() -> None:
         else:
             start_next_episode()
 
-    pyglet.clock.schedule_interval(update, 1.0 / float(args.frame_rate))
+    pyglet.clock.schedule_interval(update, environment_step_interval)
     try:
         pyglet.app.run()
     except KeyboardInterrupt:

@@ -73,7 +73,6 @@
   "frame_rate": 30,
   "robot_speed": null,
   "accept_start_angle_deg": 4.0,
-  "simulator_max_steps": null,
   "camera_width": 640,
   "camera_height": 480,
   "render_training": false,

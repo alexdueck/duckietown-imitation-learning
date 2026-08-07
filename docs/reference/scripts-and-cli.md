@@ -227,7 +227,7 @@ runs.
 | Group | Parameters | Meaning |
 | --- | --- | --- |
 | Run/output | `--output-dir`, `--exp-name`, `--seed`, `--device`, `--log-level` | Name and locate the run; configure reproducibility/runtime |
-| Environment | `--map-name`, `--frame-skip`, `--frame-rate`, `--robot-speed`, `--simulator-max-steps`, `--camera-width`, `--camera-height` | Configure gym-duckietown |
+| Environment | `--map-name`, `--frame-skip`, `--frame-rate`, `--robot-speed`, `--camera-width`, `--camera-height` | Configure gym-duckietown |
 | Domain variation | `--domain-rand`, `--dynamics-rand`, `--camera-rand`, `--distortion`, and their `--no-*` forms | Configure built-in gym-duckietown randomization; all four default on |
 | Reward | `--reward-function`, `--vd2pp-distance-weight` | Select the optimized reward and its optional distance term |
 | Model/input | `--model`, `--image-size`, `--crop-y-start`, `--source-observation-channel-order`, `--observation-history-length`, `--action-history-length`, `--temporal-hidden-dim`, `--temporal-head-mode` | Select encoder, preprocessing, and fixed-history architecture; direct temporal MLP is the default |

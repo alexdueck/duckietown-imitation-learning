@@ -184,7 +184,6 @@ class PPOConfig:
     frame_rate: int
     robot_speed: float | None
     accept_start_angle_deg: float
-    simulator_max_steps: int | None
     camera_width: int
     camera_height: int
     render_training: bool
@@ -501,12 +500,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--frame-rate", type=int, default=30)
     parser.add_argument("--robot-speed", type=float, default=None)
     parser.add_argument("--accept-start-angle-deg", type=float, default=4.0)
-    parser.add_argument(
-        "--simulator-max-steps",
-        type=int,
-        default=None,
-        help="gym-duckietown Simulator max_steps. Defaults to --max-episode-steps when positive.",
-    )
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
     parser.add_argument(
@@ -1144,9 +1137,11 @@ def make_env(args: argparse.Namespace, seed: int | None = None):
 
     patch_duckietown_world_dynamics()
 
-    simulator_max_steps = args.simulator_max_steps
-    if simulator_max_steps is None:
-        simulator_max_steps = args.max_episode_steps if args.max_episode_steps > 0 else 100_000_000
+    simulator_max_steps = (
+        args.max_episode_steps * args.frame_skip
+        if args.max_episode_steps > 0
+        else 100_000_000
+    )
 
     robot_speed = DEFAULT_ROBOT_SPEED if args.robot_speed is None else args.robot_speed
     environment_seed = args.seed if seed is None else seed
@@ -1724,6 +1719,10 @@ def main() -> None:
     )
     if args.temporal_hidden_dim <= 0:
         raise ValueError("--temporal-hidden-dim must be positive")
+    if args.max_episode_steps < 0:
+        raise ValueError("--max-episode-steps must be non-negative")
+    if args.frame_skip <= 0:
+        raise ValueError("--frame-skip must be positive")
     if args.camera_rand and not args.distortion:
         raise ValueError("--camera-rand requires --distortion in gym-duckietown 6.2.0")
     adaptive_settings = AdaptiveStartSamplingSettings(

@@ -70,7 +70,6 @@ class RandomizationConfigTests(unittest.TestCase):
         args = SimpleNamespace(
             seed=42,
             map_name="loop_empty",
-            simulator_max_steps=None,
             max_episode_steps=100,
             robot_speed=None,
             domain_rand=True,
@@ -92,7 +91,35 @@ class RandomizationConfigTests(unittest.TestCase):
 
         self.assertEqual(env.randomizer.randomization_config["trim"], UNIFORM_TRIM["trim"])
         self.assertTrue(env.kwargs["dynamics_rand"])
+        self.assertEqual(env.kwargs["max_steps"], 100)
         reset.assert_called_once_with(env, seed=7)
+
+    def test_make_env_scales_simulator_limit_by_frame_skip(self) -> None:
+        simulator_module = ModuleType("gym_duckietown.simulator")
+        simulator_module.DEFAULT_ROBOT_SPEED = 1.2
+        simulator_module.Simulator = FakeSimulator
+        args = SimpleNamespace(
+            seed=42,
+            map_name="loop_empty",
+            max_episode_steps=100,
+            robot_speed=None,
+            domain_rand=False,
+            dynamics_rand=False,
+            camera_rand=False,
+            frame_rate=30,
+            frame_skip=3,
+            camera_width=640,
+            camera_height=480,
+            accept_start_angle_deg=4.0,
+            distortion=False,
+            randomization_config={},
+        )
+
+        with patch.dict(sys.modules, {"gym_duckietown.simulator": simulator_module}):
+            with patch.object(trainer, "patch_duckietown_world_dynamics"):
+                env = trainer.make_env(args)
+
+        self.assertEqual(env.kwargs["max_steps"], 300)
 
     def test_resume_prefers_explicit_randomization_config(self) -> None:
         args = trainer.build_arg_parser().parse_args([])

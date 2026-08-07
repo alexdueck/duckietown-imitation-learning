@@ -689,7 +689,6 @@ def environment_args(
     return SimpleNamespace(
         seed=config.seed,
         map_name=map_name,
-        simulator_max_steps=config.max_steps,
         max_episode_steps=config.max_steps,
         robot_speed=checkpoint_value(
             config.robot_speed,

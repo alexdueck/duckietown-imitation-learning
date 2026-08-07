@@ -51,6 +51,10 @@ episode but does not force a PPO update. Episode outcomes also update the
 [adaptive start sampler](adaptive-start-sampling.md) when curated starts are
 configured.
 
+This limit counts policy actions, or equivalently calls to `env.step()`. Because
+gym-duckietown counts every internal physics update, the trainer passes
+`max_episode_steps * frame_skip` as the simulator's internal `max_steps` value.
+
 ## GAE
 
 Advantages are computed backward using:

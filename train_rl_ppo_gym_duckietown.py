@@ -276,7 +276,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reward-function",
         choices=REWARD_FUNCTION_CHOICES,
-        default="posangle",
+        default="velopose",
         help="Reward function optimized by PPO.",
     )
     parser.add_argument(

@@ -31,7 +31,7 @@ a JSON configuration. Create the local default from the complete versioned
 template:
 
 ```bash
-cp configs/train_config.template.json configs/train_config.json
+cp template_configs/train_config.template.json configs/train_config.json
 ```
 
 `train_rl_ppo_gym_duckietown.py` loads `configs/train_config.json`
@@ -64,12 +64,42 @@ used. A path supplied explicitly with `--train-config` must exist. The complete
 template intentionally contains every supported setting, so it doubles as a
 fairly large but honest menu.
 
+### Randomizer Overrides
+
+`randomization_config` contains optional overrides merged into
+gym-duckietown's built-in `default_dr.json`. An empty object keeps all library
+defaults. The versioned template demonstrates a bounded uniform trim:
+
+```json
+{
+  "randomization_config": {
+    "trim": {
+      "type": "uniform",
+      "low": -0.1,
+      "high": 0.1
+    }
+  }
+}
+```
+
+The supported distribution types in gym-duckietown 6.2.0 are `int`, `normal`,
+and `uniform`. The trainer validates the JSON, overlays it on the installed
+randomizer, and resets once more because `Simulator()` performs an initial
+reset before the override can be installed. The repeated reset uses the same
+environment seed.
+
+Gym-duckietown samples `trim` on every reset, but only applies the sampled trim
+to its dynamics model when `dynamics_rand` is `true`. During resumed training,
+explicit randomization values from the selected JSON or command line override
+checkpoint values. Unspecified values continue to be restored from the
+checkpoint.
+
 ## Start Configuration
 
 Create a local file from the versioned template:
 
 ```bash
-cp configs/gym_duckietown_start_poses.json.template \
+cp template_configs/gym_duckietown_start_poses.json.template \
    configs/gym_duckietown_start_poses.json
 ```
 

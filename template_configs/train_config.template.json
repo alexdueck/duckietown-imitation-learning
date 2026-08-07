@@ -6,7 +6,7 @@
     "small_loop",
     "zigzag_dists"
   ],
-  "reward_function": "posangle",
+  "reward_function": "velopose",
   "vd2pp_distance_weight": 1.0,
   "model": "mobilenet_v3_small",
   "imitation_checkpoint": null,
@@ -62,6 +62,13 @@
   "dynamics_rand": true,
   "camera_rand": true,
   "distortion": true,
+  "randomization_config": {
+    "trim": {
+      "type": "uniform",
+      "low": -0.1,
+      "high": 0.1
+    }
+  },
   "frame_skip": 1,
   "frame_rate": 30,
   "robot_speed": null,

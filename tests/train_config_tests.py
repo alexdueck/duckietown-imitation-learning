@@ -23,7 +23,7 @@ class TrainConfigTests(unittest.TestCase):
             for action in parser._actions
             if action.dest not in ("help", "train_config")
         }
-        template_path = Path("configs/train_config.template.json")
+        template_path = Path("template_configs/train_config.template.json")
         template = json.loads(template_path.read_text())
         self.assertEqual(set(template), expected)
 
@@ -39,18 +39,11 @@ class TrainConfigTests(unittest.TestCase):
         defaults["map_names"] = list(trainer.DEFAULT_MAP_NAMES)
         for key, template_value in template.items():
             default_value = defaults[key]
-            if isinstance(default_value, Path):
-                self.assertEqual(Path(template_value).expanduser(), default_value)
-            elif isinstance(default_value, tuple):
-                self.assertEqual(template_value, list(default_value))
-            else:
-                self.assertEqual(template_value, default_value)
+            if key == "randomization_config":
+                self.assertEqual(default_value, {})
+                self.assertEqual(template_value["trim"]["type"], "uniform")
+                continue
 
-        defaults = vars(trainer.build_arg_parser().parse_args([]))
-        defaults.pop("train_config")
-        defaults["map_names"] = list(trainer.DEFAULT_MAP_NAMES)
-        for key, template_value in template.items():
-            default_value = defaults[key]
             if isinstance(default_value, Path):
                 self.assertEqual(Path(template_value).expanduser(), default_value)
             elif isinstance(default_value, tuple):

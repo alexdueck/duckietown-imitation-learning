@@ -63,6 +63,10 @@ from dt_utils.gym_duckietown_start_config import (
     load_start_config,
 )
 from dt_utils.gym_duckietown_rendering import prepare_reset_render_context
+from dt_utils.gym_duckietown_randomization import (
+    apply_randomization_config,
+    parse_randomization_config,
+)
 from dt_utils.rl_models import TanhGaussianPolicy, load_imitation_actor, tanh_normal_log_prob
 from dt_utils.temporal_rl import (
     FixedHistory,
@@ -175,7 +179,7 @@ class PPOConfig:
     dynamics_rand: bool
     camera_rand: bool
     distortion: bool
-    randomization_config: str
+    randomization_config: dict[str, dict[str, Any]]
     frame_skip: int
     frame_rate: int
     robot_speed: float | None
@@ -483,6 +487,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=True,
         help="Enable the distortion camera model required by camera randomization.",
     )
+    parser.add_argument(
+        "--randomization-config",
+        type=parse_randomization_config,
+        default={},
+        metavar="JSON",
+        help=(
+            "JSON object overriding entries in gym-duckietown's built-in "
+            "randomizer. Prefer placing this object in --train-config."
+        ),
+    )
     parser.add_argument("--frame-skip", type=int, default=1)
     parser.add_argument("--frame-rate", type=int, default=30)
     parser.add_argument("--robot-speed", type=float, default=None)
@@ -605,6 +619,9 @@ def restore_resume_configuration(
         "dynamics_rand": bool(checkpoint_config.get("dynamics_rand", False)),
         "camera_rand": bool(checkpoint_config.get("camera_rand", False)),
         "distortion": bool(checkpoint_config.get("distortion", False)),
+        "randomization_config": parse_randomization_config(
+            checkpoint_config.get("randomization_config", {})
+        ),
         "image_size": int(checkpoint_config.get("image_size", args.image_size)),
         "crop_y_start": int(checkpoint_config.get("crop_y_start", args.crop_y_start)),
         "source_observation_channel_order": checkpoint_config.get(
@@ -617,10 +634,15 @@ def restore_resume_configuration(
         "dynamics_rand",
         "camera_rand",
         "distortion",
+        "randomization_config",
     }
     restored_keys = []
     for key, checkpoint_value in restored.items():
-        current_value = getattr(args, key)
+        current_value = (
+            getattr(args, key, {})
+            if key == "randomization_config"
+            else getattr(args, key)
+        )
         option = "--" + key.replace("_", "-")
         if key in configured_destinations and current_value != checkpoint_value:
             if key in environment_override_keys:
@@ -634,7 +656,7 @@ def restore_resume_configuration(
                 f"{option}={current_value!r} is incompatible with the resumed checkpoint "
                 f"value {checkpoint_value!r}. Remove the option or use a compatible checkpoint."
             )
-        setattr(args, key, checkpoint_value)
+        setattr(args, key, deepcopy(checkpoint_value))
         restored_keys.append(key)
     if "map_names" not in configured_destinations:
         checkpoint_map_names = checkpoint_config.get("map_names")
@@ -784,12 +806,12 @@ def build_checkpoint_metadata(
         else "zero-initialized output layer over current-frame head"
     )
     return {
-        "metadata_schema_version": 4,
+        "metadata_schema_version": 5,
         "domain_rand": config.domain_rand,
         "dynamics_rand": config.dynamics_rand,
         "camera_rand": config.camera_rand,
         "distortion": config.distortion,
-        "randomization_config": config.randomization_config,
+        "randomization_config": deepcopy(config.randomization_config),
         "observation_history_length": config.observation_history_length,
         "action_history_length": config.action_history_length,
         "history_initialization": deepcopy(HISTORY_INITIALIZATION),
@@ -827,7 +849,7 @@ def build_checkpoint_metadata(
             "randomization": {
                 "requested": requested_randomization,
                 "actual": actual_randomization,
-                "config": config.randomization_config,
+                "config": deepcopy(config.randomization_config),
                 "built_in_distributions": randomization_distributions,
             },
             "camera_calibration": camera_calibration,
@@ -1127,8 +1149,9 @@ def make_env(args: argparse.Namespace, seed: int | None = None):
         simulator_max_steps = args.max_episode_steps if args.max_episode_steps > 0 else 100_000_000
 
     robot_speed = DEFAULT_ROBOT_SPEED if args.robot_speed is None else args.robot_speed
-    return Simulator(
-        seed=args.seed if seed is None else seed,
+    environment_seed = args.seed if seed is None else seed
+    env = Simulator(
+        seed=environment_seed,
         map_name=args.map_name,
         randomize_maps_on_reset=False,
         max_steps=simulator_max_steps,
@@ -1146,6 +1169,13 @@ def make_env(args: argparse.Namespace, seed: int | None = None):
         full_transparency=True,
         distortion=args.distortion,
     )
+    randomization_config = getattr(args, "randomization_config", {})
+    if randomization_config:
+        apply_randomization_config(env, randomization_config)
+        # Simulator.__init__() already reset once using the built-in config.
+        # Reseeding makes the first usable reset reproducible with the override.
+        reset_raw(env, seed=environment_seed)
+    return env
 
 
 def reset_raw(env, seed: int | None = None):
@@ -1760,7 +1790,6 @@ def main() -> None:
     config_values["evaluation_start_poses"] = (
         start_config.evaluation_poses if start_config is not None else ()
     )
-    config_values["randomization_config"] = "gym-duckietown defaults"
     config = PPOConfig(**config_values, device=str(device))
     checkpoint_metadata = build_checkpoint_metadata(
         config,
@@ -2123,6 +2152,16 @@ def main() -> None:
         )
         print(
             f"Dynamics randomization: {'enabled' if actual_randomization['dynamics_rand'] else 'disabled'}",
+            flush=True,
+        )
+        effective_distributions = checkpoint_metadata["environment"]["randomization"][
+            "built_in_distributions"
+        ]
+        trim_distribution = (effective_distributions or {}).get("trim")
+        print(
+            "Trim distribution: "
+            + json.dumps(trim_distribution, sort_keys=True)
+            + ("" if args.dynamics_rand else " (sampled but not applied)"),
             flush=True,
         )
         print(

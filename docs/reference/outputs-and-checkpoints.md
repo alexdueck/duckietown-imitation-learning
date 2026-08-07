@@ -34,8 +34,9 @@ metadata for the environment class/version, requested and actual randomization,
 map and seeds, preprocessing and input shapes, action representation, fixed
 history initialization, and temporal model architecture. The same metadata is
 written in readable form to `config.json`. Resume restores architecture,
-preprocessing, action semantics, and randomization settings; explicit
-incompatible overrides fail before model construction.
+preprocessing, action semantics, randomization flags, requested distribution
+overrides, and the effective installed distributions. Explicit current-run
+randomization settings take precedence over checkpoint values.
 
 The resolved config also stores the loaded `train_config` path and a
 `configuration_sources` mapping. Consequently, checkpoint values reflect the

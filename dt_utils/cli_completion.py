@@ -6,7 +6,7 @@ import argparse
 def parse_args_with_completion(parser: argparse.ArgumentParser) -> argparse.Namespace:
     try:
         import argcomplete
-    except ImportError:
+    except (ImportError, TypeError):
         pass
     else:
         argcomplete.autocomplete(parser)
